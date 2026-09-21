@@ -12,5 +12,6 @@ public interface BotHandle {
     Navigator navigator();
     Miner miner();
     ResourceCollector collector();
+    CombatController combat();
     void remove();
 }

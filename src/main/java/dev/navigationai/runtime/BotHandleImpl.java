@@ -3,6 +3,7 @@ package dev.navigationai.runtime;
 import dev.navigationai.api.BotActions;
 import dev.navigationai.api.BotHandle;
 import dev.navigationai.api.BotState;
+import dev.navigationai.api.CombatController;
 import dev.navigationai.api.Miner;
 import dev.navigationai.api.Navigator;
 import dev.navigationai.api.ResourceCollector;
@@ -17,6 +18,7 @@ final class BotHandleImpl implements BotHandle {
     private final NavigatorImpl navigator;
     private final MinerImpl miner;
     private final ResourceCollectorImpl collector;
+    private final CombatControllerImpl combat;
     private BotState state = BotState.ACTIVE;
 
     BotHandleImpl(BotRuntime runtime, ServerPlayer player, String name) {
@@ -27,6 +29,7 @@ final class BotHandleImpl implements BotHandle {
         this.navigator = new NavigatorImpl(runtime, this);
         this.miner = new MinerImpl(runtime, this);
         this.collector = new ResourceCollectorImpl(runtime, this);
+        this.combat = new CombatControllerImpl(runtime, this);
     }
     BotRuntime runtime() { return runtime; }
     @Override public UUID id() { return player.getUUID(); }
@@ -37,9 +40,13 @@ final class BotHandleImpl implements BotHandle {
     @Override public Navigator navigator() { return navigator; }
     @Override public Miner miner() { return miner; }
     @Override public ResourceCollector collector() { return collector; }
+    @Override public CombatController combat() { return combat; }
     MinerImpl minerImpl() { return miner; }
     @Override public void remove() {
         navigator.cancel();
+        collector.cancel();
+        miner.cancel();
+        combat.cancel();
         runtime.remove(this);
         state = BotState.REMOVED;
     }
@@ -50,6 +57,7 @@ final class BotHandleImpl implements BotHandle {
             navigator.cancel();
             miner.cancel();
             collector.cancel();
+            combat.cancel();
             return;
         }
         // Vanilla sends a hit player's knockback to that player's client and
@@ -58,7 +66,8 @@ final class BotHandleImpl implements BotHandle {
         runtime.applyPendingMotion(player);
         collector.tick();
         miner.tick();
-        navigator.tick();
+        combat.tick();
+        if (!combat.isActive()) navigator.tick();
         // A fake player has no network connection registered with ServerConnectionListener.
         // Run the same server-side simulation step that a real player's connection invokes.
         player.doTick();

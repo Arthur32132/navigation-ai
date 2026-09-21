@@ -17,6 +17,8 @@
 - `BotActions` — прямой ввод игрока;
 - `Miner` и `MiningTask` — разрушение одного блока через серверную механику;
 - `ResourceCollector` и `GatherTask` — поиск, добыча и подсчёт предметов;
+- `CombatController` и `CombatTask` — бой с мобом или игроком;
+- `CombatPolicy`, `CombatSkill`, `CombatResult`, `CombatStatus` — ограничения и профиль поведения;
 - `Navigator` — постановка и отмена задач;
 - `NavigationGoal`, `NavigationPolicy` — цель и ограничения поиска;
 - `NavigationTask`, `NavigationResult`, `NavigationStatus` — наблюдение за задачей.
@@ -52,6 +54,7 @@ bot.player();      // ServerPlayer
 bot.state();       // SPAWNING, ACTIVE, DEAD или REMOVED
 bot.actions();     // управление вводом
 bot.navigator();   // навигация
+bot.combat();      // бой
 bot.remove();      // удаление из мира и PlayerList
 ```
 
@@ -87,6 +90,50 @@ NavigationTask follow = bot.navigator().follow(
 `FollowGoal.repathDistance` задаёт расстояние, после которого путь пересчитывается. Цель должна находиться в том же измерении, что и бот. `BlockGoal.tolerance`, `PositionGoal.tolerance` и `FollowGoal.distance` уже присутствуют в API, но в текущем runtime ещё не влияют на условие завершения; это задел для следующего навигационного исполнителя.
 
 Одновременно у бота выполняется одна задача. Новый вызов `goTo` отменяет предыдущую, очищает старый путь и запускает новый поиск. `cancel()` останавливает ввод и переводит задачу в `CANCELLED`.
+
+## Сражения
+
+Бой запускается с явно выбранной живой целью. Целью может быть `Mob` или
+`Player`; политика отдельно разрешает эти два типа. Одновременно выполняется
+только одна боевая задача, а новый бой останавливает навигацию, добычу и сбор.
+
+```java
+CombatTask combat = bot.combat().fight(targetLivingEntity, CombatPolicy.standard());
+combat.completion().thenAccept(result -> server.execute(() -> {
+    if (result.status() == CombatStatus.SUCCESS) {
+        // цель побеждена
+    }
+}));
+
+CombatTask areaCombat = bot.combat().fightNearby(16.0, CombatPolicy.expert());
+```
+
+`CombatPolicy.expert()` выбирает более быструю реакцию, плавный поворот и более
+узкую погрешность прицеливания. `CombatPolicy.standard()` оставляет больше
+ошибок и задержку реакции. Оба профиля обязаны соблюдать видимость, дальность,
+ванильный cooldown и реальные правила оружия.
+
+Контроллер распознаёт мечи по идентификатору предмета, топоры по `AxeItem`, а
+луки по `BowItem`. Меч и топор атакуют через `ServerPlayer.attack`, лук проходит
+через `BowItem` и потребляет реальные стрелы. Перед каждым ударом контроллер
+плавно меняет yaw/pitch, проверяет луч до цели и атакует только если текущий
+взгляд уже совпадает с целью. Поэтому мгновенное попадание в бок или за спину
+невозможно. Смена оружия и натяжение лука прекращаются при `cancel()`, смерти,
+удалении цели или выходе за пределы политики.
+
+`fightNearby(radius, policy)` последовательно выбирает ближайшие разрешённые
+цели в радиусе. Игроки в creative и spectator автоматически пропускаются;
+после смерти или выхода цели из области выбирается следующая. Задача завершается
+успешно после короткого ожидания, если разрешённых живых целей больше не осталось;
+это позволяет мобу появиться в области сразу после запуска команды.
+
+Для ручной проверки в тестовом моде доступны:
+
+```text
+/navtest fight <bot> <entity> <standard|expert>
+/navtest combat-status <bot>
+/navtest cancel <bot>
+```
 
 ## Состояния задачи
 
