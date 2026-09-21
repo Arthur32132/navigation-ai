@@ -29,7 +29,11 @@ final class BotHandleImpl implements BotHandle {
     @Override public BotState state() { return state; }
     @Override public BotActions actions() { return actions; }
     @Override public Navigator navigator() { return navigator; }
-    @Override public void remove() { runtime.remove(this); state = BotState.REMOVED; }
+    @Override public void remove() {
+        navigator.cancel();
+        runtime.remove(this);
+        state = BotState.REMOVED;
+    }
     void tick() {
         if (state == BotState.REMOVED) return;
         if (player.isDeadOrDying() || player.isRemoved()) { state = BotState.DEAD; navigator.cancel(); return; }

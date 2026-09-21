@@ -18,8 +18,11 @@ final class WorldSnapshot implements GridWorld {
     }
 
     static WorldSnapshot capture(ServerLevel level, GridPos start, GridPos goal, int radius, boolean allowWater) {
-        int minX = Math.min(start.x(), goal.x()) - radius, maxX = Math.max(start.x(), goal.x()) + radius;
-        int minZ = Math.min(start.z(), goal.z()) - radius, maxZ = Math.max(start.z(), goal.z()) + radius;
+        // Keep the snapshot bounded by the requested radius. A distant goal is
+        // intentionally outside this local snapshot and will be reported as
+        // unreachable instead of making the server scan the whole rectangle.
+        int minX = start.x() - radius, maxX = start.x() + radius;
+        int minZ = start.z() - radius, maxZ = start.z() + radius;
         int minY = Math.max(level.getMinY(), Math.min(start.y(), goal.y()) - 8);
         int maxY = Math.min(level.getMinY() + level.getHeight() - 2, Math.max(start.y(), goal.y()) + 8);
         Set<GridPos> passable = new HashSet<>();

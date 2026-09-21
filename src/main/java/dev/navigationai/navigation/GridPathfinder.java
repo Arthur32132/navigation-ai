@@ -42,7 +42,6 @@ public final class GridPathfinder {
             for (int[] move : MOVES) {
                 GridPos next = current.add(move[0], move[1], move[2]);
                 if (!world.passable(next) || closed.contains(next)) continue;
-                if (move[1] != 0 && !world.passable(current.add(0, move[1], 0))) continue;
                 double nextScore = score.get(current) + world.cost(current, next);
                 if (nextScore >= score.getOrDefault(next, Double.POSITIVE_INFINITY)) continue;
                 score.put(next, nextScore);

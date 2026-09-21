@@ -30,6 +30,7 @@ final class NavigatorImpl implements Navigator {
     private long pathStartedNanos;
     private long requestGeneration;
     private Vec3 lastPosition;
+    private Vec3 followPlanPosition;
     private int ticksWithoutProgress;
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
@@ -51,14 +52,14 @@ final class NavigatorImpl implements Navigator {
         requestGeneration++;
         if (task != null && task.status() != NavigationStatus.SUCCESS && task.status() != NavigationStatus.FAILED) task.cancel();
         owner.actions().stop();
-        path = List.of(); pathIndex = 0; goal = null;
+        path = List.of(); pathIndex = 0; goal = null; followPlanPosition = null;
     }
     @Override public NavigationStatus status() { return task == null ? NavigationStatus.IDLE : task.status(); }
     @Override public Optional<NavigationGoal> goal() { return Optional.ofNullable(goal); }
 
     void tick() {
         if (task == null || goal == null || task.status() == NavigationStatus.CANCELLED || task.status() == NavigationStatus.FAILED || task.status() == NavigationStatus.SUCCESS) return;
-        if (goal instanceof NavigationGoal.FollowGoal follow && (path.isEmpty() || follow.target().level() != owner.player().level() || owner.player().distanceToSqr(follow.target()) > follow.repathDistance() * follow.repathDistance())) {
+        if (goal instanceof NavigationGoal.FollowGoal follow && shouldRepathFollow(follow)) {
             if (task.status() == NavigationStatus.RUNNING) requestPath();
         }
         if (task.status() != NavigationStatus.RUNNING || path.isEmpty()) return;
@@ -90,6 +91,7 @@ final class NavigatorImpl implements Navigator {
         path = List.of(); pathIndex = 0;
         ServerPlayer player = owner.player();
         ServerLevel level = (ServerLevel)player.level();
+        if (goal instanceof NavigationGoal.FollowGoal follow) followPlanPosition = follow.target().position();
         BlockPos target = targetBlock();
         GridPos startPos = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(), player.blockPosition().getZ());
         GridPos goalPos = new GridPos(target.getX(), target.getY(), target.getZ());
@@ -101,6 +103,13 @@ final class NavigatorImpl implements Navigator {
             GridPath result = GridPathfinder.find(snapshot, startPos, goalPos, policy);
             runtime.server().execute(() -> applyPath(result, started, generation));
         });
+    }
+
+    private boolean shouldRepathFollow(NavigationGoal.FollowGoal follow) {
+        if (follow.target().level() != owner.player().level()) return true;
+        if (followPlanPosition == null) return true;
+        return follow.target().position().distanceToSqr(followPlanPosition)
+                > follow.repathDistance() * follow.repathDistance();
     }
 
     private BlockPos targetBlock() {
@@ -136,6 +145,14 @@ final class NavigatorImpl implements Navigator {
             if (cancelled.compareAndSet(false, true)) {
                 status = NavigationStatus.CANCELLED;
                 completion.complete(new NavigationResult(NavigationStatus.CANCELLED, "cancelled", 0, 0));
+                if (NavigatorImpl.this.task == this) {
+                    owner.actions().stop();
+                    NavigatorImpl.this.requestGeneration++;
+                    NavigatorImpl.this.path = List.of();
+                    NavigatorImpl.this.pathIndex = 0;
+                    NavigatorImpl.this.goal = null;
+                    NavigatorImpl.this.followPlanPosition = null;
+                }
             }
         }
         void fail(String reason, int nodes) {

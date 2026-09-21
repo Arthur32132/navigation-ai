@@ -1,6 +1,7 @@
 package dev.navigationai.navigation;
 
 import dev.navigationai.api.NavigationPolicy;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -29,5 +30,16 @@ class GridPathfinderTest {
         GridPath path = GridPathfinder.find(world, new GridPos(0, 0, 0), new GridPos(90, 0, 90), policy(128));
         assertTrue(path.nodes().isEmpty());
         assertEquals(128, path.nodesVisited());
+    }
+
+    @Test
+    void allowsDiagonalVerticalStepWhenCenterCellIsBlocked() {
+        GridPos start = new GridPos(0, 0, 0);
+        GridPos goal = new GridPos(1, 1, 0);
+        GridWorld world = pos -> pos.equals(start) || pos.equals(goal);
+
+        GridPath path = GridPathfinder.find(world, start, goal, policy(128));
+
+        assertEquals(List.of(start, goal), path.nodes());
     }
 }
