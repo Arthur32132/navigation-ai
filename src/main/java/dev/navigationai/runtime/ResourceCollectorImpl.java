@@ -143,7 +143,8 @@ final class ResourceCollectorImpl implements ResourceCollector {
         if (status == NavigationStatus.SUCCESS) {
             current.mining = owner.miner().breakBlock(current.target);
             current.phase = GatherPhase.MINING;
-        } else if (status == NavigationStatus.FAILED || status == NavigationStatus.CANCELLED) {
+        } else if (status == NavigationStatus.FAILED || status == NavigationStatus.CANCELLED
+                || status == NavigationStatus.STUCK) {
             current.phase = GatherPhase.SEARCHING;
         }
     }

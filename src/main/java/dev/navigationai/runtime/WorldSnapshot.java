@@ -55,7 +55,8 @@ final class WorldSnapshot implements GridWorld {
             var above = level.getBlockState(pos.above());
             var below = level.getBlockState(pos.below());
             FluidState fluidState = level.getFluidState(pos);
-            boolean waterCell = fluidState.getType() == Fluids.WATER;
+            boolean waterCell = fluidState.getType() == Fluids.WATER
+                    || fluidState.getType() == Fluids.FLOWING_WATER;
             var stateShape = state.getCollisionShape(level, pos);
             var aboveShape = above.getCollisionShape(level, pos.above());
             boolean emptyBody = stateShape.isEmpty() && aboveShape.isEmpty();
@@ -71,8 +72,13 @@ final class WorldSnapshot implements GridWorld {
                     && (!state.hasProperty(DoorBlock.HALF)
                         || state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
             FluidState belowFluid = level.getFluidState(pos.below());
+            boolean belowWater = belowFluid.getType() == Fluids.WATER
+                    || belowFluid.getType() == Fluids.FLOWING_WATER;
+            boolean lavaCell = fluidState.getType() == Fluids.LAVA
+                    || fluidState.getType() == Fluids.FLOWING_LAVA;
+            boolean fluidAllowed = (!waterCell && !lavaCell) || (allowWater && waterCell);
             boolean floor = below.getCollisionShape(level, pos.below()).isEmpty()
-                    ? (allowWater && belowFluid.getType() == Fluids.WATER)
+                    ? (allowWater && belowWater)
                     : true;
             GridPos gridPos = new GridPos(x, y, z);
             boolean breakableBody = allowBreaking && isBreakable(level, pos, state)
@@ -84,15 +90,20 @@ final class WorldSnapshot implements GridWorld {
                     && !below.getCollisionShape(level, pos.below()).isEmpty();
             boolean supportedPlacement = allowPlacing && emptyBody && below.getCollisionShape(level, pos.below()).isEmpty()
                     && (hasSolidNeighbour(level, pos.below()) || hasSolidNeighbour(level, pos));
-            if ((emptyBody && floor) || lowSurface || climbable || openable || openDoor
-                    || breakableBody || breakableAbove || supportedPlacement
-                    || (allowWater && waterCell && aboveShape.isEmpty())) {
+            boolean passableCell = fluidAllowed && (emptyBody && floor || lowSurface || climbable || openable || openDoor
+                    || breakableBody || breakableAbove || supportedPlacement);
+            if (passableCell || (allowWater && waterCell && aboveShape.isEmpty())) {
                 passable.add(gridPos);
             }
+            boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
+                    || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
+                    || below.is(Blocks.MAGMA_BLOCK) || below.is(Blocks.CACTUS)
+                    || below.is(Blocks.POWDER_SNOW) || belowFluid.getType() == Fluids.LAVA
+                    || belowFluid.getType() == Fluids.FLOWING_LAVA;
             if (state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE) || state.is(Blocks.CAMPFIRE)
                     || state.is(Blocks.SOUL_CAMPFIRE) || state.is(Blocks.MAGMA_BLOCK)
                     || state.is(Blocks.CACTUS) || state.is(Blocks.POWDER_SNOW)
-                    || fluidState.getType() == Fluids.LAVA) {
+                    || lavaCell || dangerousSupport) {
                 dangerous.add(gridPos);
             }
         }
@@ -114,6 +125,7 @@ final class WorldSnapshot implements GridWorld {
 
     private static boolean isClosedWoodenDoor(net.minecraft.world.level.block.state.BlockState state) {
         return state.getBlock() instanceof DoorBlock
+                && state.is(BlockTags.WOODEN_DOORS)
                 && state.hasProperty(DoorBlock.OPEN) && !state.getValue(DoorBlock.OPEN)
                 && (!state.hasProperty(DoorBlock.HALF)
                     || state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
