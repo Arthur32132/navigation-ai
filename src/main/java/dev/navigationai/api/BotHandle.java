@@ -10,5 +10,7 @@ public interface BotHandle {
     BotState state();
     BotActions actions();
     Navigator navigator();
+    Miner miner();
+    ResourceCollector collector();
     void remove();
 }

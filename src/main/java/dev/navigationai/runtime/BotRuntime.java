@@ -15,14 +15,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.PacketListener;
+import net.minecraft.network.ProtocolInfo;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
-import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
-import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
@@ -46,6 +48,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger("navigation_ai/runtime");
     private final MinecraftServer server;
     private final Map<UUID, BotHandleImpl> bots = new ConcurrentHashMap<>();
+    private final Map<UUID, BotConnection> connections = new ConcurrentHashMap<>();
     private final ExecutorService pathExecutor;
 
     public BotRuntime(MinecraftServer server) {
@@ -74,18 +77,23 @@ public final class BotRuntime implements BotService, AutoCloseable {
         player.setXRot(options.pitch());
         player.setYHeadRot(options.yaw());
 
-        Connection connection = new Connection(PacketFlow.SERVERBOUND);
-        new BotPacketListener(server, connection, player, CommonListenerCookie.createInitial(profile, false));
-        player.initInventoryMenu();
-
-        options.level().addNewPlayer(player);
-        PlayerListAccessor list = (PlayerListAccessor)(Object)server.getPlayerList();
-        list.navigationAi$players().add(player);
-        list.navigationAi$playersByUuid().put(player.getUUID(), player);
-        server.getPlayerList().broadcastAll(ClientboundPlayerInfoUpdatePacket.createPlayerInitializing(java.util.List.of(player)));
+        // Let PlayerList perform the same registration sequence as a real
+        // player. The previous implementation manually inserted the player
+        // into PlayerList and ServerLevel, which was enough for the server
+        // and locator bar but could leave the entity pairing incomplete for
+        // clients that were already connected. A connection that silently
+        // drops packets lets us reuse the vanilla sequence without creating
+        // a real network client for the fake player.
+        BotConnection connection = new BotConnection(player);
+        server.getPlayerList().placeNewPlayer(
+            connection,
+            player,
+            CommonListenerCookie.createInitial(profile, false)
+        );
 
         BotHandleImpl handle = new BotHandleImpl(this, player, options.name());
         bots.put(player.getUUID(), handle);
+        connections.put(player.getUUID(), connection);
         LOGGER.info("Created navigation bot {} ({})", options.name(), player.getUUID());
         return handle;
     }
@@ -98,6 +106,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
         ensureServerThread();
         if (bots.remove(handle.id(), handle)) {
             ServerPlayer player = handle.player();
+            connections.remove(player.getUUID());
             PlayerListAccessor list = (PlayerListAccessor)(Object)server.getPlayerList();
             list.navigationAi$players().remove(player);
             list.navigationAi$playersByUuid().remove(player.getUUID());
@@ -111,7 +120,14 @@ public final class BotRuntime implements BotService, AutoCloseable {
         bots.values().forEach(BotHandleImpl::tick);
     }
 
-    private void ensureServerThread() { if (!server.isSameThread()) throw new IllegalStateException("Bot API must be called on the server thread"); }
+    void applyPendingMotion(ServerPlayer player) {
+        BotConnection connection = connections.get(player.getUUID());
+        if (connection == null) return;
+        Vec3 motion = connection.takePendingMotion();
+        if (motion != null) player.setDeltaMovement(motion);
+    }
+
+    void ensureServerThread() { if (!server.isSameThread()) throw new IllegalStateException("Bot API must be called on the server thread"); }
 
     @Override public void close() {
         savePersisted();
@@ -169,11 +185,30 @@ public final class BotRuntime implements BotService, AutoCloseable {
     }
 
     /** A disconnected connection is sufficient for server simulation and never queues packets. */
-    private static final class BotPacketListener extends ServerGamePacketListenerImpl {
-        private BotPacketListener(MinecraftServer server, Connection connection, ServerPlayer player, CommonListenerCookie cookie) {
-            super(server, connection, player, cookie);
+    private static final class BotConnection extends Connection {
+        private final ServerPlayer player;
+        private volatile Vec3 pendingMotion;
+
+        private BotConnection(ServerPlayer player) {
+            super(PacketFlow.SERVERBOUND);
+            this.player = player;
         }
-        @Override public void send(net.minecraft.network.protocol.Packet<?> packet) { }
-        @Override public void send(net.minecraft.network.protocol.Packet<?> packet, io.netty.channel.ChannelFutureListener listener) { }
+
+        private void capture(Packet<?> packet) {
+            if (packet instanceof ClientboundSetEntityMotionPacket motion && motion.id() == player.getId()) {
+                pendingMotion = motion.movement();
+            }
+        }
+
+        private Vec3 takePendingMotion() {
+            Vec3 motion = pendingMotion;
+            pendingMotion = null;
+            return motion;
+        }
+
+        @Override public <T extends PacketListener> void setupInboundProtocol(ProtocolInfo<T> protocol, T listener) { }
+        @Override public void send(Packet<?> packet) { capture(packet); }
+        @Override public void send(Packet<?> packet, io.netty.channel.ChannelFutureListener listener) { capture(packet); }
+        @Override public void send(Packet<?> packet, io.netty.channel.ChannelFutureListener listener, boolean flush) { capture(packet); }
     }
 }
