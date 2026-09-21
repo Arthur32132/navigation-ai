@@ -10,6 +10,10 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.LadderBlock;
+import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.LoggerFactory;
 
@@ -21,13 +25,16 @@ public final class RuntimeRegression {
     private BotHandle bot, target;
     private MiningTask mining;
     private GatherTask gathering;
+    private NavigationTask navigation;
     private int scenario = -1, ticks, passed, failed;
     private boolean replacementSeen;
     private static final String[] NAMES = {"mining_inventory_tool_restore", "mining_cancel_before_tick",
         "mining_no_tool_preserves_slot", "unbreakable_block", "gather_and_pickup", "full_inventory",
         "missing_resource", "gather_timeout_cancels_navigation", "gather_cancel",
         "best_sword_and_broken_weapon_replacement", "bow_inventory_arrows_damage", "combat_one_block_step",
-        "unreachable_resource", "retry_other_side"};
+        "unreachable_resource", "retry_other_side", "navigation_breaking", "navigation_bridge",
+        "navigation_door", "navigation_ladder", "navigation_dynamic_obstacle"};
+    private boolean dynamicObstaclePlaced;
 
     public static void register() {
         ServerTickEvents.END_SERVER_TICK.register(server -> {
@@ -70,8 +77,10 @@ public final class RuntimeRegression {
         }
         ticks = 0;
         replacementSeen = false;
+        dynamicObstaclePlaced = false;
         mining = null;
         gathering = null;
+        navigation = null;
         for (int x=-16;x<=16;x++) for (int z=-16;z<=16;z++) {
             block(x,-1,z,Blocks.STONE);
             for (int y=0;y<=5;y++) block(x,y,z,Blocks.AIR);
@@ -132,6 +141,58 @@ public final class RuntimeRegression {
                 }
                 gathering=bot.collector().gather(new GatherRequest(Blocks.DIRT,Items.DIRT,1),new GatherPolicy(6,300,3));
             }
+            case 14 -> {
+                for (int z=-16; z<=16; z++) {
+                    block(2,0,z,Blocks.DIRT);
+                    block(2,1,z,Blocks.DIRT);
+                    block(2,2,z,Blocks.BEDROCK);
+                }
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(true,false,false,false,20_000,128,8,0));
+            }
+            case 15 -> {
+                block(2,-1,0,Blocks.AIR);
+                bot.player().getInventory().setItem(10,new ItemStack(Items.COBBLESTONE,8));
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1026.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,true,false,false,20_000,128,8,0));
+            }
+            case 16 -> {
+                // A narrow corridor forces the bot through a closed wooden door.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                level.setBlockAndUpdate(p(2,0,0), Blocks.OAK_DOOR.defaultBlockState()
+                    .setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER)
+                    .setValue(DoorBlock.FACING, Direction.EAST));
+                level.setBlockAndUpdate(p(2,1,0), Blocks.OAK_DOOR.defaultBlockState()
+                    .setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER)
+                    .setValue(DoorBlock.FACING, Direction.EAST));
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1026.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 17 -> {
+                // A ladder is the only route to a higher platform.
+                for (int y=0; y<=4; y++) {
+                    block(0,y,-1,Blocks.STONE);
+                    block(0,y,1,Blocks.STONE);
+                }
+                for (int y=0; y<=3; y++) {
+                    level.setBlockAndUpdate(p(0,y,0), Blocks.LADDER.defaultBlockState()
+                        .setValue(LadderBlock.FACING, Direction.SOUTH));
+                }
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1024.5,203.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 18 -> {
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
         }
     }
 
@@ -175,6 +236,24 @@ public final class RuntimeRegression {
                     && level.getBlockState(p(3,0,0)).is(Blocks.DIRT),gathering.completion().join().toString()); }
                 case 13 -> { if(gathering.completion().isDone()) finish(gathering.status()==GatherStatus.SUCCESS
                     && gathering.collectedItems()>=1,gathering.completion().join().toString()); }
+            case 14 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,0,0)).isAir() && level.getBlockState(p(2,1,0)).isAir(),
+                    navigation.completion().join().toString()); }
+            case 15 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,-1,0)).is(Blocks.COBBLESTONE), navigation.completion().join().toString()); }
+            case 16 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,0,0)).getValue(DoorBlock.OPEN), navigation.completion().join().toString()); }
+            case 17 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getY() >= 202.0, navigation.completion().join().toString()); }
+            case 18 -> {
+                if (!dynamicObstaclePlaced && ticks >= 8) {
+                    dynamicObstaclePlaced = true;
+                    block(3,0,0,Blocks.STONE); block(3,1,0,Blocks.STONE);
+                }
+                if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1028.75 && level.getBlockState(p(3,0,0)).is(Blocks.STONE),
+                    navigation.completion().join().toString());
+            }
             }
             if(active!=null && ticks>400) finish(false,"timed out after 400 ticks");
         } catch(Exception e) {

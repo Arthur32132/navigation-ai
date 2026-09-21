@@ -27,8 +27,17 @@ final class MinerImpl implements Miner {
     @Override
     public MiningTask breakBlock(BlockPos position) {
         runtime.ensureServerThread();
+        return breakBlock(position, true);
+    }
+
+    MiningTask breakBlockWithoutCancellingNavigation(BlockPos position) {
+        runtime.ensureServerThread();
+        return breakBlock(position, false);
+    }
+
+    private MiningTask breakBlock(BlockPos position, boolean cancelNavigation) {
         cancel();
-        owner.navigator().cancel();
+        if (cancelNavigation) owner.navigator().cancel();
         task = new MiningTaskImpl(position.immutable());
         return task;
     }

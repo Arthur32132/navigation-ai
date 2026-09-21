@@ -1,16 +1,40 @@
-[18:29:01] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state
-[18:29:02] [Server thread/INFO]: REGRESSION OK mining_inventory_tool_restore: MiningResult[status=SUCCESS, reason=block_broken, blockBroken=true, durationNanos=140184200]
-[18:29:02] [Server thread/INFO]: REGRESSION OK mining_cancel_before_tick: cancel preserves block and selected slot
-[18:29:02] [Server thread/INFO]: REGRESSION OK mining_no_tool_preserves_slot: missing tool
-[18:29:02] [Server thread/INFO]: REGRESSION OK unbreakable_block: cannot_break
-[18:29:03] [Server thread/INFO]: REGRESSION OK gather_and_pickup: GatherResult[status=SUCCESS, reason=target_reached, collectedItems=1, brokenBlocks=1, durationNanos=1679433500]
-[18:29:06] [Server thread/INFO]: REGRESSION OK full_inventory: GatherResult[status=FAILED, reason=inventory_full, collectedItems=0, brokenBlocks=1, durationNanos=2279742300]
-[18:29:06] [Server thread/INFO]: REGRESSION OK missing_resource: GatherResult[status=FAILED, reason=no_resources, collectedItems=0, brokenBlocks=0, durationNanos=40233300]
-[18:29:06] [Server thread/INFO]: REGRESSION OK gather_timeout_cancels_navigation: GatherResult[status=FAILED, reason=timeout, collectedItems=0, brokenBlocks=0, durationNanos=88686200]
-[18:29:06] [Server thread/INFO]: REGRESSION OK gather_cancel: GatherResult[status=CANCELLED, reason=cancelled, collectedItems=0, brokenBlocks=0, durationNanos=61500]
-[18:29:09] [Server thread/INFO]: REGRESSION OK best_sword_and_broken_weapon_replacement: best sword selected; depleted sword replaced; real melee damage
-[18:29:13] [Server thread/INFO]: REGRESSION OK bow_inventory_arrows_damage: arrow consumed and target damaged
-[18:29:16] [Server thread/INFO]: REGRESSION OK combat_one_block_step: climbed step and damaged target
-[18:29:16] [Server thread/INFO]: REGRESSION OK unreachable_resource: GatherResult[status=FAILED, reason=no_resources, collectedItems=0, brokenBlocks=0, durationNanos=40613100]
-[18:29:20] [Server thread/INFO]: REGRESSION OK retry_other_side: GatherResult[status=SUCCESS, reason=target_reached, collectedItems=1, brokenBlocks=1, durationNanos=3241650000]
-[18:29:20] [Server thread/INFO]: REGRESSION PASS passed=14 failed=0
+[20:28:28] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state
+[20:28:28] [Server thread/INFO]: REGRESSION START mining_inventory_tool_restore
+[20:28:28] [Server thread/INFO]: REGRESSION OK mining_inventory_tool_restore: MiningResult[status=SUCCESS, reason=block_broken, blockBroken=true, durationNanos=148155300]
+[20:28:28] [Server thread/INFO]: REGRESSION START mining_cancel_before_tick
+[20:28:28] [Server thread/INFO]: REGRESSION OK mining_cancel_before_tick: cancel preserves block and selected slot
+[20:28:28] [Server thread/INFO]: REGRESSION START mining_no_tool_preserves_slot
+[20:28:28] [Server thread/INFO]: REGRESSION OK mining_no_tool_preserves_slot: missing tool
+[20:28:28] [Server thread/INFO]: REGRESSION START unbreakable_block
+[20:28:28] [Server thread/INFO]: REGRESSION OK unbreakable_block: cannot_break
+[20:28:28] [Server thread/INFO]: REGRESSION START gather_and_pickup
+[20:28:30] [Server thread/INFO]: REGRESSION OK gather_and_pickup: GatherResult[status=SUCCESS, reason=target_reached, collectedItems=1, brokenBlocks=1, durationNanos=1550002800]
+[20:28:30] [Server thread/INFO]: REGRESSION START full_inventory
+[20:28:32] [Server thread/INFO]: REGRESSION OK full_inventory: GatherResult[status=FAILED, reason=inventory_full, collectedItems=0, brokenBlocks=1, durationNanos=2167535700]
+[20:28:32] [Server thread/INFO]: REGRESSION START missing_resource
+[20:28:32] [Server thread/INFO]: REGRESSION OK missing_resource: GatherResult[status=FAILED, reason=no_resources, collectedItems=0, brokenBlocks=0, durationNanos=26106300]
+[20:28:32] [Server thread/INFO]: REGRESSION START gather_timeout_cancels_navigation
+[20:28:32] [Server thread/INFO]: REGRESSION OK gather_timeout_cancels_navigation: GatherResult[status=FAILED, reason=timeout, collectedItems=0, brokenBlocks=0, durationNanos=84579100]
+[20:28:32] [Server thread/INFO]: REGRESSION START gather_cancel
+[20:28:32] [Server thread/INFO]: REGRESSION OK gather_cancel: GatherResult[status=CANCELLED, reason=cancelled, collectedItems=0, brokenBlocks=0, durationNanos=31700]
+[20:28:32] [Server thread/INFO]: REGRESSION START best_sword_and_broken_weapon_replacement
+[20:28:36] [Server thread/INFO]: REGRESSION OK best_sword_and_broken_weapon_replacement: best sword selected; depleted sword replaced; real melee damage
+[20:28:36] [Server thread/INFO]: REGRESSION START bow_inventory_arrows_damage
+[20:28:39] [Server thread/INFO]: REGRESSION OK bow_inventory_arrows_damage: arrow consumed and target damaged
+[20:28:39] [Server thread/INFO]: REGRESSION START combat_one_block_step
+[20:28:43] [Server thread/INFO]: REGRESSION OK combat_one_block_step: climbed step and damaged target
+[20:28:43] [Server thread/INFO]: REGRESSION START unreachable_resource
+[20:28:43] [Server thread/INFO]: REGRESSION OK unreachable_resource: GatherResult[status=FAILED, reason=no_resources, collectedItems=0, brokenBlocks=0, durationNanos=19654400]
+[20:28:43] [Server thread/INFO]: REGRESSION START retry_other_side
+[20:28:46] [Server thread/INFO]: REGRESSION OK retry_other_side: GatherResult[status=SUCCESS, reason=target_reached, collectedItems=1, brokenBlocks=1, durationNanos=2933340700]
+[20:28:46] [Server thread/INFO]: REGRESSION START navigation_breaking
+[20:28:48] [Server thread/INFO]: REGRESSION OK navigation_breaking: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=5, durationNanos=642555900]
+[20:28:48] [Server thread/INFO]: REGRESSION START navigation_bridge
+[20:28:49] [Server thread/INFO]: REGRESSION OK navigation_bridge: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=409068800]
+[20:28:49] [Server thread/INFO]: REGRESSION START navigation_door
+[20:28:49] [Server thread/INFO]: REGRESSION OK navigation_door: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=435463900]
+[20:28:49] [Server thread/INFO]: REGRESSION START navigation_ladder
+[20:28:50] [Server thread/INFO]: REGRESSION OK navigation_ladder: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=4, durationNanos=1070374000]
+[20:28:50] [Server thread/INFO]: REGRESSION START navigation_dynamic_obstacle
+[20:28:52] [Server thread/INFO]: REGRESSION OK navigation_dynamic_obstacle: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=948356200]
+[20:28:52] [Server thread/INFO]: REGRESSION PASS passed=19 failed=0

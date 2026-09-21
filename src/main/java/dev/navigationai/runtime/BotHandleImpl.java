@@ -42,6 +42,7 @@ final class BotHandleImpl implements BotHandle {
     @Override public ResourceCollector collector() { return collector; }
     @Override public CombatController combat() { return combat; }
     MinerImpl minerImpl() { return miner; }
+    NavigatorImpl navigatorImpl() { return navigator; }
     @Override public void remove() {
         navigator.cancel();
         collector.cancel();

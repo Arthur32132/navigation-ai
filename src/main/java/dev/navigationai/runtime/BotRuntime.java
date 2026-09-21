@@ -6,6 +6,8 @@ import dev.navigationai.api.BotHandle;
 import dev.navigationai.api.BotService;
 import dev.navigationai.mixin.PlayerListAccessor;
 import java.util.Collection;
+import java.util.ArrayList;
+import java.util.List;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
@@ -13,7 +15,9 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
@@ -49,16 +53,19 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private final MinecraftServer server;
     private final Map<UUID, BotHandleImpl> bots = new ConcurrentHashMap<>();
     private final Map<UUID, BotConnection> connections = new ConcurrentHashMap<>();
+    private final List<PendingNavigation> pendingNavigations = new ArrayList<>();
     private final ExecutorService pathExecutor;
+    private int restoreDelayTicks = 20;
 
     public BotRuntime(MinecraftServer server) {
         this.server = server;
         int workers = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
-        this.pathExecutor = Executors.newFixedThreadPool(workers, runnable -> {
+        this.pathExecutor = new ThreadPoolExecutor(workers, workers, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(64), runnable -> {
             Thread thread = new Thread(runnable, "navigation-ai-path");
             thread.setDaemon(true);
             return thread;
-        });
+        }, new ThreadPoolExecutor.AbortPolicy());
         loadPersisted();
     }
 
@@ -117,6 +124,11 @@ public final class BotRuntime implements BotService, AutoCloseable {
 
     public void tick() {
         ensureServerThread();
+        if (restoreDelayTicks > 0) {
+            restoreDelayTicks--;
+        } else {
+            restorePendingNavigations();
+        }
         bots.values().forEach(BotHandleImpl::tick);
     }
 
@@ -130,6 +142,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
     void ensureServerThread() { if (!server.isSameThread()) throw new IllegalStateException("Bot API must be called on the server thread"); }
 
     @Override public void close() {
+        restorePendingNavigations();
         savePersisted();
         BotHandleImpl[] handles = bots.values().toArray(BotHandleImpl[]::new);
         for (BotHandleImpl handle : handles) {
@@ -144,7 +157,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
         try {
             Files.createDirectories(persistencePath().getParent());
             TagValueOutput root = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
-            root.putInt("version", 1);
+            root.putInt("version", 2);
             ValueOutput.ValueOutputList entries = root.childrenList("bots");
             for (BotHandleImpl handle : bots.values()) {
                 ValueOutput entry = entries.addChild();
@@ -152,6 +165,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
                 entry.putString("name", handle.name());
                 entry.putString("dimension", player.level().dimension().identifier().toString());
                 player.saveWithoutId(entry);
+                handle.navigatorImpl().saveState(entry.child("navigation"));
             }
             NbtIo.writeCompressed(root.buildResult(), persistencePath());
         } catch (Exception exception) {
@@ -165,13 +179,29 @@ public final class BotRuntime implements BotService, AutoCloseable {
         try {
             CompoundTag root = NbtIo.readCompressed(path, NbtAccounter.unlimitedHeap());
             ValueInput input = TagValueInput.create(ProblemReporter.DISCARDING, server.registryAccess(), root);
-            input.childrenListOrEmpty("bots").stream().forEach(this::restoreEntry);
+            input.childrenListOrEmpty("bots").stream().forEach(entry -> restoreEntry(entry, pendingNavigations));
         } catch (Exception exception) {
             LOGGER.warn("Could not load navigation bots; keeping the save for manual recovery", exception);
         }
     }
 
-    private void restoreEntry(ValueInput entry) {
+    private void restorePendingNavigations() {
+        if (pendingNavigations.isEmpty()) return;
+        PendingNavigation[] pending = pendingNavigations.toArray(PendingNavigation[]::new);
+        pendingNavigations.clear();
+        for (PendingNavigation restore : pending) {
+            try {
+                if (!restore.handle().navigatorImpl().restoreState(restore.input())) {
+                    LOGGER.warn("Skipping persisted navigation for bot {}: follow target is unavailable",
+                            restore.handle().name());
+                }
+            } catch (RuntimeException exception) {
+                LOGGER.warn("Skipping invalid persisted navigation for bot {}", restore.handle().name(), exception);
+            }
+        }
+    }
+
+    private void restoreEntry(ValueInput entry, List<PendingNavigation> pending) {
         String name = entry.getStringOr("name", "bot");
         String dimensionId = entry.getStringOr("dimension", Level.OVERWORLD.identifier().toString());
         ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, Identifier.parse(dimensionId));
@@ -180,9 +210,12 @@ public final class BotRuntime implements BotService, AutoCloseable {
         UUID uuid = entry.read("UUID", net.minecraft.core.UUIDUtil.CODEC).orElse(UUID.randomUUID());
         Vec3 position = entry.read("Pos", Vec3.CODEC).orElse(Vec3.ZERO);
         Vec2 rotation = entry.read("Rotation", Vec2.CODEC).orElse(Vec2.ZERO);
-        BotHandle handle = create(new BotCreateOptions(name, uuid, level, position, rotation.x, rotation.y));
+        BotHandleImpl handle = (BotHandleImpl) create(new BotCreateOptions(name, uuid, level, position, rotation.x, rotation.y));
         handle.player().load(entry);
+        entry.child("navigation").ifPresent(navigation -> pending.add(new PendingNavigation(handle, navigation)));
     }
+
+    private record PendingNavigation(BotHandleImpl handle, ValueInput input) { }
 
     /** A disconnected connection is sufficient for server simulation and never queues packets. */
     private static final class BotConnection extends Connection {

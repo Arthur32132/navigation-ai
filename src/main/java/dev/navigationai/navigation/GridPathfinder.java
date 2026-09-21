@@ -15,6 +15,7 @@ import java.util.Set;
 public final class GridPathfinder {
     private static final int[][] MOVES = {
         {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1},
+        {0, 1, 0}, {0, -1, 0},
         {1, 1, 0}, {-1, 1, 0}, {0, 1, 1}, {0, 1, -1},
         {1, -1, 0}, {-1, -1, 0}, {0, -1, 1}, {0, -1, -1}
     };
@@ -25,11 +26,17 @@ public final class GridPathfinder {
         if (!world.passable(start)) return new GridPath(List.of(), 0);
         if (start.equals(goal)) return new GridPath(List.of(start), 1);
         record Entry(GridPos pos, double priority) { }
-        PriorityQueue<Entry> open = new PriorityQueue<>(Comparator.comparingDouble(Entry::priority));
+        PriorityQueue<Entry> open = new PriorityQueue<>(Comparator
+                .comparingDouble(Entry::priority)
+                .thenComparingInt(entry -> entry.pos().y())
+                .thenComparingInt(entry -> entry.pos().x())
+                .thenComparingInt(entry -> entry.pos().z()));
         Map<GridPos, Double> score = new HashMap<>();
         Map<GridPos, GridPos> parent = new HashMap<>();
+        Map<GridPos, Integer> steps = new HashMap<>();
         Set<GridPos> closed = new HashSet<>();
         score.put(start, 0.0);
+        steps.put(start, 0);
         open.add(new Entry(start, heuristic(start, goal)));
         int visited = 0;
         while (!open.isEmpty() && visited < policy.maxSearchNodes()) {
@@ -41,10 +48,14 @@ public final class GridPathfinder {
             }
             for (int[] move : MOVES) {
                 GridPos next = current.add(move[0], move[1], move[2]);
-                if (!world.passable(next) || closed.contains(next)) continue;
+                if (!world.canTraverse(current, next) || closed.contains(next)) continue;
+                int nextSteps = steps.get(current) + 1;
+                if (nextSteps > policy.maxPathLength()) continue;
                 double nextScore = score.get(current) + world.cost(current, next);
+                if (world.dangerous(next)) nextScore += policy.dangerCost();
                 if (nextScore >= score.getOrDefault(next, Double.POSITIVE_INFINITY)) continue;
                 score.put(next, nextScore);
+                steps.put(next, nextSteps);
                 parent.put(next, current);
                 open.add(new Entry(next, nextScore + heuristic(next, goal)));
             }
@@ -53,7 +64,8 @@ public final class GridPathfinder {
     }
 
     private static double heuristic(GridPos a, GridPos b) {
-        return Math.abs(a.x() - b.x()) + Math.abs(a.z() - b.z()) + Math.abs(a.y() - b.y()) * 1.25;
+        return Math.max(Math.abs(a.x() - b.x()), Math.abs(a.z() - b.z()))
+                + Math.abs(a.y() - b.y());
     }
 
     private static List<GridPos> reconstruct(Map<GridPos, GridPos> parent, GridPos current) {
