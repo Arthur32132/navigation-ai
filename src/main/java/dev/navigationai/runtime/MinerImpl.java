@@ -53,8 +53,14 @@ final class MinerImpl implements Miner {
             task.originalSlot = player.getInventory().getSelectedSlot();
             task.toolSlot = selected;
             selectToolSlot(player, selected);
+            task.toolPrepared = true;
         }
-        task.progress += state.getDestroyProgress(player, level, position);
+        float destroyProgress = state.getDestroyProgress(player, level, position);
+        if (destroyProgress <= 0.0f) {
+            task.fail("cannot_break");
+            return;
+        }
+        task.progress += destroyProgress;
         if (task.progress < 1.0f) {
             player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
             return;
@@ -107,6 +113,7 @@ final class MinerImpl implements Miner {
     }
 
     private void restoreToolSlot(ServerPlayer player) {
+        if (!task.toolPrepared || task.toolRestored) return;
         Inventory inventory = player.getInventory();
         int selected = task.originalSlot;
         if (task.swapped) {
@@ -117,6 +124,7 @@ final class MinerImpl implements Miner {
         }
         inventory.setSelectedSlot(selected);
         task.toolSlot = -1;
+        task.toolRestored = true;
     }
 
     private final class MiningTaskImpl implements MiningTask {
@@ -125,9 +133,11 @@ final class MinerImpl implements Miner {
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private MiningStatus status = MiningStatus.RUNNING;
         private int ticks;
-        private int originalSlot;
-        private int toolSlot;
+        private int originalSlot = -1;
+        private int toolSlot = -1;
         private boolean swapped;
+        private boolean toolPrepared;
+        private boolean toolRestored;
         private float progress;
         private final long started = System.nanoTime();
 

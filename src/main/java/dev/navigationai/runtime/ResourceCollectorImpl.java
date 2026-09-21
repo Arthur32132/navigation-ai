@@ -71,9 +71,21 @@ final class ResourceCollectorImpl implements ResourceCollector {
     }
 
     private void search(GatherTaskImpl current) {
+        ServerLevel level = (ServerLevel) owner.player().level();
+        if (current.target != null) {
+            if (!current.request.blocks().contains(level.getBlockState(current.target).getBlock())) {
+                clearTarget(current);
+            } else if (current.standingIndex < current.standingPositions.size()
+                    && current.attemptsForBlock < current.policy.maxAttemptsPerBlock()) {
+                startNavigation(current, current.standingPositions.get(current.standingIndex++));
+                current.attemptsForBlock++;
+                return;
+            } else {
+                clearTarget(current);
+            }
+        }
         if (current.candidates.isEmpty()) {
             ServerPlayer player = owner.player();
-            ServerLevel level = (ServerLevel) player.level();
             BlockPos origin = player.blockPosition();
             int radius = current.policy.radius();
             List<BlockPos> found = new ArrayList<>();
@@ -90,21 +102,39 @@ final class ResourceCollectorImpl implements ResourceCollector {
         }
         while (current.candidateIndex < current.candidates.size()) {
             BlockPos target = current.candidates.get(current.candidateIndex++);
-            ServerLevel level = (ServerLevel) owner.player().level();
             if (!current.request.blocks().contains(level.getBlockState(target).getBlock())) continue;
-            BlockPos stand = findStandingPosition(level, target);
-            if (stand == null) continue;
+            List<BlockPos> standingPositions = findStandingPositions(level, target);
+            if (standingPositions.isEmpty()) continue;
             current.target = target;
-            current.stand = stand;
-            current.phase = GatherPhase.MOVING;
-            current.navigation = owner.navigator().goTo(
-                    new NavigationGoal.PositionGoal(Vec3.atCenterOf(stand), 1.0),
-                    new NavigationPolicy(false, false, true, false, 10_000, 256, current.policy.radius(), 0));
+            current.standingPositions = standingPositions;
+            current.standingIndex = 0;
+            current.attemptsForBlock = 0;
+            startNavigation(current, current.standingPositions.get(current.standingIndex++));
+            current.attemptsForBlock++;
             return;
         }
         current.fail(current.brokenBlocks == 0
                 ? (current.lastFailureReason == null ? "no_resources" : current.lastFailureReason)
                 : "resources_exhausted");
+    }
+
+    private void startNavigation(GatherTaskImpl current, BlockPos stand) {
+        current.stand = stand;
+        current.phase = GatherPhase.MOVING;
+        current.navigation = owner.navigator().goTo(
+                new NavigationGoal.PositionGoal(Vec3.atCenterOf(stand), 1.0),
+                new NavigationPolicy(false, false, true, false, 10_000, 256,
+                        Math.max(4, current.policy.radius()), 0));
+    }
+
+    private void clearTarget(GatherTaskImpl current) {
+        current.target = null;
+        current.stand = null;
+        current.standingPositions = List.of();
+        current.standingIndex = 0;
+        current.attemptsForBlock = 0;
+        current.navigation = null;
+        current.mining = null;
     }
 
     private void tickMoving(GatherTaskImpl current) {
@@ -141,7 +171,10 @@ final class ResourceCollectorImpl implements ResourceCollector {
         if (current.collected >= current.request.count()) { current.complete("target_reached"); return; }
         if (current.collectingTicks >= 20) {
             if (!hasInventoryRoom(owner.player(), current.request.items())) current.fail("inventory_full");
-            else current.phase = GatherPhase.SEARCHING;
+            else {
+                clearTarget(current);
+                current.phase = GatherPhase.SEARCHING;
+            }
         }
     }
 
@@ -165,20 +198,23 @@ final class ResourceCollectorImpl implements ResourceCollector {
 
     private static boolean hasInventoryRoom(ServerPlayer player, java.util.Set<net.minecraft.world.item.Item> items) {
         for (net.minecraft.world.item.Item item : items) {
-            if (player.getInventory().getSlotWithRemainingSpace(new ItemStack(item)) >= 0) return true;
+            ItemStack probe = new ItemStack(item);
+            if (player.getInventory().getSlotWithRemainingSpace(probe) >= 0
+                    || player.getInventory().getFreeSlot() >= 0) return true;
         }
         return false;
     }
 
-    private static BlockPos findStandingPosition(ServerLevel level, BlockPos target) {
+    private static List<BlockPos> findStandingPositions(ServerLevel level, BlockPos target) {
+        List<BlockPos> positions = new ArrayList<>();
         for (BlockPos candidate : new BlockPos[] {
                 target.west(), target.east(), target.north(), target.south(), target.above() }) {
             BlockState feet = level.getBlockState(candidate);
             BlockState head = level.getBlockState(candidate.above());
             BlockState below = level.getBlockState(candidate.below());
-            if (feet.isAir() && head.isAir() && !below.isAir()) return candidate;
+            if (feet.isAir() && head.isAir() && !below.isAir()) positions.add(candidate);
         }
-        return null;
+        return List.copyOf(positions);
     }
 
     private final class GatherTaskImpl implements GatherTask {
@@ -192,9 +228,12 @@ final class ResourceCollectorImpl implements ResourceCollector {
         private GatherPhase phase = GatherPhase.SEARCHING;
         private BlockPos target;
         private BlockPos stand;
+        private List<BlockPos> standingPositions = List.of();
         private NavigationTask navigation;
         private MiningTask mining;
         private int candidateIndex;
+        private int standingIndex;
+        private int attemptsForBlock;
         private int ticks;
         private int collectingTicks;
         private int baseline;
@@ -228,6 +267,8 @@ final class ResourceCollectorImpl implements ResourceCollector {
         }
         private void fail(String reason) {
             if (status != GatherStatus.RUNNING) return;
+            if (navigation != null) navigation.cancel();
+            if (mining != null) mining.cancel();
             status = GatherStatus.FAILED;
             phase = GatherPhase.DONE;
             completion.complete(new GatherResult(status, reason, collected, brokenBlocks, System.nanoTime() - started));
