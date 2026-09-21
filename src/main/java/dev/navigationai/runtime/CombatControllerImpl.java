@@ -189,7 +189,8 @@ final class CombatControllerImpl implements CombatController {
         }
 
         boolean ranged = weapon == Weapon.BOW;
-        double desiredDistance = ranged ? Math.min(policy.bowRange() - 2.0, 14.0) : policy.meleeRange() - 0.35;
+        // Movement has a 0.55-block dead zone; keep its far edge inside reach.
+        double desiredDistance = ranged ? Math.min(policy.bowRange() - 2.0, 14.0) : policy.meleeRange() - 0.75;
         moveAroundTarget(distance, desiredDistance);
         Vec3 aim = aimPoint(ranged);
         lookSmoothlyAt(aim, policy.skill());
@@ -388,8 +389,17 @@ final class CombatControllerImpl implements CombatController {
     private Vec3 aimPoint(boolean ranged) {
         Vec3 point = target.getBoundingBox().getCenter();
         if (ranged) {
-            double leadTicks = Math.min(8.0, Math.max(0.0, owner.player().distanceTo(target) / 3.0));
-            point = point.add(target.getDeltaMovement().scale(leadTicks));
+            double speed = 3.0 * BowItem.getPowerForTime(policy.skill().bowDrawTicks());
+            double flightTicks = owner.player().distanceTo(target) / Math.max(0.1, speed);
+            double leadTicks = Math.min(8.0, flightTicks);
+            Vec3 velocity = target.getDeltaMovement();
+            // Grounded entities retain downward gravity velocity even though
+            // the floor prevents displacement. Do not lead below their feet.
+            point = point.add(velocity.x * leadTicks,
+                target.onGround() ? 0.0 : velocity.y * leadTicks, velocity.z * leadTicks);
+            // Approximate vanilla arrow gravity (0.05 blocks/tick squared).
+            // This changes aim only; the released arrow keeps vanilla physics.
+            point = point.add(0.0, 0.025 * flightTicks * flightTicks, 0.0);
         }
         return point;
     }

@@ -48,6 +48,12 @@ run/eula.txt -> eula=true
 
 ## Проверка перед релизом
 
+Для повторяемых игровых проверок добычи и боя используйте
+[серверную регрессию](../tools/regression/README.md). Она запускается командой
+`navtest regression` в отдельном тестовом мире и проверяет 14 сценариев.
+Результат прогона 21 сентября 2026: 14/14, API selftest: 22/22,
+JUnit A*: 3/3. [Сохранённый журнал](../tools/regression/last-run.txt).
+
 1. `gradlew.bat clean build` на JDK 25.
 2. Запуск unit-тестов A* через `gradlew.bat test`.
 3. Smoke-сервер Minecraft 26.2 с Fabric API.
