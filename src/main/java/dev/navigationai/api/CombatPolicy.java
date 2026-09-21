@@ -9,14 +9,40 @@ public record CombatPolicy(
     double bowRange,
     boolean allowBow,
     boolean allowMobs,
-    boolean allowPlayers
+    boolean allowPlayers,
+    CombatWeaponMode weaponMode
 ) {
+    /** Backwards-compatible constructor; AUTO keeps the original behaviour. */
+    public CombatPolicy(CombatSkill skill, double maxFollowDistance, double meleeRange, double bowRange,
+                        boolean allowBow, boolean allowMobs, boolean allowPlayers) {
+        this(skill, maxFollowDistance, meleeRange, bowRange, allowBow, allowMobs, allowPlayers,
+            CombatWeaponMode.AUTO);
+    }
+
     public CombatPolicy {
         if (skill == null) throw new IllegalArgumentException("skill is required");
+        if (weaponMode == null) throw new IllegalArgumentException("weaponMode is required");
         if (!(maxFollowDistance > 0.0 && maxFollowDistance <= 128.0)) throw new IllegalArgumentException("maxFollowDistance must be in (0, 128]");
         if (!(meleeRange > 1.0 && meleeRange <= 6.0)) throw new IllegalArgumentException("meleeRange must be in (1, 6]");
         if (!(bowRange > meleeRange && bowRange <= 64.0)) throw new IllegalArgumentException("bowRange must be greater than meleeRange and at most 64");
     }
+
+    /** Whether a sword is permitted by this policy. */
+    public boolean allowsSword() { return weaponMode != CombatWeaponMode.BOW; }
+
+    /** Whether a bow is permitted by this policy. */
+    public boolean allowsBow() { return weaponMode == CombatWeaponMode.BOW || (weaponMode == CombatWeaponMode.AUTO && allowBow); }
+
+    /** Returns a copy with the requested weapon restriction. */
+    public CombatPolicy withWeapon(CombatWeaponMode mode) {
+        if (mode == null) throw new IllegalArgumentException("weaponMode is required");
+        return new CombatPolicy(skill, maxFollowDistance, meleeRange, bowRange,
+            mode == CombatWeaponMode.BOW || allowBow, allowMobs, allowPlayers, mode);
+    }
+
+    public CombatPolicy swordOnly() { return withWeapon(CombatWeaponMode.SWORD); }
+
+    public CombatPolicy bowOnly() { return withWeapon(CombatWeaponMode.BOW); }
 
     public static CombatPolicy standard() {
         return new CombatPolicy(CombatSkill.STANDARD, 32.0, 3.0, 28.0, true, true, true);

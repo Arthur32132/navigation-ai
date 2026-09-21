@@ -6,21 +6,24 @@ import dev.navigationai.api.CombatResult;
 import dev.navigationai.api.CombatSkill;
 import dev.navigationai.api.CombatStatus;
 import dev.navigationai.api.CombatTask;
+import dev.navigationai.api.CombatWeaponMode;
+import net.minecraft.core.component.DataComponents;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Comparator;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.AxeItem;
 import net.minecraft.world.item.BowItem;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.ProjectileWeaponItem;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
@@ -112,7 +115,15 @@ final class CombatControllerImpl implements CombatController {
     }
 
     @Override public void cancel() {
-        if (task != null && task.status == CombatStatus.RUNNING) task.cancel();
+        CombatTaskImpl cancelledTask = task;
+        if (cancelledTask != null && cancelledTask.status == CombatStatus.RUNNING) cancelledTask.cancel();
+        // A completion callback is allowed to start another task. Do not clear
+        // that new task's state when the old cancellation returns.
+        if (task != cancelledTask) return;
+        clearCombatState();
+    }
+
+    private void clearCombatState() {
         stopBow();
         owner.actions().stop();
         restoreWeapon();
@@ -172,7 +183,7 @@ final class CombatControllerImpl implements CombatController {
             finish(CombatResult.failure("no_combat_weapon", attacks, shots));
             return;
         }
-        if (desired != weapon && !equip(desired)) {
+        if ((desired != weapon || !isDesiredWeaponEquipped(desired)) && !equip(desired)) {
             finish(CombatResult.failure("weapon_not_available", attacks, shots));
             return;
         }
@@ -187,7 +198,7 @@ final class CombatControllerImpl implements CombatController {
         if (reactionTicks > 0) reactionTicks--;
 
         if (weapon == Weapon.BOW) {
-            tickBow(visible && aimed);
+            tickBow(visible && aimed && distance <= policy.bowRange());
         } else if (visible && aimed && rayHitsTarget() && reactionTicks == 0 && distance <= policy.meleeRange()
                 && player.getAttackStrengthScale(0.0f) >= 1.0f) {
             player.attack(target);
@@ -197,26 +208,27 @@ final class CombatControllerImpl implements CombatController {
 
     private Weapon chooseWeapon(double distance) {
         Inventory inventory = owner.player().getInventory();
-        if (distance > policy.meleeRange() * 1.35 && policy.allowBow() && hasUsableBow(inventory)) return Weapon.BOW;
-        if (findSlot(inventory, Weapon.SWORD) >= 0) return Weapon.SWORD;
-        if (findSlot(inventory, Weapon.AXE) >= 0) return Weapon.AXE;
-        if (policy.allowBow() && hasUsableBow(inventory)) return Weapon.BOW;
+        // A sword is always preferred in AUTO, including when the target is far
+        // away. This makes an empty hand pick up a sword and also replaces a
+        // weaker/broken sword as soon as a better usable one is available.
+        if (policy.allowsSword() && findBestSlot(inventory, Weapon.SWORD) >= 0) return Weapon.SWORD;
+        if (policy.allowsBow() && hasUsableBow(inventory)) return Weapon.BOW;
+        // Preserve the old axe fallback only for AUTO when no sword or bow is
+        // available. SWORD and BOW modes are strict restrictions.
+        if (policy.weaponMode() == CombatWeaponMode.AUTO
+                && findBestSlot(inventory, Weapon.AXE) >= 0) return Weapon.AXE;
         return Weapon.NONE;
     }
 
     private boolean hasUsableBow(Inventory inventory) {
-        int slot = findSlot(inventory, Weapon.BOW);
-        if (slot < 0) return false;
-        ItemStack bow = inventory.getItem(slot);
-        if (!(bow.getItem() instanceof BowItem bowItem)) return false;
-        return !ProjectileWeaponItem.getHeldProjectile(owner.player(), bowItem.getAllSupportedProjectiles()).isEmpty();
+        return findBestSlot(inventory, Weapon.BOW) >= 0;
     }
 
     private boolean equip(Weapon desired) {
-        if (findSlot(owner.player().getInventory(), desired) < 0) return false;
+        if (findBestSlot(owner.player().getInventory(), desired) < 0) return false;
         restoreWeapon();
         Inventory inventory = owner.player().getInventory();
-        int slot = findSlot(inventory, desired);
+        int slot = findBestSlot(inventory, desired);
         if (slot < 0) return false;
         if (slot < Inventory.getSelectionSize()) {
             inventory.setSelectedSlot(slot);
@@ -246,12 +258,54 @@ final class CombatControllerImpl implements CombatController {
         if (originalSlot >= 0) owner.player().getInventory().setSelectedSlot(originalSlot);
     }
 
-    private int findSlot(Inventory inventory, Weapon wanted) {
-        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+    private int findBestSlot(Inventory inventory, Weapon wanted) {
+        int bestSlot = -1;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int slot = 0; slot < usableInventorySize(inventory); slot++) {
             ItemStack stack = inventory.getItem(slot);
-            if (classify(stack) == wanted) return slot;
+            if (classify(stack) != wanted) continue;
+            if (stack.isBroken()) continue;
+            if (wanted == Weapon.BOW && !isUsableBow(stack)) continue;
+            double score = wanted == Weapon.SWORD ? swordScore(stack) : 0.0;
+            if (bestSlot < 0 || score > bestScore) {
+                bestSlot = slot;
+                bestScore = score;
+            }
         }
-        return -1;
+        return bestSlot;
+    }
+
+    private int usableInventorySize(Inventory inventory) {
+        return Math.min(Inventory.INVENTORY_SIZE, inventory.getContainerSize());
+    }
+
+    private boolean isUsableBow(ItemStack stack) {
+        if (!(stack.getItem() instanceof BowItem) || stack.isBroken()) return false;
+        return !owner.player().getProjectile(stack).isEmpty();
+    }
+
+    private double swordScore(ItemStack stack) {
+        double attackDamage = 0.0;
+        var modifiers = stack.get(DataComponents.ATTRIBUTE_MODIFIERS);
+        if (modifiers != null) {
+            attackDamage = modifiers.compute(Attributes.ATTACK_DAMAGE, 0.0, EquipmentSlot.MAINHAND);
+        }
+        // Damage is a tie-breaker: a sword with higher attack damage remains
+        // preferable, while among equal swords the less worn one wins.
+        double durability = stack.isDamageableItem()
+            ? (double) (stack.getMaxDamage() - stack.getDamageValue()) / Math.max(1, stack.getMaxDamage())
+            : 1.0;
+        return attackDamage * 1000.0 + durability;
+    }
+
+    private boolean isDesiredWeaponEquipped(Weapon desired) {
+        ItemStack held = owner.player().getMainHandItem();
+        if (classify(held) != desired) return false;
+        if (desired == Weapon.BOW) return isUsableBow(held);
+        if (desired != Weapon.SWORD) return !held.isBroken();
+        int bestSlot = findBestSlot(owner.player().getInventory(), Weapon.SWORD);
+        return bestSlot >= 0 && !held.isBroken()
+            && swordScore(held) >= swordScore(owner.player().getInventory().getItem(bestSlot));
     }
 
     private Weapon classify(ItemStack stack) {
@@ -267,8 +321,8 @@ final class CombatControllerImpl implements CombatController {
         if (!bowUsing) {
             if (!aimed || reactionTicks > 0) return;
             ItemStack bow = player.getItemInHand(InteractionHand.MAIN_HAND);
-            if (!(bow.getItem() instanceof BowItem bowItem)
-                    || ProjectileWeaponItem.getHeldProjectile(player, bowItem.getAllSupportedProjectiles()).isEmpty()) {
+            if (!(bow.getItem() instanceof BowItem)
+                    || player.getProjectile(bow).isEmpty()) {
                 finish(CombatResult.failure("no_arrows", attacks, shots));
                 return;
             }
@@ -304,7 +358,31 @@ final class CombatControllerImpl implements CombatController {
             sideways = ((ticks / policy.skill().strafePeriod()) & 1) == 0 ? 0.65 : -0.65;
         }
         boolean sprint = distance > desiredDistance + 4.0;
-        owner.actions().setMovement((float) sideways, (float) forward, false, sprint, false);
+        boolean jump = shouldJumpOverObstacle(distance, desiredDistance);
+        owner.actions().setMovement((float) sideways, (float) forward, jump, sprint, false);
+    }
+
+    private boolean shouldJumpOverObstacle(double distance, double desiredDistance) {
+        ServerPlayer player = owner.player();
+        if (!player.onGround()) return false;
+
+        // Do not jump while backing away. When closing distance, probe the
+        // target-facing space so the bot can jump before the collision flag is
+        // set by the physics tick. A one-block step is clear at y + 1, while a
+        // taller wall remains blocked and will not cause endless jumping.
+        boolean targetHigher = target.getY() > player.getY() + 0.75;
+        if (distance <= desiredDistance + 0.55 && !targetHigher && !player.horizontalCollision) return false;
+        double dx = target.getX() - player.getX();
+        double dz = target.getZ() - player.getZ();
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal < 1.0E-4) return false;
+        double probeDistance = Math.max(0.35, player.getBbWidth() * 0.65);
+        dx = dx / horizontal * probeDistance;
+        dz = dz / horizontal * probeDistance;
+
+        AABB probe = player.getBoundingBox().move(dx, 0.0, dz);
+        if (player.level().noBlockCollision(player, probe)) return false;
+        return player.level().noBlockCollision(player, probe.move(0.0, 1.01, 0.0));
     }
 
     private Vec3 aimPoint(boolean ranged) {
@@ -406,16 +484,11 @@ final class CombatControllerImpl implements CombatController {
     }
 
     private void finish(CombatResult result) {
-        stopBow();
-        owner.actions().stop();
-        restoreWeapon();
+        clearCombatState();
+        // Clear controller state before completing the future. CompletableFuture
+        // invokes callbacks synchronously when already complete; a callback may
+        // start another fight and must not be overwritten by this cleanup.
         if (task != null) task.complete(result);
-        target = null;
-        weapon = Weapon.NONE;
-        weaponSlot = -1;
-        nearbyMode = false;
-        nearbyRadius = 0.0;
-        nearbyEmptyTicks = 0;
     }
 
     private final class CombatTaskImpl implements CombatTask {
@@ -428,16 +501,8 @@ final class CombatControllerImpl implements CombatController {
         @Override public void cancel() {
             if (cancelled.compareAndSet(false, true) && status == CombatStatus.RUNNING) {
                 status = CombatStatus.CANCELLED;
+                clearCombatState();
                 completion.complete(CombatResult.cancelled(attacks, shots));
-                stopBow();
-                owner.actions().stop();
-                restoreWeapon();
-                target = null;
-                weapon = Weapon.NONE;
-                weaponSlot = -1;
-                nearbyMode = false;
-                nearbyRadius = 0.0;
-                nearbyEmptyTicks = 0;
             }
         }
         private void complete(CombatResult result) {

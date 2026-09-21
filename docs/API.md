@@ -18,7 +18,7 @@
 - `Miner` и `MiningTask` — разрушение одного блока через серверную механику;
 - `ResourceCollector` и `GatherTask` — поиск, добыча и подсчёт предметов;
 - `CombatController` и `CombatTask` — бой с мобом или игроком;
-- `CombatPolicy`, `CombatSkill`, `CombatResult`, `CombatStatus` — ограничения и профиль поведения;
+- `CombatPolicy`, `CombatSkill`, `CombatWeaponMode`, `CombatResult`, `CombatStatus` — ограничения и профиль поведения;
 - `Navigator` — постановка и отмена задач;
 - `NavigationGoal`, `NavigationPolicy` — цель и ограничения поиска;
 - `NavigationTask`, `NavigationResult`, `NavigationStatus` — наблюдение за задачей.
@@ -107,6 +107,22 @@ combat.completion().thenAccept(result -> server.execute(() -> {
 
 CombatTask areaCombat = bot.combat().fightNearby(16.0, CombatPolicy.expert());
 ```
+
+По умолчанию политика использует лучший доступный меч, затем лук; если нет ни
+меча, ни лука, в режиме `AUTO` сохраняется запасной вариант с топором. Пустая
+рука также автоматически заменяется оружием из обычного инвентаря. Для мода,
+которому разрешён только один тип оружия, используйте копию политики:
+
+```java
+CombatPolicy swordOnly = CombatPolicy.standard().swordOnly();
+CombatPolicy bowOnly = CombatPolicy.expert().bowOnly();
+// То же самое: policy.withWeapon(CombatWeaponMode.SWORD/BOW)
+```
+
+`CombatWeaponMode.SWORD` и `BOW` являются строгими режимами: при отсутствии
+подходящего оружия задача завершается с ошибкой и не переключается на другой
+тип. Старый конструктор `CombatPolicy` из семи аргументов сохраняет режим
+`AUTO` для совместимости.
 
 `CombatPolicy.expert()` выбирает более быструю реакцию, плавный поворот и более
 узкую погрешность прицеливания. `CombatPolicy.standard()` оставляет больше
