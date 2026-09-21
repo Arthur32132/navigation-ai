@@ -1,0 +1,8 @@
+.gradle/
+build/
+run/
+minecraft-server-26.2/
+out/
+*.iml
+.idea/
+.vscode/
