@@ -2,6 +2,7 @@ package dev.navigationai.navigation;
 
 import dev.navigationai.api.NavigationPolicy;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -34,6 +35,19 @@ class GridPathfinderTest {
         GridPath path = GridPathfinder.find(world, new GridPos(0, 0, 0), new GridPos(90, 0, 90), policy(128));
         assertTrue(path.nodes().isEmpty());
         assertEquals(128, path.nodesVisited());
+    }
+
+    @Test
+    void reportsCooperativeGlobalBudgetExhaustionSeparatelyFromUnreachable() {
+        GridWorld world = pos -> Math.abs(pos.x()) < 100 && Math.abs(pos.z()) < 100 && pos.y() == 0;
+        AtomicInteger remaining = new AtomicInteger(3);
+
+        GridPath path = GridPathfinder.find(world, new GridPos(0, 0, 0), new GridPos(90, 0, 90),
+                policy(10_000), () -> remaining.getAndDecrement() > 0);
+
+        assertTrue(path.nodes().isEmpty());
+        assertEquals(3, path.nodesVisited());
+        assertTrue(path.budgetExhausted());
     }
 
     @Test
@@ -89,5 +103,71 @@ class GridPathfinderTest {
         GridPath path = GridPathfinder.find(world, start, goal, policy(128));
 
         assertEquals(List.of(start, new GridPos(0, 1, 0), new GridPos(0, 2, 0), goal), path.nodes());
+    }
+
+    @Test
+    void jumpsAcrossOneTwoAndThreeBlockGaps() {
+        for (int gap = 1; gap <= 3; gap++) {
+            GridPos start = new GridPos(0, 0, 0);
+            GridPos goal = new GridPos(gap + 1, 0, 0);
+            GridWorld world = new GridWorld() {
+                @Override public boolean passable(GridPos pos) {
+                    return pos.equals(start) || pos.equals(goal);
+                }
+
+                @Override public boolean canJump(GridPos from, GridPos to) {
+                    return from.equals(start) && to.equals(goal);
+                }
+            };
+
+            GridPath path = GridPathfinder.find(world, start, goal, policy(128));
+
+            assertEquals(List.of(start, goal), path.nodes(), "gap=" + gap);
+        }
+    }
+
+    @Test
+    void doesNotJumpAcrossLongerGap() {
+        GridPos start = new GridPos(0, 0, 0);
+        GridPos goal = new GridPos(5, 0, 0);
+        GridWorld world = new GridWorld() {
+            @Override public boolean passable(GridPos pos) {
+                return pos.equals(start) || pos.equals(goal);
+            }
+
+            @Override public boolean canJump(GridPos from, GridPos to) {
+                return true;
+            }
+        };
+
+        GridPath path = GridPathfinder.find(world, start, goal, policy(128));
+
+        assertTrue(path.nodes().isEmpty());
+    }
+
+    @Test
+    void limitsWaterAndPrefersDryDetour() {
+        GridPos start = new GridPos(0, 0, 0);
+        GridPos goal = new GridPos(4, 0, 0);
+        GridWorld world = new GridWorld() {
+            @Override public boolean passable(GridPos pos) {
+                return pos.y() == 0 && pos.x() >= 0 && pos.x() <= 4 && Math.abs(pos.z()) <= 1;
+            }
+
+            @Override public boolean isWater(GridPos pos) {
+                return pos.y() == 0 && pos.z() == 0 && pos.x() >= 1 && pos.x() <= 3;
+            }
+
+            @Override public int maxWaterSteps() { return 8; }
+
+            @Override public double cost(GridPos from, GridPos to) {
+                return GridWorld.super.cost(from, to) + (isWater(to) ? 3.0 : 0.0);
+            }
+        };
+
+        GridPath path = GridPathfinder.find(world, start, goal, policy(512));
+
+        assertFalse(path.nodes().isEmpty());
+        assertTrue(path.nodes().stream().noneMatch(pos -> pos.z() == 0 && pos.x() >= 1 && pos.x() <= 3));
     }
 }

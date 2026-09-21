@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.core.BlockPos;
@@ -24,6 +25,7 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.storage.ValueInput;
 import net.minecraft.world.level.storage.ValueOutput;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.item.BlockItem;
@@ -34,6 +36,8 @@ import net.minecraft.world.level.block.TrapDoorBlock;
 import net.minecraft.world.level.block.state.BlockState;
 
 final class NavigatorImpl implements Navigator {
+    private static final double STANDING_CLEARANCE_MARGIN = 0.10D;
+    private static final double CROUCHING_CLEARANCE_MARGIN = 0.02D;
     private final BotRuntime runtime;
     private final BotHandleImpl owner;
     private NavigationGoal goal;
@@ -51,6 +55,11 @@ final class NavigatorImpl implements Navigator {
     private long nextHazardRepathNanos;
     private WorldSnapshot plannedSnapshot;
     private boolean finalPlanningSegment;
+    private boolean planningDeferred;
+    private Future<?> searchFuture;
+    private int budgetDeferrals;
+
+    private static final int MAX_BUDGET_DEFERRALS = 3;
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
 
@@ -62,6 +71,7 @@ final class NavigatorImpl implements Navigator {
         this.goal = goal;
         this.policy = policy;
         this.task = new NavigationTaskImpl();
+        this.budgetDeferrals = 0;
         requestPath();
         return task;
     }
@@ -77,6 +87,9 @@ final class NavigatorImpl implements Navigator {
         repathAttempts = 0;
         plannedSnapshot = null;
         finalPlanningSegment = false;
+        planningDeferred = false;
+        budgetDeferrals = 0;
+        cancelSearchFuture();
         nextHazardRepathNanos = 0L;
     }
     @Override public NavigationStatus status() { return task == null ? NavigationStatus.IDLE : task.status(); }
@@ -193,6 +206,11 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        if (planningDeferred) {
+            planningDeferred = false;
+            requestPath();
+            if (planningDeferred || task.status() == NavigationStatus.COMPUTING) return;
+        }
         if (navigationMining != null) {
             if (navigationMining.status() == MiningStatus.RUNNING) return;
             if (navigationMining.status() == MiningStatus.FAILED || navigationMining.status() == MiningStatus.CANCELLED) {
@@ -235,7 +253,15 @@ final class NavigatorImpl implements Navigator {
             } else if (finalPlanningSegment) {
                 tickFinalApproach();
             } else {
-                requestPath();
+                // A local segment can end at a reachable neighbour when the
+                // requested cell is blocked. If the bot did not move, do not
+                // keep rebuilding the same one-cell route forever.
+                if (++repathAttempts >= 3) {
+                    owner.actions().stop();
+                    task.stuck(resultNodesVisited());
+                } else {
+                    requestPath();
+                }
             }
             return;
         }
@@ -266,10 +292,14 @@ final class NavigatorImpl implements Navigator {
         BlockPos currentBlock = owner.player().blockPosition();
         ServerLevel level = (ServerLevel) owner.player().level();
         boolean climbing = isClimbable(level, next) || isClimbable(level, currentBlock);
-        boolean jump = climbing ? next.getY() > currentBlock.getY()
+        BlockPos edgeStart = pathIndex > 0 ? path.get(pathIndex - 1) : currentBlock;
+        boolean jumpGap = isJumpTransition(edgeStart, next);
+        boolean jump = jumpGap ? owner.player().onGround()
+                : climbing ? next.getY() > currentBlock.getY()
                 : next.getY() > currentBlock.getY() && owner.player().onGround();
-        boolean sneak = climbing && next.getY() < currentBlock.getY();
-        owner.actions().setMovement(0, 1, jump, !climbing, sneak);
+        boolean sneak = requiresSneak(currentBlock) || requiresSneak(next)
+                || (climbing && next.getY() < currentBlock.getY());
+        owner.actions().setMovement(0, 1, jump, !climbing && !sneak, sneak);
         Vec3 current = owner.player().position();
         boolean progressed = lastPosition == null || current.distanceToSqr(lastPosition) >= 0.0004;
         if (progressed) {
@@ -291,10 +321,24 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void requestPath() {
-        if (task == null || task.cancelled.get()) return;
+        if (task == null || task.cancelled.get() || isTerminal(task.status())) return;
+        boolean replan = !planningDeferred && (plannedSnapshot != null || !path.isEmpty());
+        if (replan) runtime.recordReplan();
+        long generation = ++requestGeneration;
+        cancelSearchFuture();
         task.status = NavigationStatus.COMPUTING;
         path = List.of(); pathIndex = 0;
         owner.actions().stop();
+        if (runtime.shouldDeferPathSearch(searchPriority())) {
+            runtime.recordBackpressureDeferral();
+            planningDeferred = true;
+            return;
+        }
+        if (!runtime.tryAcquireSnapshotBudget()) {
+            planningDeferred = true;
+            return;
+        }
+        planningDeferred = false;
         ServerPlayer player = owner.player();
         ServerLevel level = (ServerLevel)player.level();
         if (goal instanceof NavigationGoal.FollowGoal follow) followPlanPosition = follow.target().position();
@@ -303,8 +347,14 @@ final class NavigatorImpl implements Navigator {
         GridPos desired = new GridPos(requestedTarget.getX(), requestedTarget.getY(), requestedTarget.getZ());
         GridPos localTarget = clampPlanningTarget(startPos, desired);
         finalPlanningSegment = localTarget.equals(desired);
-        WorldSnapshot snapshot = WorldSnapshot.capture(level, player, startPos, localTarget, policy.snapshotRadius(),
-                policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing());
+        long snapshotStarted = System.nanoTime();
+        WorldSnapshot snapshot;
+        try {
+            snapshot = WorldSnapshot.capture(level, player, startPos, localTarget, policy.snapshotRadius(),
+                    policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing());
+        } finally {
+            runtime.recordSnapshot(System.nanoTime() - snapshotStarted);
+        }
         plannedSnapshot = snapshot;
         GridPos goalPos = findReachableGoal(snapshot, localTarget);
         // Keep the search asynchronous even when the requested cell is blocked.
@@ -315,14 +365,29 @@ final class NavigatorImpl implements Navigator {
         GridPos searchGoal = goalPos;
         long started = System.nanoTime();
         pathStartedNanos = started;
-        long generation = ++requestGeneration;
         try {
-            runtime.pathExecutor().submit(() -> {
-                GridPath result = GridPathfinder.find(snapshot, startPos, searchGoal, policy);
+            searchFuture = runtime.pathScheduler().submit(searchPriority(), () -> {
+                long searchStarted = System.nanoTime();
+                GridPath result = GridPathfinder.find(snapshot, startPos, searchGoal, policy, runtime.pathNodeBudget()::tryConsume);
+                runtime.recordPathSearch(result.nodesVisited(), System.nanoTime() - searchStarted);
                 runtime.server().execute(() -> applyPath(result, started, generation));
             });
+            runtime.recordPathSearchSubmitted();
         } catch (RejectedExecutionException rejected) {
+            searchFuture = null;
+            runtime.recordPathSearchRejected();
             task.fail("search_queue_full", 0);
+        }
+    }
+
+    private int searchPriority() {
+        return goal instanceof NavigationGoal.FollowGoal ? 10 : 20;
+    }
+
+    private void cancelSearchFuture() {
+        if (searchFuture != null) {
+            if (runtime.pathScheduler().cancel(searchFuture)) runtime.recordPathSearchCancelled();
+            searchFuture = null;
         }
     }
 
@@ -367,12 +432,17 @@ final class NavigatorImpl implements Navigator {
         ServerPlayer player = owner.player();
         ServerLevel level = (ServerLevel) player.level();
         BlockState state = level.getBlockState(next);
+        // A closed trapdoor can be part of a deliberate crawl-height tunnel.
+        // Keep it closed and use the crouching pose instead of opening the
+        // block and losing the clearance information from the plan.
+        if (requiresSneak(next) && isLowSurface(level, next, state)) return true;
         if (openDoorOrTrapdoor(level, next, state)) return true;
         if (state.is(BlockTags.CLIMBABLE)) return true;
         if (isOpenDoorOrTrapdoor(state)) return true;
         var stateShape = state.getCollisionShape(level, next);
         if (!stateShape.isEmpty() && stateShape.max(net.minecraft.core.Direction.Axis.Y) <= 0.5D
-                && level.getBlockState(next.above()).getCollisionShape(level, next.above()).isEmpty()) return true;
+                && (hasClearanceAbove(level, next, Pose.STANDING)
+                || hasClearanceAbove(level, next, Pose.CROUCHING))) return true;
         if (!stateShape.isEmpty()) {
             if (!policy.allowBreaking() || next.equals(player.blockPosition())) {
                 task.fail("obstacle_requires_breaking", resultNodesVisited());
@@ -383,6 +453,8 @@ final class NavigatorImpl implements Navigator {
         }
         var above = level.getBlockState(next.above());
         if (!above.getCollisionShape(level, next.above()).isEmpty()) {
+            if (hasBodyClearance(level, next, Pose.STANDING)
+                    || hasBodyClearance(level, next, Pose.CROUCHING)) return true;
             if (!policy.allowBreaking() || above.is(net.minecraft.world.level.block.Blocks.BEDROCK)
                     || above.getDestroySpeed(level, next.above()) < 0.0f) {
                 task.fail("obstacle_requires_breaking", resultNodesVisited());
@@ -393,11 +465,15 @@ final class NavigatorImpl implements Navigator {
         }
         BlockPos support = next.below();
         if (state.getCollisionShape(level, next).isEmpty()
-                && level.getBlockState(support).getCollisionShape(level, support).isEmpty()
-                && policy.allowPlacing()
-                && !placeSupport(level, support)) {
-            task.fail("no_building_material", resultNodesVisited());
-            return false;
+                && level.getBlockState(support).getCollisionShape(level, support).isEmpty()) {
+            // Water is a valid support-less transition only when the policy
+            // explicitly allows swimming. Empty air must never be treated as
+            // a normal walking cell after the world changed under the bot.
+            if (isWater(level, next) && policy.allowWater()) return true;
+            if (!policy.allowPlacing() || !placeSupport(level, support)) {
+                task.fail("no_building_material", resultNodesVisited());
+                return false;
+            }
         }
         return true;
     }
@@ -405,14 +481,14 @@ final class NavigatorImpl implements Navigator {
     private boolean openDoorOrTrapdoor(ServerLevel level, BlockPos position, BlockState state) {
         ServerPlayer player = owner.player();
         if (state.getBlock() instanceof DoorBlock door
-                && state.is(BlockTags.WOODEN_DOORS)
+                && door.type().canOpenByHand()
                 && state.hasProperty(DoorBlock.OPEN) && !state.getValue(DoorBlock.OPEN)) {
             BlockPos lower = state.hasProperty(DoorBlock.HALF)
                     && state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER
                     ? position.below() : position;
             BlockState lowerState = level.getBlockState(lower);
             if (lowerState.getBlock() instanceof DoorBlock lowerDoor
-                    && lowerState.is(BlockTags.WOODEN_DOORS)
+                    && lowerDoor.type().canOpenByHand()
                     && lowerState.hasProperty(DoorBlock.OPEN) && !lowerState.getValue(DoorBlock.OPEN)) {
                 if (!player.mayInteract(level, lower)) return false;
                 lowerDoor.setOpen(player, level, lowerState, lower, true);
@@ -436,6 +512,34 @@ final class NavigatorImpl implements Navigator {
 
     private boolean isClimbable(ServerLevel level, BlockPos position) {
         return level.getBlockState(position).is(BlockTags.CLIMBABLE);
+    }
+
+    private boolean isJumpTransition(BlockPos from, BlockPos to) {
+        if (from.getY() != to.getY()) return false;
+        int dx = Math.abs(to.getX() - from.getX());
+        int dz = Math.abs(to.getZ() - from.getZ());
+        return (dx == 0 && dz >= 2 && dz <= 4) || (dz == 0 && dx >= 2 && dx <= 4);
+    }
+
+    private boolean requiresSneak(BlockPos position) {
+        if (plannedSnapshot == null) return false;
+        return plannedSnapshot.requiresSneak(new GridPos(position.getX(), position.getY(), position.getZ()));
+    }
+
+    private boolean hasBodyClearance(ServerLevel level, BlockPos position, Pose pose) {
+        BlockState state = level.getBlockState(position);
+        if (!state.getCollisionShape(level, position).isEmpty()) return false;
+        return hasClearanceAbove(level, position, pose);
+    }
+
+    private boolean hasClearanceAbove(ServerLevel level, BlockPos position, Pose pose) {
+        BlockState above = level.getBlockState(position.above());
+        var aboveShape = above.getCollisionShape(level, position.above());
+        double height = owner.player().getDimensions(pose).height();
+        double margin = pose == Pose.CROUCHING ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        return aboveShape.isEmpty()
+                || 1.0D + aboveShape.min(net.minecraft.core.Direction.Axis.Y)
+                >= height + margin;
     }
 
     private boolean hasDynamicObstacle(BlockPos position) {
@@ -482,6 +586,14 @@ final class NavigatorImpl implements Navigator {
         BlockState state = level.getBlockState(position);
         if (isOpenable(state) || isOpenDoorOrTrapdoor(state) || state.is(BlockTags.CLIMBABLE)) return false;
         if (isLowSurface(level, position, state)) return false;
+        if (hasBodyClearance(level, position, Pose.STANDING)
+                || hasBodyClearance(level, position, Pose.CROUCHING)) return false;
+        BlockPos support = position.below();
+        if (state.getCollisionShape(level, position).isEmpty()
+                && level.getBlockState(position.above()).getCollisionShape(level, position.above()).isEmpty()
+                && level.getBlockState(support).getCollisionShape(level, support).isEmpty()
+                && !isWater(level, position)
+                && !policy.allowPlacing()) return true;
         // A planned breakable cell is intentional when this policy allows
         // mining; let prepareTransition start the mining task instead of
         // treating it as a newly appeared dynamic obstacle.
@@ -496,8 +608,8 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean isOpenable(BlockState state) {
-        return (state.getBlock() instanceof DoorBlock
-                && state.is(BlockTags.WOODEN_DOORS)
+        return (state.getBlock() instanceof DoorBlock door
+                && door.type().canOpenByHand()
                 && state.hasProperty(DoorBlock.OPEN) && !state.getValue(DoorBlock.OPEN))
                 || (state.getBlock() instanceof TrapDoorBlock && state.is(BlockTags.WOODEN_TRAPDOORS)
                 && state.hasProperty(TrapDoorBlock.OPEN) && !state.getValue(TrapDoorBlock.OPEN));
@@ -506,7 +618,8 @@ final class NavigatorImpl implements Navigator {
     private boolean isLowSurface(ServerLevel level, BlockPos position, BlockState state) {
         return !state.getCollisionShape(level, position).isEmpty()
                 && state.getCollisionShape(level, position).max(net.minecraft.core.Direction.Axis.Y) <= 0.5D
-                && level.getBlockState(position.above()).getCollisionShape(level, position.above()).isEmpty();
+                && (hasClearanceAbove(level, position, Pose.STANDING)
+                || hasClearanceAbove(level, position, Pose.CROUCHING));
     }
 
     private boolean isOpenDoorOrTrapdoor(BlockState state) {
@@ -514,6 +627,12 @@ final class NavigatorImpl implements Navigator {
                 && state.getValue(DoorBlock.OPEN))
                 || (state.getBlock() instanceof TrapDoorBlock && state.hasProperty(TrapDoorBlock.OPEN)
                 && state.getValue(TrapDoorBlock.OPEN));
+    }
+
+    private boolean isWater(ServerLevel level, BlockPos position) {
+        var fluid = level.getFluidState(position).getType();
+        return fluid == net.minecraft.world.level.material.Fluids.WATER
+                || fluid == net.minecraft.world.level.material.Fluids.FLOWING_WATER;
     }
 
     private boolean requestHazardRepath() {
@@ -571,13 +690,17 @@ final class NavigatorImpl implements Navigator {
         ServerPlayer player = owner.player();
         if (!player.mayInteract(level, position)) return false;
         if (!hasSolidNeighbour(level, position)) return false;
+        BlockState existing = level.getBlockState(position);
+        if (!existing.canBeReplaced() || !level.getFluidState(position).isEmpty()) return false;
         for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
             ItemStack stack = player.getInventory().getItem(slot);
             if (!(stack.getItem() instanceof BlockItem blockItem)) continue;
             Block block = blockItem.getBlock();
             var state = block.defaultBlockState();
-            if (!state.isSolid() || !state.canSurvive(level, position)) continue;
-            if (level.setBlock(position, state, 3)) {
+            if (!state.isSolid() || block instanceof net.minecraft.world.level.block.FallingBlock
+                    || !state.canSurvive(level, position)) continue;
+            if (level.setBlock(position, state, 3)
+                    && level.getBlockState(position).getBlock() == block) {
                 stack.shrink(1);
                 return true;
             }
@@ -612,8 +735,19 @@ final class NavigatorImpl implements Navigator {
     private int resultNodesVisited() { return path.size(); }
 
     private void applyPath(GridPath result, long started, long generation) {
-        if (task == null || task.cancelled.get() || goal == null) return;
+        if (task == null || task.cancelled.get() || goal == null || isTerminal(task.status())) return;
         if (generation != requestGeneration) return;
+        if (result.budgetExhausted()) {
+            runtime.recordNodeBudgetDeferral();
+            if (++budgetDeferrals > MAX_BUDGET_DEFERRALS) {
+                task.fail("search_budget_exhausted", result.nodesVisited());
+                return;
+            }
+            planningDeferred = true;
+            task.status = NavigationStatus.COMPUTING;
+            return;
+        }
+        budgetDeferrals = 0;
         if (result.nodes().isEmpty()) { task.fail("unreachable", result.nodesVisited()); return; }
         if (result.nodes().size() - 1 > policy.maxPathLength()) {
             task.fail("path_too_long", result.nodesVisited());
@@ -628,6 +762,9 @@ final class NavigatorImpl implements Navigator {
 
     private void finishSuccess() {
         owner.actions().stop();
+        requestGeneration++;
+        cancelSearchFuture();
+        planningDeferred = false;
         int nodes = path.size();
         long duration = System.nanoTime() - pathStartedNanos;
         path = List.of();
@@ -653,6 +790,8 @@ final class NavigatorImpl implements Navigator {
                     }
                     if (NavigatorImpl.this.task == this) {
                         NavigatorImpl.this.requestGeneration++;
+                        NavigatorImpl.this.planningDeferred = false;
+                        NavigatorImpl.this.cancelSearchFuture();
                         NavigatorImpl.this.path = List.of();
                         NavigatorImpl.this.pathIndex = 0;
                         NavigatorImpl.this.goal = null;
@@ -664,6 +803,9 @@ final class NavigatorImpl implements Navigator {
         }
         void fail(String reason, int nodes) {
             owner.actions().stop();
+            NavigatorImpl.this.requestGeneration++;
+            NavigatorImpl.this.cancelSearchFuture();
+            NavigatorImpl.this.planningDeferred = false;
             path = List.of();
             pathIndex = 0;
             status = NavigationStatus.FAILED;
@@ -671,6 +813,9 @@ final class NavigatorImpl implements Navigator {
         }
         void stuck(int nodes) {
             owner.actions().stop();
+            NavigatorImpl.this.requestGeneration++;
+            NavigatorImpl.this.cancelSearchFuture();
+            NavigatorImpl.this.planningDeferred = false;
             path = List.of();
             pathIndex = 0;
             status = NavigationStatus.STUCK;

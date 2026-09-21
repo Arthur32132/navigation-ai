@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.TrapDoorBlock;
@@ -19,14 +20,26 @@ import net.minecraft.core.Direction;
 
 /** Immutable, server-thread captured collision snapshot for off-thread A*. */
 final class WorldSnapshot implements GridWorld {
+    private static final double WATER_STEP_COST = 3.0D;
+    private static final double STANDING_CLEARANCE_MARGIN = 0.10D;
+    private static final double CROUCHING_CLEARANCE_MARGIN = 0.02D;
+    private static final int MAX_WATER_STEPS = 8;
     private final Set<GridPos> passable;
     private final Set<GridPos> dangerous;
+    private final Set<GridPos> jumpable;
+    private final Set<GridPos> crouchOnly;
+    private final Set<GridPos> waterCells;
     private final int minX, maxX, minY, maxY, minZ, maxZ;
-    private final boolean water;
 
-    private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, int minX, int maxX, int minY, int maxY, int minZ, int maxZ, boolean water) {
-        this.passable = Set.copyOf(passable); this.dangerous = Set.copyOf(dangerous);
-        this.minX = minX; this.maxX = maxX; this.minY = minY; this.maxY = maxY; this.minZ = minZ; this.maxZ = maxZ; this.water = water;
+    private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, Set<GridPos> jumpable,
+                          Set<GridPos> crouchOnly, Set<GridPos> waterCells,
+                          int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
+        this.passable = Set.copyOf(passable);
+        this.dangerous = Set.copyOf(dangerous);
+        this.jumpable = Set.copyOf(jumpable);
+        this.crouchOnly = Set.copyOf(crouchOnly);
+        this.waterCells = Set.copyOf(waterCells);
+        this.minX = minX; this.maxX = maxX; this.minY = minY; this.maxY = maxY; this.minZ = minZ; this.maxZ = maxZ;
     }
 
     static WorldSnapshot capture(ServerLevel level, ServerPlayer observer, GridPos start, GridPos goal, int radius, boolean allowWater,
@@ -41,7 +54,12 @@ final class WorldSnapshot implements GridWorld {
         int maxY = Math.min(level.getMinY() + level.getHeight() - 2, Math.max(start.y(), goal.y()) + 8);
         Set<GridPos> passable = new HashSet<>();
         Set<GridPos> dangerous = new HashSet<>();
+        Set<GridPos> jumpable = new HashSet<>();
+        Set<GridPos> crouchOnly = new HashSet<>();
+        Set<GridPos> waterCells = new HashSet<>();
         Set<Long> generatedChunks = new HashSet<>();
+        double standingHeight = observer.getDimensions(Pose.STANDING).height();
+        double crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
         for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++) for (int y = minY; y <= maxY; y++) {
             BlockPos pos = new BlockPos(x, y, z);
             if (!level.hasChunkAt(pos)) {
@@ -59,14 +77,18 @@ final class WorldSnapshot implements GridWorld {
                     || fluidState.getType() == Fluids.FLOWING_WATER;
             var stateShape = state.getCollisionShape(level, pos);
             var aboveShape = above.getCollisionShape(level, pos.above());
-            boolean emptyBody = stateShape.isEmpty() && aboveShape.isEmpty();
+            boolean standingClearance = hasClearanceAbove(aboveShape, standingHeight);
+            boolean crouchingClearance = hasClearanceAbove(aboveShape, crouchingHeight);
+            boolean standingBody = stateShape.isEmpty() && standingClearance;
+            boolean crouchingBody = stateShape.isEmpty() && crouchingClearance;
             // A bottom slab, carpet or similar partial block is a valid cell
             // under the player's feet. Full-height stairs/fences remain solid.
             boolean lowSurface = !stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 0.5D
-                    && aboveShape.isEmpty();
+                    && (standingClearance || crouchingClearance);
             boolean climbable = state.is(BlockTags.CLIMBABLE)
                     && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
-            boolean openable = isClosedWoodenDoor(state) || isClosedWoodenTrapdoor(state);
+            boolean openable = (isClosedHandOpenableDoor(state) || isClosedWoodenTrapdoor(state))
+                    && observer.mayInteract(level, pos);
             boolean openDoor = state.getBlock() instanceof DoorBlock && state.hasProperty(DoorBlock.OPEN)
                     && state.getValue(DoorBlock.OPEN)
                     && (!state.hasProperty(DoorBlock.HALF)
@@ -88,13 +110,19 @@ final class WorldSnapshot implements GridWorld {
             boolean breakableAbove = allowBreaking && state.getCollisionShape(level, pos).isEmpty()
                     && isBreakable(level, pos.above(), above)
                     && !below.getCollisionShape(level, pos.below()).isEmpty();
-            boolean supportedPlacement = allowPlacing && emptyBody && below.getCollisionShape(level, pos.below()).isEmpty()
+            boolean supportedPlacement = allowPlacing && (standingBody || crouchingBody)
+                    && below.getCollisionShape(level, pos.below()).isEmpty()
                     && (hasSolidNeighbour(level, pos.below()) || hasSolidNeighbour(level, pos));
-            boolean passableCell = fluidAllowed && (emptyBody && floor || lowSurface || climbable || openable || openDoor
+            boolean passableCell = fluidAllowed && ((standingBody || crouchingBody) && floor || lowSurface || climbable || openable || openDoor
                     || breakableBody || breakableAbove || supportedPlacement);
-            if (passableCell || (allowWater && waterCell && aboveShape.isEmpty())) {
+            if (passableCell || (allowWater && waterCell && (standingClearance || crouchingClearance))) {
                 passable.add(gridPos);
             }
+            if (passable.contains(gridPos) && !standingClearance && crouchingClearance
+                    && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
+            if (stateShape.isEmpty() && aboveShape.isEmpty() && below.getCollisionShape(level, pos.below()).isEmpty()
+                    && !waterCell && !lavaCell) jumpable.add(gridPos);
+            if (waterCell) waterCells.add(gridPos);
             boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
                     || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
                     || below.is(Blocks.MAGMA_BLOCK) || below.is(Blocks.CACTUS)
@@ -120,12 +148,20 @@ final class WorldSnapshot implements GridWorld {
                         && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
             }
         }
-        return new WorldSnapshot(passable, dangerous, minX, maxX, minY, maxY, minZ, maxZ, allowWater);
+        return new WorldSnapshot(passable, dangerous, jumpable, crouchOnly, waterCells,
+                minX, maxX, minY, maxY, minZ, maxZ);
     }
 
-    private static boolean isClosedWoodenDoor(net.minecraft.world.level.block.state.BlockState state) {
-        return state.getBlock() instanceof DoorBlock
-                && state.is(BlockTags.WOODEN_DOORS)
+    private static boolean hasClearanceAbove(net.minecraft.world.phys.shapes.VoxelShape aboveShape, double height) {
+        double margin = height <= 1.6D ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        return aboveShape.isEmpty() || 1.0D + aboveShape.min(Direction.Axis.Y) >= height + margin;
+    }
+
+    private static boolean isClosedHandOpenableDoor(net.minecraft.world.level.block.state.BlockState state) {
+        return state.getBlock() instanceof DoorBlock door
+                // Copper doors are not in WOODEN_DOORS, but their block set
+                // explicitly allows the same hand interaction as wood doors.
+                && door.type().canOpenByHand()
                 && state.hasProperty(DoorBlock.OPEN) && !state.getValue(DoorBlock.OPEN)
                 && (!state.hasProperty(DoorBlock.HALF)
                     || state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
@@ -151,4 +187,26 @@ final class WorldSnapshot implements GridWorld {
         return pos.x() >= minX && pos.x() <= maxX && pos.y() >= minY && pos.y() <= maxY && pos.z() >= minZ && pos.z() <= maxZ && passable.contains(pos);
     }
     @Override public boolean dangerous(GridPos pos) { return dangerous.contains(pos); }
+    @Override public boolean canJump(GridPos from, GridPos to) {
+        if (!passable(from) || !passable(to) || from.y() != to.y()) return false;
+        int dx = to.x() - from.x();
+        int dz = to.z() - from.z();
+        if (dx != 0 && dz != 0) return false;
+        int distance = Math.max(Math.abs(dx), Math.abs(dz));
+        if (distance < 2 || distance > 4) return false;
+        int stepX = Integer.signum(dx);
+        int stepZ = Integer.signum(dz);
+        for (int step = 1; step < distance; step++) {
+            if (!jumpable.contains(from.add(step * stepX, 0, step * stepZ))) return false;
+        }
+        return true;
+    }
+    @Override public boolean requiresSneak(GridPos pos) { return crouchOnly.contains(pos); }
+    @Override public boolean isWater(GridPos pos) { return waterCells.contains(pos); }
+    @Override public int maxWaterSteps() { return MAX_WATER_STEPS; }
+    @Override public double cost(GridPos from, GridPos to) {
+        double base = GridWorld.super.cost(from, to);
+        return base + (waterCells.contains(to) ? WATER_STEP_COST : 0.0D)
+                + (crouchOnly.contains(to) ? 0.25D : 0.0D);
+    }
 }

@@ -99,10 +99,19 @@ final class MinerImpl implements Miner {
     private int selectTool(ServerPlayer player, BlockState state) {
         Inventory inventory = player.getInventory();
         int selected = inventory.getSelectedSlot();
-        if (inventory.getItem(selected).isCorrectToolForDrops(state)) return selected;
+        int bestSlot = -1;
+        float bestSpeed = -1.0f;
         for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
-            if (inventory.getItem(slot).isCorrectToolForDrops(state)) return slot;
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isCorrectToolForDrops(state) || stack.nextDamageWillBreak()) continue;
+            float speed = stack.getDestroySpeed(state);
+            if (bestSlot < 0 || speed > bestSpeed
+                    || (speed == bestSpeed && slot == selected)) {
+                bestSlot = slot;
+                bestSpeed = speed;
+            }
         }
+        if (bestSlot >= 0) return bestSlot;
         return state.requiresCorrectToolForDrops() ? -1 : selected;
     }
 

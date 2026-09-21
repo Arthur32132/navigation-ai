@@ -12,7 +12,12 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.LadderBlock;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.StairBlock;
+import net.minecraft.world.level.block.TrapDoorBlock;
 import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.world.level.block.state.properties.Half;
+import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.LoggerFactory;
@@ -33,7 +38,9 @@ public final class RuntimeRegression {
         "missing_resource", "gather_timeout_cancels_navigation", "gather_cancel",
         "best_sword_and_broken_weapon_replacement", "bow_inventory_arrows_damage", "combat_one_block_step",
         "unreachable_resource", "retry_other_side", "navigation_breaking", "navigation_bridge",
-        "navigation_door", "navigation_ladder", "navigation_dynamic_obstacle"};
+        "navigation_door", "navigation_ladder", "navigation_dynamic_obstacle",
+        "navigation_stair_geometry", "navigation_partial_surface", "navigation_water",
+        "navigation_copper_door", "navigation_jump_pits", "navigation_crouch_tunnel"};
     private boolean dynamicObstaclePlaced;
 
     public static void register() {
@@ -193,6 +200,90 @@ public final class RuntimeRegression {
                     new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
                     new NavigationPolicy(false,false,false,false,20_000,128,8,0));
             }
+            case 19 -> {
+                // A staircase is the only route to the raised platform. The
+                // path must use the support below each successive step.
+                for (int step=0; step<3; step++) {
+                    level.setBlockAndUpdate(p(2+step,step,0),
+                        Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.EAST));
+                }
+                block(5,2,0,Blocks.STONE);
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5,203.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 20 -> {
+                // A narrow corridor forces traversal over a bottom slab. The
+                // slab is a partial collision shape, not a full block.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                level.setBlockAndUpdate(p(2,0,0),
+                    Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM));
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 21 -> {
+                // Water is allowed explicitly and occupies the only corridor.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                for (int x=2; x<=4; x++) block(x,0,0,Blocks.WATER);
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,true,false,20_000,128,8,0));
+            }
+            case 22 -> {
+                // Copper doors are hand-openable in current Minecraft, but
+                // are intentionally not members of WOODEN_DOORS.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                net.minecraft.world.level.block.Block copperDoor = Blocks.COPPER_DOOR.weathering().unaffected();
+                level.setBlockAndUpdate(p(2,0,0), copperDoor.defaultBlockState()
+                    .setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER)
+                    .setValue(DoorBlock.FACING, Direction.EAST));
+                level.setBlockAndUpdate(p(2,1,0), copperDoor.defaultBlockState()
+                    .setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER)
+                    .setValue(DoorBlock.FACING, Direction.EAST));
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1026.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 23 -> {
+                // Three one-block-wide corridors gaps require jumps of one,
+                // two and three blocks respectively.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                for (int x : new int[]{2, 5, 6, 9, 10, 11}) block(x,-1,0,Blocks.AIR);
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1039.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 24 -> {
+                // A pair of non-hand-openable trapdoors leaves a tight tunnel
+                // that is passable only while the bot keeps sneak held.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                net.minecraft.world.level.block.Block trapdoor = Blocks.IRON_TRAPDOOR;
+                for (int x=2; x<=3; x++) {
+                    level.setBlockAndUpdate(p(x,0,0), trapdoor.defaultBlockState()
+                        .setValue(TrapDoorBlock.HALF, Half.BOTTOM));
+                    level.setBlockAndUpdate(p(x,1,0), trapdoor.defaultBlockState()
+                        .setValue(TrapDoorBlock.HALF, Half.TOP));
+                }
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1026.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
         }
     }
 
@@ -254,6 +345,18 @@ public final class RuntimeRegression {
                     && bot.player().getX() >= 1028.75 && level.getBlockState(p(3,0,0)).is(Blocks.STONE),
                     navigation.completion().join().toString());
             }
+            case 19 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getY() >= 202.0, navigation.completion().join().toString()); }
+            case 20 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,0,0)).is(Blocks.OAK_SLAB), navigation.completion().join().toString()); }
+            case 21 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1028.75, navigation.completion().join().toString()); }
+            case 22 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,0,0)).getValue(DoorBlock.OPEN), navigation.completion().join().toString()); }
+            case 23 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1038.75, navigation.completion().join().toString()); }
+            case 24 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1025.75, navigation.completion().join().toString()); }
             }
             if(active!=null && ticks>400) finish(false,"timed out after 400 ticks");
         } catch(Exception e) {

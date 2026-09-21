@@ -4,6 +4,7 @@ import com.mojang.authlib.GameProfile;
 import dev.navigationai.api.BotCreateOptions;
 import dev.navigationai.api.BotHandle;
 import dev.navigationai.api.BotService;
+import dev.navigationai.api.NavigationMetrics;
 import dev.navigationai.mixin.PlayerListAccessor;
 import java.util.Collection;
 import java.util.ArrayList;
@@ -14,10 +15,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
@@ -50,28 +47,60 @@ import org.slf4j.LoggerFactory;
 /** Owns all bots for one running server. All mutations happen on the server thread. */
 public final class BotRuntime implements BotService, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger("navigation_ai/runtime");
+    private static final int SNAPSHOT_BUDGET_PER_TICK = 4;
+    private static final int PATH_NODES_BUDGET_PER_TICK = 40_000;
     private final MinecraftServer server;
     private final Map<UUID, BotHandleImpl> bots = new ConcurrentHashMap<>();
     private final Map<UUID, BotConnection> connections = new ConcurrentHashMap<>();
     private final List<PendingNavigation> pendingNavigations = new ArrayList<>();
-    private final ExecutorService pathExecutor;
+    private final PathSearchScheduler pathScheduler;
+    private final PathNodeBudget pathNodeBudget = new PathNodeBudget(PATH_NODES_BUDGET_PER_TICK);
+    private final NavigationMetricsCollector metrics = new NavigationMetricsCollector();
     private int restoreDelayTicks = 20;
+    private int snapshotBudgetTick = Integer.MIN_VALUE;
+    private int snapshotsThisTick;
+    /**
+     * A failed read must never be followed by a write of the partially
+     * restored state.  Keeping the original file is the only safe recovery
+     * path for a server restart.
+     */
+    private boolean persistenceLoadFailed;
 
     public BotRuntime(MinecraftServer server) {
         this.server = server;
         int workers = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
-        this.pathExecutor = new ThreadPoolExecutor(workers, workers, 0L, TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(64), runnable -> {
-            Thread thread = new Thread(runnable, "navigation-ai-path");
-            thread.setDaemon(true);
-            return thread;
-        }, new ThreadPoolExecutor.AbortPolicy());
+        this.pathScheduler = new PathSearchScheduler(workers, 64);
+        this.pathNodeBudget.beginTick(server.getTickCount());
         loadPersisted();
     }
 
     public MinecraftServer server() { return server; }
     public BotService service() { return this; }
-    ExecutorService pathExecutor() { return pathExecutor; }
+    public NavigationMetrics metrics() { return metrics.snapshot(pathScheduler.queuedTasks(), pathScheduler.activeTasks()); }
+    PathSearchScheduler pathScheduler() { return pathScheduler; }
+    PathNodeBudget pathNodeBudget() { return pathNodeBudget; }
+
+    void recordSnapshot(long durationNanos) { metrics.recordSnapshot(durationNanos); }
+    void recordPathSearchSubmitted() { metrics.recordPathSearchSubmitted(); }
+    void recordPathSearchCancelled() { metrics.recordPathSearchCancelled(); }
+    void recordPathSearchRejected() { metrics.recordPathSearchRejected(); }
+    void recordBackpressureDeferral() { metrics.recordBackpressureDeferral(); }
+    void recordNodeBudgetDeferral() { metrics.recordNodeBudgetDeferral(); }
+    void recordPathSearch(long nodesVisited, long durationNanos) { metrics.recordPathSearch(nodesVisited, durationNanos); }
+    void recordReplan() { metrics.recordReplan(); }
+
+    boolean shouldDeferPathSearch(int priority) { return pathScheduler.shouldDefer(priority); }
+
+    boolean tryAcquireSnapshotBudget() {
+        int tick = server.getTickCount();
+        if (tick != snapshotBudgetTick) {
+            snapshotBudgetTick = tick;
+            snapshotsThisTick = 0;
+        }
+        if (snapshotsThisTick >= SNAPSHOT_BUDGET_PER_TICK) return false;
+        snapshotsThisTick++;
+        return true;
+    }
 
     @Override
     public BotHandle create(BotCreateOptions options) {
@@ -124,12 +153,18 @@ public final class BotRuntime implements BotService, AutoCloseable {
 
     public void tick() {
         ensureServerThread();
-        if (restoreDelayTicks > 0) {
-            restoreDelayTicks--;
-        } else {
-            restorePendingNavigations();
+        long started = System.nanoTime();
+        try {
+            pathNodeBudget.beginTick(server.getTickCount());
+            if (restoreDelayTicks > 0) {
+                restoreDelayTicks--;
+            } else {
+                restorePendingNavigations();
+            }
+            bots.values().forEach(BotHandleImpl::tick);
+        } finally {
+            metrics.recordServerTick(System.nanoTime() - started);
         }
-        bots.values().forEach(BotHandleImpl::tick);
     }
 
     void applyPendingMotion(ServerPlayer player) {
@@ -148,12 +183,17 @@ public final class BotRuntime implements BotService, AutoCloseable {
         for (BotHandleImpl handle : handles) {
             if (!handle.player().isRemoved()) remove(handle);
         }
-        pathExecutor.shutdownNow();
+        pathScheduler.close();
     }
 
     private Path persistencePath() { return server.getWorldPath(LevelResource.ROOT).resolve("navigation_ai_bots.dat"); }
 
     private void savePersisted() {
+        if (persistenceLoadFailed) {
+            LOGGER.warn("Skipping navigation bot save because the previous save could not be loaded; "
+                    + "the original file was kept for recovery");
+            return;
+        }
         try {
             Files.createDirectories(persistencePath().getParent());
             TagValueOutput root = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
@@ -179,8 +219,20 @@ public final class BotRuntime implements BotService, AutoCloseable {
         try {
             CompoundTag root = NbtIo.readCompressed(path, NbtAccounter.unlimitedHeap());
             ValueInput input = TagValueInput.create(ProblemReporter.DISCARDING, server.registryAccess(), root);
-            input.childrenListOrEmpty("bots").stream().forEach(entry -> restoreEntry(entry, pendingNavigations));
+            input.childrenListOrEmpty("bots").stream().forEach(entry -> {
+                try {
+                    restoreEntry(entry, pendingNavigations);
+                } catch (RuntimeException invalidEntry) {
+                    // Keep loading independent entries so one corrupt bot does
+                    // not prevent healthy bots from being restored.  Mark the
+                    // whole source as recovery-only so close() cannot overwrite
+                    // the evidence needed to recover the bad entry.
+                    persistenceLoadFailed = true;
+                    LOGGER.warn("Skipping invalid persisted navigation bot entry", invalidEntry);
+                }
+            });
         } catch (Exception exception) {
+            persistenceLoadFailed = true;
             LOGGER.warn("Could not load navigation bots; keeping the save for manual recovery", exception);
         }
     }
@@ -206,7 +258,11 @@ public final class BotRuntime implements BotService, AutoCloseable {
         String dimensionId = entry.getStringOr("dimension", Level.OVERWORLD.identifier().toString());
         ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, Identifier.parse(dimensionId));
         var level = server.getLevel(key);
-        if (level == null) { LOGGER.warn("Skipping bot {}: dimension {} is unavailable", name, dimensionId); return; }
+        if (level == null) {
+            persistenceLoadFailed = true;
+            LOGGER.warn("Skipping bot {}: dimension {} is unavailable", name, dimensionId);
+            return;
+        }
         UUID uuid = entry.read("UUID", net.minecraft.core.UUIDUtil.CODEC).orElse(UUID.randomUUID());
         Vec3 position = entry.read("Pos", Vec3.CODEC).orElse(Vec3.ZERO);
         Vec2 rotation = entry.read("Rotation", Vec2.CODEC).orElse(Vec2.ZERO);

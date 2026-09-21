@@ -16,6 +16,18 @@ public interface GridWorld {
         return true;
     }
 
+    /** Returns whether the bot can jump directly from one cell to another. */
+    default boolean canJump(GridPos from, GridPos to) { return false; }
+
+    /** Returns whether the bot must keep sneak held while occupying this cell. */
+    default boolean requiresSneak(GridPos pos) { return false; }
+
+    /** Returns whether a cell contains water that requires swimming/wading. */
+    default boolean isWater(GridPos pos) { return false; }
+
+    /** Maximum number of water cells a route may use. */
+    default int maxWaterSteps() { return Integer.MAX_VALUE; }
+
     default boolean dangerous(GridPos pos) { return false; }
 
     /** Lower-bound movement cost used by A*. */
