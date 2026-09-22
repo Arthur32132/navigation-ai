@@ -67,8 +67,8 @@ final class CombatControllerImpl implements CombatController {
         runtime.ensureServerThread();
         if (target == null) throw new IllegalArgumentException("target is required");
         if (policy == null) throw new IllegalArgumentException("policy is required");
-        cancel();
         if (!isAllowedTarget(target, policy)) throw new IllegalArgumentException("target type is not allowed by policy");
+        cancel();
         this.target = target;
         this.nearbyMode = false;
         this.nearbyRadius = 0.0;

@@ -66,11 +66,16 @@ final class NavigatorImpl implements Navigator {
     private WorldSnapshot plannedSnapshot;
     private boolean finalPlanningSegment;
     private boolean planningDeferred;
+    private boolean waitingForFrontierChunks;
+    private int frontierChunkWaitAttempts;
+    private int nextFrontierRetryTick;
     private Future<?> searchFuture;
     private int budgetDeferrals;
     private final List<PlacedAction> placedActions = new ArrayList<>();
 
     private static final int MAX_BUDGET_DEFERRALS = 3;
+    private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
+    private static final int FRONTIER_CHUNK_RETRY_DELAY_TICKS = 5;
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
 
@@ -103,7 +108,11 @@ final class NavigatorImpl implements Navigator {
     @Override public void cancel() {
         runtime.ensureServerThread();
         requestGeneration++;
-        if (task != null && !isTerminal(task.status())) task.cancel();
+        NavigationTaskImpl cancelledTask = task;
+        if (cancelledTask != null && !isTerminal(cancelledTask.status())) cancelledTask.cancel();
+        // Completing a task invokes callbacks synchronously. A callback may have
+        // started another navigation request while the old task was cancelled.
+        if (task != cancelledTask) return;
         owner.actions().stop();
         if (navigationMining != null && navigationMining.status() == MiningStatus.RUNNING) navigationMining.cancel();
         navigationMining = null;
@@ -113,6 +122,9 @@ final class NavigatorImpl implements Navigator {
         plannedSnapshot = null;
         finalPlanningSegment = false;
         planningDeferred = false;
+        waitingForFrontierChunks = false;
+        frontierChunkWaitAttempts = 0;
+        nextFrontierRetryTick = 0;
         budgetDeferrals = 0;
         cancelSearchFuture();
         nextHazardRepathNanos = 0L;
@@ -314,6 +326,12 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        if (waitingForFrontierChunks) {
+            if (runtime.server().getTickCount() < nextFrontierRetryTick) return;
+            waitingForFrontierChunks = false;
+            requestPath();
+            return;
+        }
         if (planningDeferred) {
             planningDeferred = false;
             requestPath();
@@ -507,7 +525,7 @@ final class NavigatorImpl implements Navigator {
             } else {
                 runtime.releaseNavigationTickets(owner.id());
             }
-            snapshot = WorldSnapshot.capture(level, player, startPos, desired, policy.snapshotRadius(),
+            snapshot = WorldSnapshot.capture(level, player, startPos, policy.snapshotRadius(),
                     policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing(),
                     runtime::tryAcquireChunkGeneration);
         } finally {
@@ -673,7 +691,7 @@ final class NavigatorImpl implements Navigator {
                 return true;
             }
         }
-        if (state.getBlock() instanceof TrapDoorBlock && state.is(BlockTags.WOODEN_TRAPDOORS)
+        if (PassageBlocks.handOpenableTrapdoor(state)
                 && state.hasProperty(TrapDoorBlock.OPEN) && !state.getValue(TrapDoorBlock.OPEN)) {
             if (!player.mayInteract(level, position)) return false;
             level.setBlock(position, state.setValue(TrapDoorBlock.OPEN, true), 3);
@@ -796,7 +814,7 @@ final class NavigatorImpl implements Navigator {
         return (state.getBlock() instanceof DoorBlock door
                 && door.type().canOpenByHand()
                 && state.hasProperty(DoorBlock.OPEN) && !state.getValue(DoorBlock.OPEN))
-                || (state.getBlock() instanceof TrapDoorBlock && state.is(BlockTags.WOODEN_TRAPDOORS)
+                || (PassageBlocks.handOpenableTrapdoor(state)
                 && state.hasProperty(TrapDoorBlock.OPEN) && !state.getValue(TrapDoorBlock.OPEN))
                 || (state.getBlock() instanceof FenceGateBlock
                 && state.hasProperty(FenceGateBlock.OPEN) && !state.getValue(FenceGateBlock.OPEN));
@@ -948,7 +966,7 @@ final class NavigatorImpl implements Navigator {
         if (goal instanceof NavigationGoal.BlockGoal block) {
             Vec3 center = new Vec3(block.position().getX() + 0.5, block.position().getY() + 0.5,
                     block.position().getZ() + 0.5);
-            return owner.player().position().distanceTo(center) <= block.tolerance() + 0.5;
+            return owner.player().position().distanceTo(center) <= block.tolerance();
         }
         return false;
     }
@@ -977,7 +995,20 @@ final class NavigatorImpl implements Navigator {
             return;
         }
         budgetDeferrals = 0;
-        if (result.nodes().isEmpty()) { task.fail("unreachable", result.nodesVisited()); return; }
+        if (result.nodes().isEmpty()) {
+            // The fake player may reach the edge of its loaded area before
+            // the server finishes loading the next chunk. Retrying on later
+            // ticks lets normal player-driven chunk loading catch up instead
+            // of turning a 40–60 block route into an immediate failure.
+            if (plannedSnapshot != null && plannedSnapshot.hasUnloadedChunks()) {
+                deferForFrontierChunks(result.nodesVisited());
+                return;
+            }
+            task.fail("unreachable", result.nodesVisited());
+            return;
+        }
+        waitingForFrontierChunks = false;
+        frontierChunkWaitAttempts = 0;
         if (result.nodes().size() - 1 > policy.maxPathLength()) {
             task.fail("path_too_long", result.nodesVisited());
             return;
@@ -990,6 +1021,19 @@ final class NavigatorImpl implements Navigator {
         task.status = NavigationStatus.RUNNING;
     }
 
+    /** Waits for ordinary chunk loading; this never requests world generation. */
+    private void deferForFrontierChunks(int nodesVisited) {
+        if (++frontierChunkWaitAttempts > MAX_FRONTIER_CHUNK_RETRIES) {
+            task.fail("unreachable", nodesVisited);
+            return;
+        }
+        waitingForFrontierChunks = true;
+        int delay = Math.min(20, FRONTIER_CHUNK_RETRY_DELAY_TICKS * frontierChunkWaitAttempts);
+        nextFrontierRetryTick = runtime.server().getTickCount() + delay;
+        task.status = NavigationStatus.COMPUTING;
+        owner.actions().stop();
+    }
+
     private void finishSuccess() {
         if (goal instanceof NavigationGoal.LookAtGoal) lookAt(goalPoint());
         owner.actions().stop();
@@ -998,6 +1042,9 @@ final class NavigatorImpl implements Navigator {
         requestGeneration++;
         cancelSearchFuture();
         planningDeferred = false;
+        waitingForFrontierChunks = false;
+        frontierChunkWaitAttempts = 0;
+        nextFrontierRetryTick = 0;
         int nodes = path.size();
         long duration = System.nanoTime() - pathStartedNanos;
         path = List.of();

@@ -9,9 +9,17 @@ import net.minecraft.world.phys.Vec3;
 public record BotCreateOptions(String name, UUID uuid, ServerLevel level, Vec3 position, float yaw, float pitch) {
     public BotCreateOptions {
         Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(uuid, "uuid");
         Objects.requireNonNull(level, "level");
         Objects.requireNonNull(position, "position");
         if (name.isBlank() || name.length() > 16) throw new IllegalArgumentException("Bot name must contain 1..16 characters");
+        if (!Double.isFinite(position.x()) || !Double.isFinite(position.y())
+                || !Double.isFinite(position.z())) {
+            throw new IllegalArgumentException("Bot position coordinates must be finite");
+        }
+        if (!Float.isFinite(yaw) || !Float.isFinite(pitch)) {
+            throw new IllegalArgumentException("Bot rotation must be finite");
+        }
     }
 
     public static BotCreateOptions at(String name, ServerLevel level, Vec3 position) {

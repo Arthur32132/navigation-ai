@@ -10,6 +10,7 @@ base { archivesName = project.archives_base_name }
 repositories { }
 
 loom {
+    accessWidenerPath = file('src/main/resources/navigation_ai.accesswidener')
     splitEnvironmentSourceSets()
     mods {
         "navigation_ai" {

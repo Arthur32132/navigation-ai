@@ -7,6 +7,7 @@
   "authors": ["Navigation AI contributors"],
   "license": "MIT",
   "environment": "server",
+  "accessWidener": "navigation_ai.accesswidener",
   "entrypoints": {
     "main": ["dev.navigationai.NavigationAiMod"]
   },

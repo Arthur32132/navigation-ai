@@ -29,6 +29,7 @@ final class WorldSnapshot implements GridWorld {
     private static final double STANDING_CLEARANCE_MARGIN = 0.10D;
     private static final double CROUCHING_CLEARANCE_MARGIN = 0.02D;
     private static final int MAX_WATER_STEPS = 8;
+    private static final int VERTICAL_SNAPSHOT_RADIUS = 16;
     private final Set<GridPos> passable;
     private final Set<GridPos> dangerous;
     private final Set<GridPos> jumpable;
@@ -38,13 +39,15 @@ final class WorldSnapshot implements GridWorld {
     private final Set<GridPos> freeBody;
     private final Map<GridPos, Double> actionCosts;
     private final int minX, maxX, minY, maxY, minZ, maxZ;
+    private final boolean hasUnloadedChunks;
 
     private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, Set<GridPos> jumpable,
                           Set<GridPos> jumpOver,
                           Set<GridPos> crouchOnly, Set<GridPos> waterCells,
                           Set<GridPos> freeBody,
                           Map<GridPos, Double> actionCosts,
-                          int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
+                          int minX, int maxX, int minY, int maxY, int minZ, int maxZ,
+                          boolean hasUnloadedChunks) {
         this.passable = Set.copyOf(passable);
         this.dangerous = Set.copyOf(dangerous);
         this.jumpable = Set.copyOf(jumpable);
@@ -54,9 +57,10 @@ final class WorldSnapshot implements GridWorld {
         this.freeBody = Set.copyOf(freeBody);
         this.actionCosts = Map.copyOf(actionCosts);
         this.minX = minX; this.maxX = maxX; this.minY = minY; this.maxY = maxY; this.minZ = minZ; this.maxZ = maxZ;
+        this.hasUnloadedChunks = hasUnloadedChunks;
     }
 
-    static WorldSnapshot capture(ServerLevel level, ServerPlayer observer, GridPos start, GridPos goal, int radius, boolean allowWater,
+    static WorldSnapshot capture(ServerLevel level, ServerPlayer observer, GridPos start, int radius, boolean allowWater,
                                  boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
                                  BooleanSupplier generationBudget) {
         // Keep the snapshot bounded by the requested radius. A distant goal is
@@ -66,8 +70,11 @@ final class WorldSnapshot implements GridWorld {
         int effectiveRadius = allowChunkGeneration ? Math.min(radius, 16) : radius;
         int minX = start.x() - effectiveRadius, maxX = start.x() + effectiveRadius;
         int minZ = start.z() - effectiveRadius, maxZ = start.z() + effectiveRadius;
-        int minY = Math.max(level.getMinY(), Math.min(start.y(), goal.y()) - 8);
-        int maxY = Math.min(level.getMinY() + level.getHeight() - 2, Math.max(start.y(), goal.y()) + 8);
+        // A distant vertical goal is handled by frontier segments, just like a
+        // distant horizontal goal. Keep each server-thread capture local.
+        int minY = Math.max(level.getMinY(), start.y() - VERTICAL_SNAPSHOT_RADIUS);
+        int maxY = Math.min(level.getMinY() + level.getHeight() - 2,
+                start.y() + VERTICAL_SNAPSHOT_RADIUS);
         Set<GridPos> passable = new HashSet<>();
         Set<GridPos> dangerous = new HashSet<>();
         Set<GridPos> jumpable = new HashSet<>();
@@ -77,12 +84,16 @@ final class WorldSnapshot implements GridWorld {
         Set<GridPos> freeBody = new HashSet<>();
         Map<GridPos, Double> actionCosts = new HashMap<>();
         Set<Long> generatedChunks = new HashSet<>();
+        boolean hasUnloadedChunks = false;
         double standingHeight = observer.getDimensions(Pose.STANDING).height();
         double crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
         for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++) for (int y = minY; y <= maxY; y++) {
             BlockPos pos = new BlockPos(x, y, z);
             if (!level.hasChunkAt(pos)) {
-                if (!allowChunkGeneration) continue;
+                if (!allowChunkGeneration) {
+                    hasUnloadedChunks = true;
+                    continue;
+                }
                 // Generation is explicit and remains bounded by snapshotRadius.
                 long chunkKey = ((long) (x >> 4) << 32) ^ ((z >> 4) & 0xffffffffL);
                 if (generatedChunks.add(chunkKey)
@@ -107,7 +118,7 @@ final class WorldSnapshot implements GridWorld {
                     && (standingClearance || crouchingClearance);
             boolean climbable = state.is(BlockTags.CLIMBABLE)
                     && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
-            boolean openable = (isClosedHandOpenableDoor(state) || isClosedWoodenTrapdoor(state)
+            boolean openable = (isClosedHandOpenableDoor(state) || isClosedHandOpenableTrapdoor(state)
                     || isClosedFenceGate(state))
                     && observer.mayInteract(level, pos);
             boolean openDoor = state.getBlock() instanceof DoorBlock && state.hasProperty(DoorBlock.OPEN)
@@ -193,7 +204,7 @@ final class WorldSnapshot implements GridWorld {
             }
         }
         return new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly, waterCells, freeBody, actionCosts,
-                minX, maxX, minY, maxY, minZ, maxZ);
+                minX, maxX, minY, maxY, minZ, maxZ, hasUnloadedChunks);
     }
 
     private static boolean hasClearanceAbove(net.minecraft.world.phys.shapes.VoxelShape aboveShape, double height) {
@@ -211,8 +222,8 @@ final class WorldSnapshot implements GridWorld {
                     || state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
     }
 
-    private static boolean isClosedWoodenTrapdoor(net.minecraft.world.level.block.state.BlockState state) {
-        return state.getBlock() instanceof TrapDoorBlock && state.is(BlockTags.WOODEN_TRAPDOORS)
+    private static boolean isClosedHandOpenableTrapdoor(net.minecraft.world.level.block.state.BlockState state) {
+        return PassageBlocks.handOpenableTrapdoor(state)
                 && state.hasProperty(TrapDoorBlock.OPEN) && !state.getValue(TrapDoorBlock.OPEN);
     }
 
@@ -276,6 +287,7 @@ final class WorldSnapshot implements GridWorld {
     @Override public boolean passable(GridPos pos) {
         return pos.x() >= minX && pos.x() <= maxX && pos.y() >= minY && pos.y() <= maxY && pos.z() >= minZ && pos.z() <= maxZ && passable.contains(pos);
     }
+    boolean hasUnloadedChunks() { return hasUnloadedChunks; }
     @Override public boolean canTraverse(GridPos from, GridPos to) {
         if (!GridWorld.super.canTraverse(from, to)) return false;
         int dx = Math.abs(to.x() - from.x());

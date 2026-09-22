@@ -10,7 +10,7 @@
 | Fabric API | 0.161.0+26.2 |
 | Gradle | используется wrapper проекта, отдельная установка не нужна |
 
-Версии находятся в `gradle.properties`. `loom_version=1.17-SNAPSHOT` разрешается Fabric Loom через Gradle Plugin Portal; для воспроизводимой сборки используйте wrapper и зафиксированный `gradle-wrapper.properties`.
+Версии находятся в `gradle.properties`. `loom_version=1.17-SNAPSHOT` разрешается Fabric Loom через Gradle Plugin Portal; для воспроизводимой сборки используйте wrapper и зафиксированный `gradle-wrapper.properties`. `navigation_ai.accesswidener` использует namespace `official`, ожидаемый текущей версией Loom для Minecraft 26.2.
 
 ## Команды Windows
 
@@ -53,7 +53,7 @@ run/eula.txt -> eula=true
 Для повторяемых игровых проверок добычи и боя используйте
 [серверную регрессию](../tools/regression/README.md). Она запускается командой
 `navtest regression` в отдельном тестовом мире и проверяет 36 сценариев.
-Последний серверный прогон после полного плана: 36/36, API selftest: 22/22; текущий JUnit-набор: 23/23.
+Последний сохранённый серверный прогон после полного плана: 36/36, API selftest: 22/22. После текущих изменений JUnit-набор прошёл 26/26; серверный прогон повторно не выполнялся.
 Нагрузочная команда `navtest load <1|10|25|50>` также прошла для всех четырёх
 профилей. [Сохранённый журнал](../tools/regression/last-run.txt).
 
