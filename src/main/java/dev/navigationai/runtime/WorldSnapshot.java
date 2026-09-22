@@ -276,6 +276,20 @@ final class WorldSnapshot implements GridWorld {
     @Override public boolean passable(GridPos pos) {
         return pos.x() >= minX && pos.x() <= maxX && pos.y() >= minY && pos.y() <= maxY && pos.z() >= minZ && pos.z() <= maxZ && passable.contains(pos);
     }
+    @Override public boolean canTraverse(GridPos from, GridPos to) {
+        if (!GridWorld.super.canTraverse(from, to)) return false;
+        int dx = Math.abs(to.x() - from.x());
+        int dz = Math.abs(to.z() - from.z());
+        // A horizontal one-block rise is executed with the jump input. It
+        // needs the same standing-height arc clearance as a gap jump; a
+        // crouch-only cell is walkable but cannot be jumped through.
+        if (to.y() == from.y() + 1 && dx + dz == 1) {
+            return !requiresSneak(from) && !requiresSneak(to)
+                    && freeBody.contains(from.add(0, 1, 0))
+                    && freeBody.contains(to.add(0, 1, 0));
+        }
+        return true;
+    }
     @Override public boolean dangerous(GridPos pos) { return dangerous.contains(pos); }
     @Override public boolean canJump(GridPos from, GridPos to) {
         if (!passable(from) || !passable(to) || from.y() != to.y()) return false;

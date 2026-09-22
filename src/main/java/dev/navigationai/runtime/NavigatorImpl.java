@@ -405,10 +405,13 @@ final class NavigatorImpl implements Navigator {
         boolean jumpGap = isJumpTransition(edgeStart, next);
         boolean sneak = requiresSneak(currentBlock) || requiresSneak(next)
                 || (climbing && next.getY() < currentBlock.getY());
+        boolean stepUp = !climbing && next.getY() == currentBlock.getY() + 1
+                && Math.abs(next.getX() - currentBlock.getX()) + Math.abs(next.getZ() - currentBlock.getZ()) == 1;
         // The snapshot normally rejects this transition. Recheck the takeoff
         // and landing headroom against the live world too: a stale route must
         // never make the fake player repeatedly jump into a low ceiling.
-        if (jumpGap && (sneak || !hasJumpHeadroom(level, edgeStart) || !hasJumpHeadroom(level, next))) {
+        if ((jumpGap && (sneak || !hasJumpHeadroom(level, edgeStart) || !hasJumpHeadroom(level, next)))
+                || (stepUp && (sneak || !hasJumpHeadroom(level, currentBlock) || !hasJumpHeadroom(level, next)))) {
             requestHazardRepath();
             return;
         }

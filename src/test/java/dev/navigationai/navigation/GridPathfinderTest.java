@@ -102,6 +102,29 @@ class GridPathfinderTest {
     }
 
     @Test
+    void avoidsAVerticalStepTheWorldCannotPhysicallyClear() {
+        GridPos start = new GridPos(0, 0, 0);
+        GridPos raisedWall = new GridPos(1, 1, 0);
+        GridPos goal = new GridPos(2, 0, 0);
+        GridWorld world = new GridWorld() {
+            @Override public boolean passable(GridPos pos) {
+                return pos.equals(start) || pos.equals(raisedWall) || pos.equals(goal)
+                        || (pos.y() == 0 && pos.x() >= 0 && pos.x() <= 2 && pos.z() == 1);
+            }
+
+            @Override public boolean canTraverse(GridPos from, GridPos to) {
+                return GridWorld.super.canTraverse(from, to)
+                        && !(from.equals(start) && to.equals(raisedWall));
+            }
+        };
+
+        GridPath path = GridPathfinder.find(world, start, goal, policy(256));
+
+        assertEquals(goal, path.nodes().getLast());
+        assertFalse(path.nodes().contains(raisedWall));
+    }
+
+    @Test
     void rejectsDiagonalCornerCutting() {
         GridPos start = new GridPos(0, 0, 0);
         GridPos goal = new GridPos(1, 0, 1);
