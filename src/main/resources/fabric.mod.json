@@ -10,7 +10,6 @@
   "entrypoints": {
     "main": ["dev.navigationai.NavigationAiMod"]
   },
-  "mixins": ["navigation_ai.mixins.json"],
   "depends": {
     "fabricloader": ">=0.19.5",
     "minecraft": "~26.2",

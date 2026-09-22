@@ -3,7 +3,10 @@ package dev.navigationai.runtime;
 import dev.navigationai.navigation.GridPos;
 import dev.navigationai.navigation.GridWorld;
 import java.util.HashSet;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
@@ -11,10 +14,12 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Pose;
 import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.TrapDoorBlock;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.core.Direction;
 
@@ -29,24 +34,32 @@ final class WorldSnapshot implements GridWorld {
     private final Set<GridPos> jumpable;
     private final Set<GridPos> crouchOnly;
     private final Set<GridPos> waterCells;
+    private final Set<GridPos> freeBody;
+    private final Map<GridPos, Double> actionCosts;
     private final int minX, maxX, minY, maxY, minZ, maxZ;
 
     private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, Set<GridPos> jumpable,
                           Set<GridPos> crouchOnly, Set<GridPos> waterCells,
+                          Set<GridPos> freeBody,
+                          Map<GridPos, Double> actionCosts,
                           int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
         this.passable = Set.copyOf(passable);
         this.dangerous = Set.copyOf(dangerous);
         this.jumpable = Set.copyOf(jumpable);
         this.crouchOnly = Set.copyOf(crouchOnly);
         this.waterCells = Set.copyOf(waterCells);
+        this.freeBody = Set.copyOf(freeBody);
+        this.actionCosts = Map.copyOf(actionCosts);
         this.minX = minX; this.maxX = maxX; this.minY = minY; this.maxY = maxY; this.minZ = minZ; this.maxZ = maxZ;
     }
 
     static WorldSnapshot capture(ServerLevel level, ServerPlayer observer, GridPos start, GridPos goal, int radius, boolean allowWater,
-                                 boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing) {
+                                 boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
+                                 BooleanSupplier generationBudget) {
         // Keep the snapshot bounded by the requested radius. A distant goal is
-        // intentionally outside this local snapshot and will be reported as
-        // unreachable instead of making the server scan the whole rectangle.
+        // intentionally outside this local snapshot; the pathfinder handles it
+        // as a frontier target instead of making the server scan the whole
+        // rectangle.
         int effectiveRadius = allowChunkGeneration ? Math.min(radius, 16) : radius;
         int minX = start.x() - effectiveRadius, maxX = start.x() + effectiveRadius;
         int minZ = start.z() - effectiveRadius, maxZ = start.z() + effectiveRadius;
@@ -57,6 +70,8 @@ final class WorldSnapshot implements GridWorld {
         Set<GridPos> jumpable = new HashSet<>();
         Set<GridPos> crouchOnly = new HashSet<>();
         Set<GridPos> waterCells = new HashSet<>();
+        Set<GridPos> freeBody = new HashSet<>();
+        Map<GridPos, Double> actionCosts = new HashMap<>();
         Set<Long> generatedChunks = new HashSet<>();
         double standingHeight = observer.getDimensions(Pose.STANDING).height();
         double crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
@@ -66,7 +81,8 @@ final class WorldSnapshot implements GridWorld {
                 if (!allowChunkGeneration) continue;
                 // Generation is explicit and remains bounded by snapshotRadius.
                 long chunkKey = ((long) (x >> 4) << 32) ^ ((z >> 4) & 0xffffffffL);
-                if (generatedChunks.add(chunkKey)) level.getChunkAt(pos);
+                if (generatedChunks.add(chunkKey)
+                        && (generationBudget == null || generationBudget.getAsBoolean())) level.getChunkAt(pos);
                 if (!level.hasChunkAt(pos)) continue;
             }
             var state = level.getBlockState(pos);
@@ -87,12 +103,15 @@ final class WorldSnapshot implements GridWorld {
                     && (standingClearance || crouchingClearance);
             boolean climbable = state.is(BlockTags.CLIMBABLE)
                     && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
-            boolean openable = (isClosedHandOpenableDoor(state) || isClosedWoodenTrapdoor(state))
+            boolean openable = (isClosedHandOpenableDoor(state) || isClosedWoodenTrapdoor(state)
+                    || isClosedFenceGate(state))
                     && observer.mayInteract(level, pos);
             boolean openDoor = state.getBlock() instanceof DoorBlock && state.hasProperty(DoorBlock.OPEN)
                     && state.getValue(DoorBlock.OPEN)
                     && (!state.hasProperty(DoorBlock.HALF)
                         || state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
+            boolean openGate = state.getBlock() instanceof FenceGateBlock
+                    && state.hasProperty(FenceGateBlock.OPEN) && state.getValue(FenceGateBlock.OPEN);
             FluidState belowFluid = level.getFluidState(pos.below());
             boolean belowWater = belowFluid.getType() == Fluids.WATER
                     || belowFluid.getType() == Fluids.FLOWING_WATER;
@@ -103,20 +122,35 @@ final class WorldSnapshot implements GridWorld {
                     ? (allowWater && belowWater)
                     : true;
             GridPos gridPos = new GridPos(x, y, z);
-            boolean breakableBody = allowBreaking && isBreakable(level, pos, state)
+            if (stateShape.isEmpty() && (standingClearance || crouchingClearance)) freeBody.add(gridPos);
+            boolean breakableBody = allowBreaking && hasUsableTool(observer, state)
+                    && isBreakable(level, pos, state)
                     && (above.getCollisionShape(level, pos.above()).isEmpty()
-                        || isBreakable(level, pos.above(), above))
+                        || (hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)))
                     && !below.getCollisionShape(level, pos.below()).isEmpty();
             boolean breakableAbove = allowBreaking && state.getCollisionShape(level, pos).isEmpty()
-                    && isBreakable(level, pos.above(), above)
+                    && hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)
                     && !below.getCollisionShape(level, pos.below()).isEmpty();
             boolean supportedPlacement = allowPlacing && (standingBody || crouchingBody)
                     && below.getCollisionShape(level, pos.below()).isEmpty()
                     && (hasSolidNeighbour(level, pos.below()) || hasSolidNeighbour(level, pos));
-            boolean passableCell = fluidAllowed && ((standingBody || crouchingBody) && floor || lowSurface || climbable || openable || openDoor
+            boolean passableCell = fluidAllowed && (((standingBody || crouchingBody) && floor)
+                    || lowSurface || climbable || openable || openDoor || openGate
                     || breakableBody || breakableAbove || supportedPlacement);
             if (passableCell || (allowWater && waterCell && (standingClearance || crouchingClearance))) {
                 passable.add(gridPos);
+            }
+            if (breakableBody) {
+                actionCosts.merge(gridPos, breakCost(observer, level, pos, state), Math::max);
+                if (!above.getCollisionShape(level, pos.above()).isEmpty()) {
+                    actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
+                }
+            } else if (breakableAbove) {
+                actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
+            } else if (supportedPlacement) {
+                // Placing is deliberately more expensive than a normal step;
+                // it is a fallback for gaps, not a preferred flat-ground move.
+                actionCosts.merge(gridPos, 8.0D, Math::max);
             }
             if (passable.contains(gridPos) && !standingClearance && crouchingClearance
                     && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
@@ -148,7 +182,7 @@ final class WorldSnapshot implements GridWorld {
                         && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
             }
         }
-        return new WorldSnapshot(passable, dangerous, jumpable, crouchOnly, waterCells,
+        return new WorldSnapshot(passable, dangerous, jumpable, crouchOnly, waterCells, freeBody, actionCosts,
                 minX, maxX, minY, maxY, minZ, maxZ);
     }
 
@@ -172,6 +206,12 @@ final class WorldSnapshot implements GridWorld {
                 && state.hasProperty(TrapDoorBlock.OPEN) && !state.getValue(TrapDoorBlock.OPEN);
     }
 
+    private static boolean isClosedFenceGate(net.minecraft.world.level.block.state.BlockState state) {
+        return state.getBlock() instanceof FenceGateBlock
+                && state.hasProperty(FenceGateBlock.OPEN)
+                && !state.getValue(FenceGateBlock.OPEN);
+    }
+
     private static boolean hasSolidNeighbour(ServerLevel level, BlockPos pos) {
         return !level.getBlockState(pos.east()).getCollisionShape(level, pos.east()).isEmpty()
                 || !level.getBlockState(pos.west()).getCollisionShape(level, pos.west()).isEmpty()
@@ -181,6 +221,46 @@ final class WorldSnapshot implements GridWorld {
 
     private static boolean isBreakable(ServerLevel level, BlockPos pos, net.minecraft.world.level.block.state.BlockState state) {
         return !state.isAir() && !state.is(Blocks.BEDROCK) && state.getDestroySpeed(level, pos) >= 0.0f;
+    }
+
+    private static boolean hasUsableTool(ServerPlayer player, net.minecraft.world.level.block.state.BlockState state) {
+        if (!state.requiresCorrectToolForDrops()) return true;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            var stack = player.getInventory().getItem(slot);
+            if (stack.isEmpty() || !stack.isCorrectToolForDrops(state) || stack.nextDamageWillBreak()) continue;
+            if (effectiveDestroySpeed(stack, state) > 0.0f) return true;
+        }
+        return false;
+    }
+
+    private static double breakCost(ServerPlayer player, ServerLevel level, BlockPos pos,
+                                    net.minecraft.world.level.block.state.BlockState state) {
+        float hardness = state.getDestroySpeed(level, pos);
+        if (hardness < 0.0f) return Double.POSITIVE_INFINITY;
+        float bestSpeed = 1.0f;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            var stack = player.getInventory().getItem(slot);
+            if (stack.isEmpty() || stack.nextDamageWillBreak()) continue;
+            if (state.requiresCorrectToolForDrops() && !stack.isCorrectToolForDrops(state)) continue;
+            bestSpeed = Math.max(bestSpeed, effectiveDestroySpeed(stack, state));
+        }
+        // This is a planning estimate in ticks. MinerImpl remains the
+        // authority for the actual vanilla destroy progress.
+        return Math.max(2.0D, hardness * 30.0D / bestSpeed);
+    }
+
+    /** Includes the vanilla Efficiency contribution in planning estimates. */
+    private static float effectiveDestroySpeed(net.minecraft.world.item.ItemStack stack,
+                                               net.minecraft.world.level.block.state.BlockState state) {
+        float speed = stack.getDestroySpeed(state);
+        if (speed <= 0.0f) return speed;
+        int efficiency = 0;
+        for (var entry : stack.getEnchantments().entrySet()) {
+            if (entry.getKey().is(Enchantments.EFFICIENCY)) {
+                efficiency = Math.max(efficiency, entry.getIntValue());
+            }
+        }
+        return efficiency > 0 ? speed + efficiency * efficiency + 1.0f : speed;
     }
 
     @Override public boolean passable(GridPos pos) {
@@ -201,12 +281,30 @@ final class WorldSnapshot implements GridWorld {
         }
         return true;
     }
+    @Override public boolean canDrop(GridPos from, GridPos to) {
+        if (!passable(from) || !passable(to) || to.y() >= from.y()) return false;
+        int dx = Math.abs(to.x() - from.x());
+        int dz = Math.abs(to.z() - from.z());
+        int distance = from.y() - to.y();
+        if (dx + dz != 1 || distance < 2 || distance > 16) return false;
+        // The body falls through the target column. Every intermediate cell
+        // must have enough clearance and must not be dangerous. A solid wall,
+        // disallowed water, or lava in the column invalidates the drop even
+        // if the landing cell itself is walkable.
+        for (int y = to.y() + 1; y < from.y(); y++) {
+            GridPos intermediate = new GridPos(to.x(), y, to.z());
+            if (!freeBody.contains(intermediate) || dangerous.contains(intermediate)
+                    || (waterCells.contains(intermediate) && !passable(intermediate))) return false;
+        }
+        return true;
+    }
     @Override public boolean requiresSneak(GridPos pos) { return crouchOnly.contains(pos); }
     @Override public boolean isWater(GridPos pos) { return waterCells.contains(pos); }
     @Override public int maxWaterSteps() { return MAX_WATER_STEPS; }
     @Override public double cost(GridPos from, GridPos to) {
         double base = GridWorld.super.cost(from, to);
         return base + (waterCells.contains(to) ? WATER_STEP_COST : 0.0D)
-                + (crouchOnly.contains(to) ? 0.25D : 0.0D);
+                + (crouchOnly.contains(to) ? 0.25D : 0.0D)
+                + actionCosts.getOrDefault(to, 0.0D);
     }
 }

@@ -20,6 +20,11 @@ import net.minecraft.world.level.block.state.properties.Half;
 import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.core.registries.Registries;
+import java.util.List;
 import org.slf4j.LoggerFactory;
 
 /** Explicit, destructive-to-arena integration test. Run only in a disposable world. */
@@ -40,7 +45,11 @@ public final class RuntimeRegression {
         "unreachable_resource", "retry_other_side", "navigation_breaking", "navigation_bridge",
         "navigation_door", "navigation_ladder", "navigation_dynamic_obstacle",
         "navigation_stair_geometry", "navigation_partial_surface", "navigation_water",
-        "navigation_copper_door", "navigation_jump_pits", "navigation_crouch_tunnel"};
+        "navigation_copper_door", "navigation_jump_pits", "navigation_crouch_tunnel",
+        "navigation_long_wall_frontier", "navigation_block_goal_solid", "navigation_controlled_drop",
+        "navigation_fence_gate", "navigation_bridge_cancel_rollback", "navigation_multi_goal",
+        "navigation_patrol", "navigation_look_at", "navigation_dimension_goal", "navigation_escort",
+        "navigation_waterlogged_geometry"};
     private boolean dynamicObstaclePlaced;
 
     public static void register() {
@@ -51,6 +60,10 @@ public final class RuntimeRegression {
 
     public static int start(CommandSourceStack source) {
         if (active != null) return 0;
+        // Regression scenarios own their disposable arena. Remove persisted
+        // practice bots first so their idle entities cannot affect geometry
+        // or the adaptive runtime profile.
+        NavigationAiMod.runtime(source.getServer()).service().bots().forEach(BotHandle::remove);
         active = new RuntimeRegression(source);
         active.next();
         return 1;
@@ -92,12 +105,25 @@ public final class RuntimeRegression {
             block(x,-1,z,Blocks.STONE);
             for (int y=0;y<=5;y++) block(x,y,z,Blocks.AIR);
         }
-        bot = create("reg_actor",0,0);
+        // The frontier scenario deliberately extends beyond the local arena.
+        // Clear that extension once before the run and once after the
+        // scenario so later local goals do not inherit its wall.
+        if (scenario == 0 || scenario == 26) {
+            for (int x=17; x<=64; x++) for (int z=-8; z<=8; z++) {
+                block(x,-1,z,Blocks.STONE);
+                for (int y=0; y<=5; y++) block(x,y,z,Blocks.AIR);
+            }
+        }
+        bot = create("reg_actor",0,scenario == 27 ? 3 : 0);
         bot.player().getInventory().setSelectedSlot(4);
         report("REGRESSION START " + NAMES[scenario]);
         switch (scenario) {
             case 0 -> {
-                bot.player().getInventory().setItem(20,new ItemStack(Items.DIAMOND_PICKAXE));
+                bot.player().getInventory().setItem(20,new ItemStack(Items.WOODEN_PICKAXE));
+                ItemStack enchantedPick = new ItemStack(Items.IRON_PICKAXE);
+                enchantedPick.enchant(source.getServer().registryAccess().lookupOrThrow(Registries.ENCHANTMENT)
+                        .getOrThrow(Enchantments.EFFICIENCY), 5);
+                bot.player().getInventory().setItem(21, enchantedPick);
                 bot.player().getInventory().setItem(4,new ItemStack(Items.APPLE,3));
                 block(1,0,0,Blocks.STONE);
                 mining=bot.miner().breakBlock(p(1,0,0));
@@ -284,6 +310,109 @@ public final class RuntimeRegression {
                     new NavigationGoal.PositionGoal(new Vec3(1026.5,200.0,1024.5),0.75),
                     new NavigationPolicy(false,false,false,false,20_000,128,8,0));
             }
+            case 25 -> {
+                // The goal and wall extend beyond one local snapshot.  The
+                // planner must choose a frontier route around the wall and
+                // continue from successive snapshots until it reaches x=40.
+                for (int x=17; x<=48; x++) for (int z=-8; z<=8; z++) {
+                    block(x, -1, z, Blocks.STONE);
+                    block(x, 0, z, Blocks.AIR);
+                    block(x, 1, z, Blocks.AIR);
+                }
+                for (int x=4; x<=38; x++) for (int z=-1; z<=1; z++) {
+                    block(x, 0, z, Blocks.STONE);
+                    block(x, 1, z, Blocks.STONE);
+                }
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1064.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,512,10,0));
+            }
+            case 26 -> {
+                // A BlockGoal points at the solid target block.  The planner
+                // must finish from an adjacent walkable cell when breaking is
+                // disabled, then satisfy the goal tolerance at the block.
+                block(3, 0, 0, Blocks.STONE);
+                block(3, 1, 0, Blocks.STONE);
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.BlockGoal(p(3,0,0)),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 27 -> {
+                // Start on a raised ledge. The only useful transition is a
+                // controlled three-block drop onto the lower floor.
+                block(0,2,0,Blocks.STONE);
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1025.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0,3));
+            }
+            case 28 -> {
+                // Fence gates are hand-openable collision shapes, distinct
+                // from doors and wooden trapdoors.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                level.setBlockAndUpdate(p(2,0,0), Blocks.OAK_FENCE_GATE.defaultBlockState()
+                        .setValue(net.minecraft.world.level.block.FenceGateBlock.FACING, Direction.EAST));
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 29 -> {
+                // Cancelling a bridge build must compensate the partial
+                // placement and return the consumed block to the inventory.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                for (int x=2; x<=5; x++) block(x,-1,0,Blocks.AIR);
+                bot.player().getInventory().setItem(10,new ItemStack(Items.COBBLESTONE,8));
+                navigation=bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1032.5,200.0,1024.5),0.75),
+                    new NavigationPolicy(false,true,false,false,20_000,256,8,0));
+            }
+            case 30 -> navigation=bot.navigator().goTo(new NavigationGoal.MultiGoal(List.of(
+                    new NavigationGoal.PositionGoal(new Vec3(1027.5,200.0,1024.5),0.75),
+                    new NavigationGoal.PositionGoal(new Vec3(1030.5,200.0,1024.5),0.75),
+                    new NavigationGoal.PositionGoal(new Vec3(1033.5,200.0,1024.5),0.75))),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            case 31 -> navigation=bot.navigator().goTo(new NavigationGoal.PatrolGoal(List.of(
+                    new Vec3(1027.5,200.0,1024.5), new Vec3(1030.5,200.0,1024.5),
+                    new Vec3(1033.5,200.0,1024.5)), false),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            case 32 -> navigation=bot.navigator().goTo(
+                    new NavigationGoal.LookAtGoal(new Vec3(1029.5,201.5,1024.5),0.75),
+                    new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            case 33 -> {
+                ServerLevel nether = source.getServer().getLevel(Level.NETHER);
+                if (nether == null) throw new IllegalStateException("nether unavailable");
+                for (int x=1022; x<=1036; x++) for (int z=1022; z<=1026; z++) {
+                    nether.setBlock(new BlockPos(x,199,z), Blocks.NETHERRACK.defaultBlockState(), Block.UPDATE_ALL);
+                    for (int y=200; y<=202; y++) nether.setBlock(new BlockPos(x,y,z), Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+                }
+                navigation=bot.navigator().goTo(
+                        new NavigationGoal.DimensionGoal(Level.NETHER, new Vec3(1028.5,200.0,1024.5),0.75),
+                        new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 34 -> {
+                target=create("reg_target",6,0);
+                navigation=bot.navigator().goTo(new NavigationGoal.EscortGoal(target.player(),2.0,4.0),
+                        new NavigationPolicy(false,false,false,false,20_000,128,8,0));
+            }
+            case 35 -> {
+                // A waterlogged bottom slab exercises collision shape and
+                // fluid state together; it must remain a valid low surface.
+                for (int x=-16; x<=16; x++) {
+                    block(x,0,-1,Blocks.STONE); block(x,1,-1,Blocks.STONE);
+                    block(x,0,1,Blocks.STONE); block(x,1,1,Blocks.STONE);
+                }
+                level.setBlockAndUpdate(p(2,0,0), Blocks.OAK_SLAB.defaultBlockState()
+                        .setValue(SlabBlock.TYPE, SlabType.BOTTOM)
+                        .setValue(SlabBlock.WATERLOGGED, true));
+                navigation=bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
+                        new NavigationPolicy(false,false,true,false,20_000,128,8,0));
+            }
         }
     }
 
@@ -298,7 +427,8 @@ public final class RuntimeRegression {
                 case 0 -> { if(mining.completion().isDone()) finish(mining.status()==MiningStatus.SUCCESS
                     && level.getBlockState(p(1,0,0)).isAir() && bot.player().getInventory().getSelectedSlot()==4
                     && bot.player().getInventory().getItem(4).is(Items.APPLE)
-                    && bot.player().getInventory().getItem(20).is(Items.DIAMOND_PICKAXE), mining.completion().join().toString()); }
+                    && bot.player().getInventory().getItem(20).is(Items.WOODEN_PICKAXE)
+                    && bot.player().getInventory().getItem(21).is(Items.IRON_PICKAXE), mining.completion().join().toString()); }
                 case 1 -> finish(mining.status()==MiningStatus.CANCELLED && bot.player().getInventory().getSelectedSlot()==4
                     && level.getBlockState(p(1,0,0)).is(Blocks.DIRT), "cancel preserves block and selected slot");
                 case 2 -> { if(mining.completion().isDone()) finish(mining.status()==MiningStatus.FAILED
@@ -357,6 +487,51 @@ public final class RuntimeRegression {
                     && bot.player().getX() >= 1038.75, navigation.completion().join().toString()); }
             case 24 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
                     && bot.player().getX() >= 1025.75, navigation.completion().join().toString()); }
+            case 25 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1063.5 && Math.abs(bot.player().getZ()-1024.5) <= 1.5,
+                    navigation.completion().join().toString()); }
+            case 26 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1025.0 && bot.player().getX() < 1027.5,
+                    navigation.completion().join().toString()); }
+            case 27 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1025.0 && bot.player().getY() < 201.0,
+                    navigation.completion().join().toString()); }
+            case 28 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,0,0)).getValue(net.minecraft.world.level.block.FenceGateBlock.OPEN)
+                    && bot.player().getX() >= 1028.5,
+                    navigation.completion().join().toString()+" gate="
+                        +level.getBlockState(p(2,0,0)).getValue(net.minecraft.world.level.block.FenceGateBlock.OPEN)
+                        +" x="+bot.player().getX()); }
+            case 29 -> {
+                if (level.getBlockState(p(2,-1,0)).is(Blocks.COBBLESTONE)) {
+                    navigation.cancel();
+                    finish(navigation.completion().join().status()==NavigationStatus.CANCELLED
+                            && level.getBlockState(p(2,-1,0)).isAir()
+                            && bot.player().getInventory().getItem(10).getCount() == 8,
+                            "cancel compensated partial bridge");
+                }
+            }
+            case 30,31 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1032.5,
+                    navigation.completion().join().toString()+" x="+bot.player().getX()
+                        +" goal="+bot.navigator().goal().orElse(null)); }
+            case 32 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && Math.abs(bot.player().getX() - 1024.5) < 0.25
+                    && Math.abs(bot.player().getYRot() + 90.0f) < 25.0f,
+                    navigation.completion().join().toString()+" x="+bot.player().getX()+" yaw="+bot.player().getYRot()); }
+            case 33 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && bot.player().level().dimension().equals(Level.NETHER)
+                    && bot.player().getX() >= 1027.75, navigation.completion().join().toString()); }
+            case 34 -> {
+                if (ticks > 100 && bot.player().distanceTo(target.player()) <= 3.0) {
+                    navigation.cancel();
+                    finish(navigation.completion().join().status()==NavigationStatus.CANCELLED,
+                            "escort reached target distance");
+                }
+            }
+            case 35 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
+                    && level.getBlockState(p(2,0,0)).getValue(SlabBlock.WATERLOGGED)
+                    && bot.player().getX() >= 1028.75, navigation.completion().join().toString()); }
             }
             if(active!=null && ticks>400) finish(false,"timed out after 400 ticks");
         } catch(Exception e) {

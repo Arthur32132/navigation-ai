@@ -25,7 +25,7 @@ final class BotHandleImpl implements BotHandle {
         this.runtime = runtime;
         this.player = player;
         this.name = name;
-        this.actions = new BotActionsImpl(player);
+        this.actions = new BotActionsImpl(runtime, player);
         this.navigator = new NavigatorImpl(runtime, this);
         this.miner = new MinerImpl(runtime, this);
         this.collector = new ResourceCollectorImpl(runtime, this);
@@ -48,6 +48,17 @@ final class BotHandleImpl implements BotHandle {
         collector.cancel();
         miner.cancel();
         combat.cancel();
+        runtime.remove(this);
+        state = BotState.REMOVED;
+    }
+    void prepareForShutdown() {
+        runtime.ensureServerThread();
+        collector.cancel();
+        miner.cancel();
+        combat.cancel();
+        navigator.shutdown();
+    }
+    void removeForShutdown() {
         runtime.remove(this);
         state = BotState.REMOVED;
     }

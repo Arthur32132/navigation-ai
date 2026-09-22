@@ -5,14 +5,17 @@ import dev.navigationai.api.BotCreateOptions;
 import dev.navigationai.api.BotHandle;
 import dev.navigationai.api.BotService;
 import dev.navigationai.api.NavigationMetrics;
-import dev.navigationai.mixin.PlayerListAccessor;
 import java.util.Collection;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.network.Connection;
@@ -20,13 +23,14 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.PacketListener;
 import net.minecraft.network.ProtocolInfo;
-import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
@@ -59,11 +63,14 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private int restoreDelayTicks = 20;
     private int snapshotBudgetTick = Integer.MIN_VALUE;
     private int snapshotsThisTick;
-    /**
-     * A failed read must never be followed by a write of the partially
-     * restored state.  Keeping the original file is the only safe recovery
-     * path for a server restart.
-     */
+    private volatile int snapshotBudgetPerTick = SNAPSHOT_BUDGET_PER_TICK;
+    private volatile int adaptivePathNodeBudget = PATH_NODES_BUDGET_PER_TICK;
+    private volatile int chunkGenerationBudgetPerTick = 4;
+    private int generationBudgetTick = Integer.MIN_VALUE;
+    private int generatedChunksThisTick;
+    private final Map<UUID, java.util.Set<ChunkTicket>> navigationTickets = new ConcurrentHashMap<>();
+    private final Map<ChunkTicket, Integer> navigationTicketRefs = new ConcurrentHashMap<>();
+    /** A failed load must never be followed by a write of partial state. */
     private boolean persistenceLoadFailed;
 
     public BotRuntime(MinecraftServer server) {
@@ -97,9 +104,82 @@ public final class BotRuntime implements BotService, AutoCloseable {
             snapshotBudgetTick = tick;
             snapshotsThisTick = 0;
         }
-        if (snapshotsThisTick >= SNAPSHOT_BUDGET_PER_TICK) return false;
+        if (snapshotsThisTick >= snapshotBudgetPerTick) return false;
         snapshotsThisTick++;
         return true;
+    }
+
+    boolean tryAcquireChunkGeneration() {
+        int tick = server.getTickCount();
+        if (tick != generationBudgetTick) {
+            generationBudgetTick = tick;
+            generatedChunksThisTick = 0;
+        }
+        if (generatedChunksThisTick >= chunkGenerationBudgetPerTick) return false;
+        generatedChunksThisTick++;
+        return true;
+    }
+
+    /** Replaces a bot's retained chunk area with the area around its current plan. */
+    void updateNavigationTickets(UUID botId, ServerLevel level, dev.navigationai.navigation.GridPos start, int radius) {
+        if (radius < 1) {
+            releaseNavigationTickets(botId);
+            return;
+        }
+        int chunkRadius = Math.max(1, (radius + 15) / 16);
+        Set<ChunkTicket> desired = new HashSet<>();
+        ChunkPos center = new ChunkPos(start.x() >> 4, start.z() >> 4);
+        for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
+            for (int dz = -chunkRadius; dz <= chunkRadius; dz++) {
+                desired.add(new ChunkTicket(level.dimension(),
+                        new ChunkPos(center.x() + dx, center.z() + dz).pack()));
+            }
+        }
+
+        Set<ChunkTicket> tickets = navigationTickets.computeIfAbsent(botId,
+                ignored -> ConcurrentHashMap.newKeySet());
+        for (ChunkTicket ticket : desired) {
+            if (tickets.add(ticket)) retainNavigationTicket(ticket);
+        }
+        for (ChunkTicket ticket : new HashSet<>(tickets)) {
+            if (!desired.contains(ticket) && tickets.remove(ticket)) {
+                releaseNavigationTicket(ticket);
+            }
+        }
+        if (tickets.isEmpty()) navigationTickets.remove(botId, tickets);
+    }
+
+    private void retainNavigationTicket(ChunkTicket ticket) {
+        int references = navigationTicketRefs.merge(ticket, 1, Integer::sum);
+        if (references == 1) {
+            ServerLevel level = server.getLevel(ticket.dimension());
+            if (level != null) {
+                level.getChunkSource().addTicketWithRadius(net.minecraft.server.level.TicketType.PLAYER_LOADING,
+                        ChunkPos.unpack(ticket.chunk()), 2);
+            }
+        }
+    }
+
+    void releaseNavigationTickets(UUID botId) {
+        Set<ChunkTicket> tickets = navigationTickets.remove(botId);
+        if (tickets == null) return;
+        for (ChunkTicket ticket : tickets) {
+            releaseNavigationTicket(ticket);
+        }
+    }
+
+    private void releaseNavigationTicket(ChunkTicket ticket) {
+        Integer references = navigationTicketRefs.compute(ticket, (ignored, count) -> {
+            if (count == null || count <= 1) return null;
+            return count - 1;
+        });
+        if (references == null) {
+            ServerLevel level = server.getLevel(ticket.dimension());
+            if (level != null) {
+                level.getChunkSource().removeTicketWithRadius(net.minecraft.server.level.TicketType.PLAYER_LOADING,
+                        ChunkPos.unpack(ticket.chunk()), 2);
+            }
+        }
     }
 
     @Override
@@ -141,13 +221,10 @@ public final class BotRuntime implements BotService, AutoCloseable {
     void remove(BotHandleImpl handle) {
         ensureServerThread();
         if (bots.remove(handle.id(), handle)) {
+            releaseNavigationTickets(handle.id());
             ServerPlayer player = handle.player();
             connections.remove(player.getUUID());
-            PlayerListAccessor list = (PlayerListAccessor)(Object)server.getPlayerList();
-            list.navigationAi$players().remove(player);
-            list.navigationAi$playersByUuid().remove(player.getUUID());
-            server.getPlayerList().broadcastAll(new ClientboundPlayerInfoRemovePacket(java.util.List.of(player.getUUID())));
-            if (!player.isRemoved()) player.level().removePlayerImmediately(player, net.minecraft.world.entity.Entity.RemovalReason.DISCARDED);
+            if (!player.isRemoved()) server.getPlayerList().remove(player);
         }
     }
 
@@ -155,7 +232,8 @@ public final class BotRuntime implements BotService, AutoCloseable {
         ensureServerThread();
         long started = System.nanoTime();
         try {
-            pathNodeBudget.beginTick(server.getTickCount());
+            updateAdaptiveBudgets();
+            pathNodeBudget.beginTick(server.getTickCount(), adaptivePathNodeBudget);
             if (restoreDelayTicks > 0) {
                 restoreDelayTicks--;
             } else {
@@ -165,6 +243,35 @@ public final class BotRuntime implements BotService, AutoCloseable {
         } finally {
             metrics.recordServerTick(System.nanoTime() - started);
         }
+    }
+
+    /** Scales planning work with the number of active fake players and recent tick cost. */
+    private void updateAdaptiveBudgets() {
+        int count = bots.size();
+        int snapshotLimit;
+        int nodeLimit;
+        if (count <= 1) {
+            snapshotLimit = 4;
+            nodeLimit = PATH_NODES_BUDGET_PER_TICK;
+        } else if (count <= 10) {
+            snapshotLimit = 4;
+            nodeLimit = 32_000;
+        } else if (count <= 25) {
+            snapshotLimit = 3;
+            nodeLimit = 24_000;
+        } else {
+            snapshotLimit = 2;
+            nodeLimit = 16_000;
+        }
+        chunkGenerationBudgetPerTick = count <= 1 ? 4 : count <= 10 ? 4 : count <= 25 ? 3 : 2;
+        // A slow recent tick takes precedence over the static bot-count tier.
+        long lastTick = metrics.snapshot(pathScheduler.queuedTasks(), pathScheduler.activeTasks()).lastTickNanos();
+        if (lastTick > 75_000_000L) {
+            snapshotLimit = Math.max(1, snapshotLimit - 1);
+            nodeLimit = Math.max(8_000, nodeLimit * 3 / 4);
+        }
+        snapshotBudgetPerTick = snapshotLimit;
+        adaptivePathNodeBudget = nodeLimit;
     }
 
     void applyPendingMotion(ServerPlayer player) {
@@ -177,12 +284,17 @@ public final class BotRuntime implements BotService, AutoCloseable {
     void ensureServerThread() { if (!server.isSameThread()) throw new IllegalStateException("Bot API must be called on the server thread"); }
 
     @Override public void close() {
+        ensureServerThread();
         restorePendingNavigations();
-        savePersisted();
         BotHandleImpl[] handles = bots.values().toArray(BotHandleImpl[]::new);
         for (BotHandleImpl handle : handles) {
-            if (!handle.player().isRemoved()) remove(handle);
+            if (handle.state() != dev.navigationai.api.BotState.REMOVED) handle.prepareForShutdown();
         }
+        savePersisted();
+        for (BotHandleImpl handle : handles) {
+            if (handle.state() != dev.navigationai.api.BotState.REMOVED) handle.removeForShutdown();
+        }
+        for (UUID id : new ArrayList<>(navigationTickets.keySet())) releaseNavigationTickets(id);
         pathScheduler.close();
     }
 
@@ -194,8 +306,10 @@ public final class BotRuntime implements BotService, AutoCloseable {
                     + "the original file was kept for recovery");
             return;
         }
+        Path target = persistencePath();
+        Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
         try {
-            Files.createDirectories(persistencePath().getParent());
+            Files.createDirectories(target.getParent());
             TagValueOutput root = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
             root.putInt("version", 2);
             ValueOutput.ValueOutputList entries = root.childrenList("bots");
@@ -207,9 +321,20 @@ public final class BotRuntime implements BotService, AutoCloseable {
                 player.saveWithoutId(entry);
                 handle.navigatorImpl().saveState(entry.child("navigation"));
             }
-            NbtIo.writeCompressed(root.buildResult(), persistencePath());
+            NbtIo.writeCompressed(root.buildResult(), temporary);
+            try {
+                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException unsupported) {
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (Exception exception) {
             LOGGER.warn("Could not save navigation bots", exception);
+        } finally {
+            try {
+                Files.deleteIfExists(temporary);
+            } catch (Exception cleanupFailure) {
+                LOGGER.warn("Could not clean temporary navigation bot save {}", temporary, cleanupFailure);
+            }
         }
     }
 
@@ -272,6 +397,8 @@ public final class BotRuntime implements BotService, AutoCloseable {
     }
 
     private record PendingNavigation(BotHandleImpl handle, ValueInput input) { }
+
+    private record ChunkTicket(ResourceKey<Level> dimension, long chunk) { }
 
     /** A disconnected connection is sufficient for server simulation and never queues packets. */
     private static final class BotConnection extends Connection {

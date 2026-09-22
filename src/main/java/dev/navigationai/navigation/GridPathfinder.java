@@ -23,6 +23,7 @@ public final class GridPathfinder {
         {2, 0, 0}, {-2, 0, 0}, {3, 0, 0}, {-3, 0, 0}, {4, 0, 0}, {-4, 0, 0},
         {0, 0, 2}, {0, 0, -2}, {0, 0, 3}, {0, 0, -3}, {0, 0, 4}, {0, 0, -4}
     };
+    private static final int[][] DROP_MOVES = createDropMoves();
 
     private GridPathfinder() { }
 
@@ -32,8 +33,20 @@ public final class GridPathfinder {
 
     public static GridPath find(GridWorld world, GridPos start, GridPos goal,
                                 NavigationPolicy policy, NodeBudget budget) {
+        return find(world, start, goal, policy, budget, false);
+    }
+
+    /**
+     * Searches a bounded world and, when requested, returns the best useful
+     * frontier path if the goal is outside the known area or the local budget
+     * ends first.  The default API keeps its historical all-or-nothing
+     * behaviour for callers that do not execute incremental plans.
+     */
+    public static GridPath find(GridWorld world, GridPos start, GridPos goal,
+                                NavigationPolicy policy, NodeBudget budget,
+                                boolean returnBestPartial) {
         if (!world.passable(start)) return new GridPath(List.of(), 0);
-        if (start.equals(goal)) return new GridPath(List.of(start), 1);
+        if (start.equals(goal)) return GridPath.reached(List.of(start), 1);
         record Entry(SearchNode node, double priority) { }
         PriorityQueue<Entry> open = new PriorityQueue<>(Comparator
                 .comparingDouble(Entry::priority)
@@ -52,15 +65,33 @@ public final class GridPathfinder {
         steps.put(startNode, 0);
         open.add(new Entry(startNode, heuristic(start, goal)));
         int visited = 0;
+        SearchNode bestNode = startNode;
+        double bestFrontierScore = heuristic(start, goal);
+        double bestPathCost = 0.0D;
+        boolean budgetExhausted = false;
+        boolean searchLimitReached = false;
+        boolean pathLengthReached = false;
+        boolean goalVisible = world.passable(goal);
         while (!open.isEmpty() && visited < policy.maxSearchNodes()) {
             if (Thread.currentThread().isInterrupted()) return new GridPath(List.of(), visited);
-            if (!budget.tryConsume()) return new GridPath(List.of(), visited, true);
+            if (!budget.tryConsume()) {
+                budgetExhausted = true;
+                break;
+            }
             SearchNode currentNode = open.poll().node();
             GridPos current = currentNode.pos();
             if (!closed.add(currentNode)) continue;
             visited++;
+            double currentCost = score.getOrDefault(currentNode, Double.POSITIVE_INFINITY);
+            double frontierScore = frontierScore(current, goal, currentCost);
+            if (frontierScore < bestFrontierScore
+                    || (frontierScore == bestFrontierScore && currentCost < bestPathCost)) {
+                bestNode = currentNode;
+                bestFrontierScore = frontierScore;
+                bestPathCost = currentCost;
+            }
             if (current.equals(goal)) {
-                return new GridPath(reconstruct(parent, currentNode), visited);
+                return GridPath.reached(reconstruct(parent, currentNode), visited);
             }
             for (int[] move : MOVES) {
                 GridPos next = current.add(move[0], move[1], move[2]);
@@ -73,8 +104,17 @@ public final class GridPathfinder {
                 SearchNode nextNode = new SearchNode(next, nextWaterSteps);
                 if (closed.contains(nextNode)) continue;
                 int nextSteps = steps.get(currentNode) + 1;
-                if (nextSteps > policy.maxPathLength()) continue;
-                double nextScore = score.get(currentNode) + world.cost(current, next);
+                if (nextSteps > policy.maxPathLength()) {
+                    pathLengthReached = true;
+                    continue;
+                }
+                // A jump is a fallback for a gap or a raised transition.  On
+                // flat ground, walking the intermediate cells is safer and
+                // gives the executor more control over the arrival point.
+                // Keep the jump available, but make it slightly more
+                // expensive so an equivalent walk wins the tie.
+                double nextScore = score.get(currentNode) + world.cost(current, next)
+                        + (jump ? 0.35D : 0.0D);
                 if (world.dangerous(next)) nextScore += policy.dangerCost();
                 if (nextScore >= score.getOrDefault(nextNode, Double.POSITIVE_INFINITY)) continue;
                 score.put(nextNode, nextScore);
@@ -82,13 +122,59 @@ public final class GridPathfinder {
                 parent.put(nextNode, currentNode);
                 open.add(new Entry(nextNode, nextScore + heuristic(next, goal)));
             }
+            if (policy.maxFallDistance() >= 2) {
+                for (int[] move : DROP_MOVES) {
+                    int dropDistance = -move[1];
+                    if (dropDistance > policy.maxFallDistance()) continue;
+                    GridPos next = current.add(move[0], move[1], move[2]);
+                    if (!world.canDrop(current, next)) continue;
+                    SearchNode nextNode = new SearchNode(next, currentNode.waterSteps()
+                            + (world.isWater(next) ? 1 : 0));
+                    if (nextNode.waterSteps() > world.maxWaterSteps() || closed.contains(nextNode)) continue;
+                    int nextSteps = steps.get(currentNode) + 1;
+                    if (nextSteps > policy.maxPathLength()) {
+                        pathLengthReached = true;
+                        continue;
+                    }
+                    double nextScore = score.get(currentNode) + world.cost(current, next)
+                            + dropDistance * 0.35D;
+                    if (world.dangerous(next)) nextScore += policy.dangerCost();
+                    if (nextScore >= score.getOrDefault(nextNode, Double.POSITIVE_INFINITY)) continue;
+                    score.put(nextNode, nextScore);
+                    steps.put(nextNode, nextSteps);
+                    parent.put(nextNode, currentNode);
+                    open.add(new Entry(nextNode, nextScore + heuristic(next, goal)));
+                }
+            }
         }
-        return new GridPath(List.of(), visited);
+        if (visited >= policy.maxSearchNodes() && !open.isEmpty()) searchLimitReached = true;
+        if (returnBestPartial && bestNode != startNode
+                && (budgetExhausted || searchLimitReached || pathLengthReached || !goalVisible)) {
+            return GridPath.incomplete(reconstruct(parent, bestNode), visited, budgetExhausted);
+        }
+        return new GridPath(List.of(), visited, budgetExhausted);
+    }
+
+    private static double frontierScore(GridPos position, GridPos goal, double pathCost) {
+        // Distance to the real goal dominates, while a small path-cost term
+        // avoids selecting a very expensive frontier when two nodes are close.
+        return heuristic(position, goal) + pathCost * 0.05D;
     }
 
     private static double heuristic(GridPos a, GridPos b) {
         return Math.max(Math.abs(a.x() - b.x()), Math.abs(a.z() - b.z()))
                 + Math.abs(a.y() - b.y());
+    }
+
+    private static int[][] createDropMoves() {
+        ArrayList<int[]> moves = new ArrayList<>();
+        for (int distance = 2; distance <= 16; distance++) {
+            moves.add(new int[] {1, -distance, 0});
+            moves.add(new int[] {-1, -distance, 0});
+            moves.add(new int[] {0, -distance, 1});
+            moves.add(new int[] {0, -distance, -1});
+        }
+        return moves.toArray(int[][]::new);
     }
 
     private static List<GridPos> reconstruct(Map<SearchNode, SearchNode> parent, SearchNode current) {

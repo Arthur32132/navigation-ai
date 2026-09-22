@@ -19,6 +19,9 @@ public interface GridWorld {
     /** Returns whether the bot can jump directly from one cell to another. */
     default boolean canJump(GridPos from, GridPos to) { return false; }
 
+    /** Returns whether the bot can safely step off a ledge and land at {@code to}. */
+    default boolean canDrop(GridPos from, GridPos to) { return false; }
+
     /** Returns whether the bot must keep sneak held while occupying this cell. */
     default boolean requiresSneak(GridPos pos) { return false; }
 

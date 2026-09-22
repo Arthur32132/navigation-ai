@@ -67,6 +67,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
     }
 
     void cancel() {
+        runtime.ensureServerThread();
         if (task != null && task.status == GatherStatus.RUNNING) task.cancel();
     }
 
@@ -252,6 +253,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
         @Override public int collectedItems() { return collected; }
         @Override public CompletableFuture<GatherResult> completion() { return completion; }
         @Override public void cancel() {
+            runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == GatherStatus.RUNNING) {
                 if (navigation != null) navigation.cancel();
                 if (mining != null) mining.cancel();

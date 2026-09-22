@@ -7,16 +7,24 @@ final class PathNodeBudget {
     private final int maxNodesPerTick;
     private final AtomicReference<BudgetState> state;
     private volatile int tick = Integer.MIN_VALUE;
+    private volatile int currentLimit;
 
     PathNodeBudget(int maxNodesPerTick) {
         if (maxNodesPerTick < 1) throw new IllegalArgumentException("maxNodesPerTick must be positive");
         this.maxNodesPerTick = maxNodesPerTick;
+        this.currentLimit = maxNodesPerTick;
         this.state = new AtomicReference<>(new BudgetState(Integer.MIN_VALUE, maxNodesPerTick));
     }
 
     void beginTick(int tick) {
+        beginTick(tick, maxNodesPerTick);
+    }
+
+    void beginTick(int tick, int limit) {
+        int boundedLimit = Math.max(1, Math.min(maxNodesPerTick, limit));
+        currentLimit = boundedLimit;
         if (this.tick != tick) {
-            state.set(new BudgetState(tick, maxNodesPerTick));
+            state.set(new BudgetState(tick, boundedLimit));
             this.tick = tick;
         }
     }
@@ -31,6 +39,8 @@ final class PathNodeBudget {
     }
 
     int remaining() { return state.get().remaining(); }
+
+    int currentLimit() { return currentLimit; }
 
     private record BudgetState(int tick, int remaining) { }
 }

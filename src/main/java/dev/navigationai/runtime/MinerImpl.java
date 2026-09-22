@@ -11,6 +11,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
@@ -81,6 +82,7 @@ final class MinerImpl implements Miner {
     }
 
     void cancel() {
+        runtime.ensureServerThread();
         if (task != null && task.status == MiningStatus.RUNNING) task.cancel();
     }
 
@@ -104,7 +106,7 @@ final class MinerImpl implements Miner {
         for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
             ItemStack stack = inventory.getItem(slot);
             if (!stack.isCorrectToolForDrops(state) || stack.nextDamageWillBreak()) continue;
-            float speed = stack.getDestroySpeed(state);
+            float speed = effectiveDestroySpeed(stack, state);
             if (bestSlot < 0 || speed > bestSpeed
                     || (speed == bestSpeed && slot == selected)) {
                 bestSlot = slot;
@@ -113,6 +115,19 @@ final class MinerImpl implements Miner {
         }
         if (bestSlot >= 0) return bestSlot;
         return state.requiresCorrectToolForDrops() ? -1 : selected;
+    }
+
+    /** Mirrors the vanilla Efficiency bonus when ranking tools before mining. */
+    private float effectiveDestroySpeed(ItemStack stack, BlockState state) {
+        float speed = stack.getDestroySpeed(state);
+        if (speed <= 0.0f) return speed;
+        int efficiency = 0;
+        for (var entry : stack.getEnchantments().entrySet()) {
+            if (entry.getKey().is(Enchantments.EFFICIENCY)) {
+                efficiency = Math.max(efficiency, entry.getIntValue());
+            }
+        }
+        return efficiency > 0 ? speed + efficiency * efficiency + 1.0f : speed;
     }
 
     private void selectToolSlot(ServerPlayer player, int slot) {
@@ -163,6 +178,7 @@ final class MinerImpl implements Miner {
         @Override public MiningStatus status() { return status; }
         @Override public CompletableFuture<MiningResult> completion() { return completion; }
         @Override public void cancel() {
+            runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == MiningStatus.RUNNING) {
                 restoreToolSlot(playerForRestore());
                 status = MiningStatus.CANCELLED;

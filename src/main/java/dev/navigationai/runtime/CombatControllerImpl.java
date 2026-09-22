@@ -115,6 +115,7 @@ final class CombatControllerImpl implements CombatController {
     }
 
     @Override public void cancel() {
+        runtime.ensureServerThread();
         CombatTaskImpl cancelledTask = task;
         if (cancelledTask != null && cancelledTask.status == CombatStatus.RUNNING) cancelledTask.cancel();
         // A completion callback is allowed to start another task. Do not clear
@@ -509,6 +510,7 @@ final class CombatControllerImpl implements CombatController {
         @Override public CombatStatus status() { return status; }
         @Override public CompletableFuture<CombatResult> completion() { return completion; }
         @Override public void cancel() {
+            runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == CombatStatus.RUNNING) {
                 status = CombatStatus.CANCELLED;
                 clearCombatState();
