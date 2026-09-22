@@ -158,8 +158,12 @@ final class WorldSnapshot implements GridWorld {
             }
             if (passable.contains(gridPos) && !standingClearance && crouchingClearance
                     && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
-            if (stateShape.isEmpty() && aboveShape.isEmpty() && below.getCollisionShape(level, pos.below()).isEmpty()
-                    && !waterCell && !lavaCell) jumpable.add(gridPos);
+            // A jumping body needs two clear cells at its current height;
+            // unlike a walkable cell, a crouch-height tunnel is never a
+            // valid segment of a long jump.
+            if (stateShape.isEmpty() && aboveShape.isEmpty() && !waterCell && !lavaCell) {
+                jumpable.add(gridPos);
+            }
             if (!stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 1.0D && aboveShape.isEmpty()
                     && !waterCell && !lavaCell) jumpOver.add(gridPos);
             if (waterCell) waterCells.add(gridPos);
@@ -308,7 +312,10 @@ final class WorldSnapshot implements GridWorld {
             GridPos cell = crossed.getKey();
             if (cell.equals(from) || cell.equals(to)) continue;
             if (dangerous.contains(cell)) return false;
-            if (jumpable.contains(cell) || freeBody.contains(cell)) continue;
+            // The jump apex occupies the cell one block above the normal
+            // walking volume.  Requiring that full body space prevents a
+            // planned gap jump from entering a low tunnel or hitting a roof.
+            if (jumpable.contains(cell) && freeBody.contains(cell.add(0, 1, 0))) continue;
             if (crossed.getValue() < 1.0D || !jumpOver.contains(cell)
                     || !freeBody.contains(cell.add(0, 1, 0))) return false;
         }

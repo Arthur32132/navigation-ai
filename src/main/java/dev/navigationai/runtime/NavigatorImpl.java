@@ -403,6 +403,15 @@ final class NavigatorImpl implements Navigator {
         boolean climbing = isClimbable(level, next) || isClimbable(level, currentBlock);
         BlockPos edgeStart = pathIndex > 0 ? path.get(pathIndex - 1) : currentBlock;
         boolean jumpGap = isJumpTransition(edgeStart, next);
+        boolean sneak = requiresSneak(currentBlock) || requiresSneak(next)
+                || (climbing && next.getY() < currentBlock.getY());
+        // The snapshot normally rejects this transition. Recheck the takeoff
+        // and landing headroom against the live world too: a stale route must
+        // never make the fake player repeatedly jump into a low ceiling.
+        if (jumpGap && (sneak || !hasJumpHeadroom(level, edgeStart) || !hasJumpHeadroom(level, next))) {
+            requestHazardRepath();
+            return;
+        }
         boolean swimming = policy.allowWater()
                 && (isWater(level, next) || isWater(level, currentBlock) || isWater(level, next.below()));
         // Fake players do not receive the client packet that normally toggles
@@ -413,8 +422,6 @@ final class NavigatorImpl implements Navigator {
                 : climbing ? next.getY() > currentBlock.getY()
                 : next.getY() > currentBlock.getY() && owner.player().onGround();
         if (swimming && next.getY() > currentBlock.getY()) jump = true;
-        boolean sneak = requiresSneak(currentBlock) || requiresSneak(next)
-                || (climbing && next.getY() < currentBlock.getY());
         owner.actions().setMovement(0, 1, jump, !climbing && !sneak, sneak);
         Vec3 current = owner.player().position();
         boolean progressed = progressedToward(target);
@@ -688,6 +695,11 @@ final class NavigatorImpl implements Navigator {
         int dz = Math.abs(to.getZ() - from.getZ());
         double distance = Math.hypot(dx, dz);
         return distance >= 2.0D && distance <= 4.0D;
+    }
+
+    private boolean hasJumpHeadroom(ServerLevel level, BlockPos position) {
+        return level.getBlockState(position.above()).getCollisionShape(level, position.above()).isEmpty()
+                && hasBodyClearance(level, position.above(), Pose.STANDING);
     }
 
     private boolean requiresSneak(BlockPos position) {
