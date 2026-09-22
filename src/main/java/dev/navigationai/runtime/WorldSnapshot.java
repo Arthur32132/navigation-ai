@@ -32,6 +32,7 @@ final class WorldSnapshot implements GridWorld {
     private final Set<GridPos> passable;
     private final Set<GridPos> dangerous;
     private final Set<GridPos> jumpable;
+    private final Set<GridPos> jumpOver;
     private final Set<GridPos> crouchOnly;
     private final Set<GridPos> waterCells;
     private final Set<GridPos> freeBody;
@@ -39,6 +40,7 @@ final class WorldSnapshot implements GridWorld {
     private final int minX, maxX, minY, maxY, minZ, maxZ;
 
     private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, Set<GridPos> jumpable,
+                          Set<GridPos> jumpOver,
                           Set<GridPos> crouchOnly, Set<GridPos> waterCells,
                           Set<GridPos> freeBody,
                           Map<GridPos, Double> actionCosts,
@@ -46,6 +48,7 @@ final class WorldSnapshot implements GridWorld {
         this.passable = Set.copyOf(passable);
         this.dangerous = Set.copyOf(dangerous);
         this.jumpable = Set.copyOf(jumpable);
+        this.jumpOver = Set.copyOf(jumpOver);
         this.crouchOnly = Set.copyOf(crouchOnly);
         this.waterCells = Set.copyOf(waterCells);
         this.freeBody = Set.copyOf(freeBody);
@@ -68,6 +71,7 @@ final class WorldSnapshot implements GridWorld {
         Set<GridPos> passable = new HashSet<>();
         Set<GridPos> dangerous = new HashSet<>();
         Set<GridPos> jumpable = new HashSet<>();
+        Set<GridPos> jumpOver = new HashSet<>();
         Set<GridPos> crouchOnly = new HashSet<>();
         Set<GridPos> waterCells = new HashSet<>();
         Set<GridPos> freeBody = new HashSet<>();
@@ -156,6 +160,8 @@ final class WorldSnapshot implements GridWorld {
                     && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
             if (stateShape.isEmpty() && aboveShape.isEmpty() && below.getCollisionShape(level, pos.below()).isEmpty()
                     && !waterCell && !lavaCell) jumpable.add(gridPos);
+            if (!stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 1.0D && aboveShape.isEmpty()
+                    && !waterCell && !lavaCell) jumpOver.add(gridPos);
             if (waterCell) waterCells.add(gridPos);
             boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
                     || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
@@ -182,7 +188,7 @@ final class WorldSnapshot implements GridWorld {
                         && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
             }
         }
-        return new WorldSnapshot(passable, dangerous, jumpable, crouchOnly, waterCells, freeBody, actionCosts,
+        return new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly, waterCells, freeBody, actionCosts,
                 minX, maxX, minY, maxY, minZ, maxZ);
     }
 
@@ -271,13 +277,40 @@ final class WorldSnapshot implements GridWorld {
         if (!passable(from) || !passable(to) || from.y() != to.y()) return false;
         int dx = to.x() - from.x();
         int dz = to.z() - from.z();
-        if (dx != 0 && dz != 0) return false;
-        int distance = Math.max(Math.abs(dx), Math.abs(dz));
-        if (distance < 2 || distance > 4) return false;
-        int stepX = Integer.signum(dx);
-        int stepZ = Integer.signum(dz);
-        for (int step = 1; step < distance; step++) {
-            if (!jumpable.contains(from.add(step * stepX, 0, step * stepZ))) return false;
+        double distance = Math.hypot(dx, dz);
+        if (distance < 2.0D || distance > 4.0D) return false;
+
+        // Sample the swept horizontal line.  A clear body cell represents a
+        // gap or open air.  For a one-block wall, the body must instead have
+        // room one block higher and the parabolic jump must reach that height.
+        // This rejects two-block walls, liquids and hazards while allowing a
+        // diagonal jump that safely clears one ordinary wall block.
+        Map<GridPos, Double> highestArcByCell = new HashMap<>();
+        int samples = Math.max(1, (int) Math.ceil(distance * 8.0D));
+        for (int sample = 1; sample < samples; sample++) {
+            double progress = sample / (double) samples;
+            GridPos crossed = new GridPos(
+                    (int) Math.floor(from.x() + 0.5D + dx * progress), from.y(),
+                    (int) Math.floor(from.z() + 0.5D + dz * progress));
+            if (crossed.equals(from) || crossed.equals(to)) continue;
+            double arcHeight = 5.0D * progress * (1.0D - progress);
+            highestArcByCell.merge(crossed, arcHeight, Math::max);
+            // A diagonal body has width: at a grid-corner crossing it can
+            // touch either adjoining cell, not only the cell containing the
+            // line's centre.  Include both cells so a jump cannot clip
+            // through two touching wall corners.
+            if (dx != 0 && dz != 0) {
+                highestArcByCell.merge(crossed.add(-Integer.signum(dx), 0, 0), arcHeight, Math::max);
+                highestArcByCell.merge(crossed.add(0, 0, -Integer.signum(dz)), arcHeight, Math::max);
+            }
+        }
+        for (Map.Entry<GridPos, Double> crossed : highestArcByCell.entrySet()) {
+            GridPos cell = crossed.getKey();
+            if (cell.equals(from) || cell.equals(to)) continue;
+            if (dangerous.contains(cell)) return false;
+            if (jumpable.contains(cell) || freeBody.contains(cell)) continue;
+            if (crossed.getValue() < 1.0D || !jumpOver.contains(cell)
+                    || !freeBody.contains(cell.add(0, 1, 0))) return false;
         }
         return true;
     }

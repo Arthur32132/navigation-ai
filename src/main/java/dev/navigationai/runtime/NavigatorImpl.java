@@ -686,7 +686,8 @@ final class NavigatorImpl implements Navigator {
         if (from.getY() != to.getY()) return false;
         int dx = Math.abs(to.getX() - from.getX());
         int dz = Math.abs(to.getZ() - from.getZ());
-        return (dx == 0 && dz >= 2 && dz <= 4) || (dz == 0 && dx >= 2 && dx <= 4);
+        double distance = Math.hypot(dx, dz);
+        return distance >= 2.0D && distance <= 4.0D;
     }
 
     private boolean requiresSneak(BlockPos position) {

@@ -223,6 +223,42 @@ class GridPathfinderTest {
     }
 
     @Test
+    void jumpsDiagonallyWhenTheWorldValidatesTheArc() {
+        GridPos start = new GridPos(0, 0, 0);
+        GridPos goal = new GridPos(2, 0, 2);
+        GridWorld world = new GridWorld() {
+            @Override public boolean passable(GridPos pos) {
+                return pos.equals(start) || pos.equals(goal);
+            }
+
+            @Override public boolean canJump(GridPos from, GridPos to) {
+                return from.equals(start) && to.equals(goal);
+            }
+        };
+
+        GridPath path = GridPathfinder.find(world, start, goal, policy(128));
+
+        assertEquals(List.of(start, goal), path.nodes());
+    }
+
+    @Test
+    void doesNotPlanDiagonalJumpsBeyondTheSprintRange() {
+        GridPos start = new GridPos(0, 0, 0);
+        GridPos goal = new GridPos(3, 0, 3);
+        GridWorld world = new GridWorld() {
+            @Override public boolean passable(GridPos pos) {
+                return pos.equals(start) || pos.equals(goal);
+            }
+
+            @Override public boolean canJump(GridPos from, GridPos to) { return true; }
+        };
+
+        GridPath path = GridPathfinder.find(world, start, goal, policy(128));
+
+        assertTrue(path.nodes().isEmpty());
+    }
+
+    @Test
     void limitsWaterAndPrefersDryDetour() {
         GridPos start = new GridPos(0, 0, 0);
         GridPos goal = new GridPos(4, 0, 0);

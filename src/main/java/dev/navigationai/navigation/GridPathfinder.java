@@ -15,14 +15,13 @@ import java.util.Set;
 public final class GridPathfinder {
     private record SearchNode(GridPos pos, int waterSteps) { }
 
-    private static final int[][] MOVES = {
-        {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1},
-        {0, 1, 0}, {0, -1, 0},
-        {1, 1, 0}, {-1, 1, 0}, {0, 1, 1}, {0, 1, -1},
-        {1, -1, 0}, {-1, -1, 0}, {0, -1, 1}, {0, -1, -1},
-        {2, 0, 0}, {-2, 0, 0}, {3, 0, 0}, {-3, 0, 0}, {4, 0, 0}, {-4, 0, 0},
-        {0, 0, 2}, {0, 0, -2}, {0, 0, 3}, {0, 0, -3}, {0, 0, 4}, {0, 0, -4}
-    };
+    /**
+     * The longest safe sprint jump covers four horizontal blocks: a three
+     * block gap plus the landing cell.  Generate every direction inside that
+     * radius, rather than only the two cardinal axes, so A* can use a valid
+     * diagonal trajectory around a corner or obstacle.
+     */
+    private static final int[][] MOVES = createMoves();
     private static final int[][] DROP_MOVES = createDropMoves();
 
     private GridPathfinder() { }
@@ -164,6 +163,26 @@ public final class GridPathfinder {
     private static double heuristic(GridPos a, GridPos b) {
         return Math.max(Math.abs(a.x() - b.x()), Math.abs(a.z() - b.z()))
                 + Math.abs(a.y() - b.y());
+    }
+
+    private static int[][] createMoves() {
+        ArrayList<int[]> moves = new ArrayList<>();
+        moves.add(new int[] {1, 0, 0}); moves.add(new int[] {-1, 0, 0});
+        moves.add(new int[] {0, 0, 1}); moves.add(new int[] {0, 0, -1});
+        moves.add(new int[] {0, 1, 0}); moves.add(new int[] {0, -1, 0});
+        moves.add(new int[] {1, 1, 0}); moves.add(new int[] {-1, 1, 0});
+        moves.add(new int[] {0, 1, 1}); moves.add(new int[] {0, 1, -1});
+        moves.add(new int[] {1, -1, 0}); moves.add(new int[] {-1, -1, 0});
+        moves.add(new int[] {0, -1, 1}); moves.add(new int[] {0, -1, -1});
+
+        for (int dx = -4; dx <= 4; dx++) for (int dz = -4; dz <= 4; dz++) {
+            if (dx == 0 && dz == 0) continue;
+            double distance = Math.hypot(dx, dz);
+            if (distance >= 2.0D && distance <= 4.0D) {
+                moves.add(new int[] {dx, 0, dz});
+            }
+        }
+        return moves.toArray(int[][]::new);
     }
 
     private static int[][] createDropMoves() {
