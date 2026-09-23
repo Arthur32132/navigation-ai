@@ -21,6 +21,8 @@ import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.VoxelShape;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.core.Direction;
 
 /** Immutable, server-thread captured collision snapshot for off-thread A*. */
@@ -28,7 +30,6 @@ final class WorldSnapshot implements GridWorld {
     private static final double WATER_STEP_COST = 3.0D;
     private static final double STANDING_CLEARANCE_MARGIN = 0.10D;
     private static final double CROUCHING_CLEARANCE_MARGIN = 0.02D;
-    private static final int MAX_WATER_STEPS = 8;
     private static final int VERTICAL_SNAPSHOT_RADIUS = 16;
     private final Set<GridPos> passable;
     private final Set<GridPos> dangerous;
@@ -48,14 +49,16 @@ final class WorldSnapshot implements GridWorld {
                           Map<GridPos, Double> actionCosts,
                           int minX, int maxX, int minY, int maxY, int minZ, int maxZ,
                           boolean hasUnloadedChunks) {
-        this.passable = Set.copyOf(passable);
-        this.dangerous = Set.copyOf(dangerous);
-        this.jumpable = Set.copyOf(jumpable);
-        this.jumpOver = Set.copyOf(jumpOver);
-        this.crouchOnly = Set.copyOf(crouchOnly);
-        this.waterCells = Set.copyOf(waterCells);
-        this.freeBody = Set.copyOf(freeBody);
-        this.actionCosts = Map.copyOf(actionCosts);
+        // Capture owns these collections and stops mutating them after this
+        // point. Reusing them avoids a large final copy on the server tick.
+        this.passable = passable;
+        this.dangerous = dangerous;
+        this.jumpable = jumpable;
+        this.jumpOver = jumpOver;
+        this.crouchOnly = crouchOnly;
+        this.waterCells = waterCells;
+        this.freeBody = freeBody;
+        this.actionCosts = actionCosts;
         this.minX = minX; this.maxX = maxX; this.minY = minY; this.maxY = maxY; this.minZ = minZ; this.maxZ = maxZ;
         this.hasUnloadedChunks = hasUnloadedChunks;
     }
@@ -63,153 +66,229 @@ final class WorldSnapshot implements GridWorld {
     static WorldSnapshot capture(ServerLevel level, ServerPlayer observer, GridPos start, int radius, boolean allowWater,
                                  boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
                                  BooleanSupplier generationBudget) {
-        // Keep the snapshot bounded by the requested radius. A distant goal is
-        // intentionally outside this local snapshot; the pathfinder handles it
-        // as a frontier target instead of making the server scan the whole
-        // rectangle.
-        int effectiveRadius = allowChunkGeneration ? Math.min(radius, 16) : radius;
-        int minX = start.x() - effectiveRadius, maxX = start.x() + effectiveRadius;
-        int minZ = start.z() - effectiveRadius, maxZ = start.z() + effectiveRadius;
-        // A distant vertical goal is handled by frontier segments, just like a
-        // distant horizontal goal. Keep each server-thread capture local.
-        int minY = Math.max(level.getMinY(), start.y() - VERTICAL_SNAPSHOT_RADIUS);
-        int maxY = Math.min(level.getMinY() + level.getHeight() - 2,
-                start.y() + VERTICAL_SNAPSHOT_RADIUS);
-        Set<GridPos> passable = new HashSet<>();
-        Set<GridPos> dangerous = new HashSet<>();
-        Set<GridPos> jumpable = new HashSet<>();
-        Set<GridPos> jumpOver = new HashSet<>();
-        Set<GridPos> crouchOnly = new HashSet<>();
-        Set<GridPos> waterCells = new HashSet<>();
-        Set<GridPos> freeBody = new HashSet<>();
-        Map<GridPos, Double> actionCosts = new HashMap<>();
-        Set<Long> generatedChunks = new HashSet<>();
-        boolean hasUnloadedChunks = false;
-        double standingHeight = observer.getDimensions(Pose.STANDING).height();
-        double crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
-        for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++) for (int y = minY; y <= maxY; y++) {
-            BlockPos pos = new BlockPos(x, y, z);
-            if (!level.hasChunkAt(pos)) {
-                if (!allowChunkGeneration) {
-                    hasUnloadedChunks = true;
-                    continue;
-                }
-                // Generation is explicit and remains bounded by snapshotRadius.
-                long chunkKey = ((long) (x >> 4) << 32) ^ ((z >> 4) & 0xffffffffL);
-                if (generatedChunks.add(chunkKey)
-                        && (generationBudget == null || generationBudget.getAsBoolean())) level.getChunkAt(pos);
-                if (!level.hasChunkAt(pos)) continue;
-            }
-            var state = level.getBlockState(pos);
-            var above = level.getBlockState(pos.above());
-            var below = level.getBlockState(pos.below());
-            FluidState fluidState = level.getFluidState(pos);
-            boolean waterCell = fluidState.getType() == Fluids.WATER
-                    || fluidState.getType() == Fluids.FLOWING_WATER;
-            var stateShape = state.getCollisionShape(level, pos);
-            var aboveShape = above.getCollisionShape(level, pos.above());
-            boolean standingClearance = hasClearanceAbove(aboveShape, standingHeight);
-            boolean crouchingClearance = hasClearanceAbove(aboveShape, crouchingHeight);
-            boolean standingBody = stateShape.isEmpty() && standingClearance;
-            boolean crouchingBody = stateShape.isEmpty() && crouchingClearance;
-            // A bottom slab, carpet or similar partial block is a valid cell
-            // under the player's feet. Full-height stairs/fences remain solid.
-            boolean lowSurface = !stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 0.5D
-                    && (standingClearance || crouchingClearance);
-            boolean climbable = state.is(BlockTags.CLIMBABLE)
-                    && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
-            boolean openable = (isClosedHandOpenableDoor(state) || isClosedHandOpenableTrapdoor(state)
-                    || isClosedFenceGate(state))
-                    && observer.mayInteract(level, pos);
-            boolean openDoor = state.getBlock() instanceof DoorBlock && state.hasProperty(DoorBlock.OPEN)
-                    && state.getValue(DoorBlock.OPEN)
-                    && (!state.hasProperty(DoorBlock.HALF)
-                        || state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
-            boolean openGate = state.getBlock() instanceof FenceGateBlock
-                    && state.hasProperty(FenceGateBlock.OPEN) && state.getValue(FenceGateBlock.OPEN);
-            FluidState belowFluid = level.getFluidState(pos.below());
-            boolean belowWater = belowFluid.getType() == Fluids.WATER
-                    || belowFluid.getType() == Fluids.FLOWING_WATER;
-            boolean lavaCell = fluidState.getType() == Fluids.LAVA
-                    || fluidState.getType() == Fluids.FLOWING_LAVA;
-            boolean fluidAllowed = (!waterCell && !lavaCell) || (allowWater && waterCell);
-            boolean floor = below.getCollisionShape(level, pos.below()).isEmpty()
-                    ? (allowWater && belowWater)
-                    : true;
-            GridPos gridPos = new GridPos(x, y, z);
-            if (stateShape.isEmpty() && (standingClearance || crouchingClearance)) freeBody.add(gridPos);
-            boolean breakableBody = allowBreaking && hasUsableTool(observer, state)
-                    && isBreakable(level, pos, state)
-                    && (above.getCollisionShape(level, pos.above()).isEmpty()
-                        || (hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)))
-                    && !below.getCollisionShape(level, pos.below()).isEmpty();
-            boolean breakableAbove = allowBreaking && state.getCollisionShape(level, pos).isEmpty()
-                    && hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)
-                    && !below.getCollisionShape(level, pos.below()).isEmpty();
-            boolean supportedPlacement = allowPlacing && (standingBody || crouchingBody)
-                    && below.getCollisionShape(level, pos.below()).isEmpty()
-                    && (hasSolidNeighbour(level, pos.below()) || hasSolidNeighbour(level, pos));
-            boolean passableCell = fluidAllowed && (((standingBody || crouchingBody) && floor)
-                    || lowSurface || climbable || openable || openDoor || openGate
-                    || breakableBody || breakableAbove || supportedPlacement);
-            if (passableCell || (allowWater && waterCell && (standingClearance || crouchingClearance))) {
-                passable.add(gridPos);
-            }
-            if (breakableBody) {
-                actionCosts.merge(gridPos, breakCost(observer, level, pos, state), Math::max);
-                if (!above.getCollisionShape(level, pos.above()).isEmpty()) {
-                    actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
-                }
-            } else if (breakableAbove) {
-                actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
-            } else if (supportedPlacement) {
-                // Placing is deliberately more expensive than a normal step;
-                // it is a fallback for gaps, not a preferred flat-ground move.
-                actionCosts.merge(gridPos, 8.0D, Math::max);
-            }
-            if (passable.contains(gridPos) && !standingClearance && crouchingClearance
-                    && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
-            // A jumping body needs two clear cells at its current height;
-            // unlike a walkable cell, a crouch-height tunnel is never a
-            // valid segment of a long jump.
-            if (stateShape.isEmpty() && aboveShape.isEmpty() && !waterCell && !lavaCell) {
-                jumpable.add(gridPos);
-            }
-            if (!stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 1.0D && aboveShape.isEmpty()
-                    && !waterCell && !lavaCell) jumpOver.add(gridPos);
-            if (waterCell) waterCells.add(gridPos);
-            boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
-                    || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
-                    || below.is(Blocks.MAGMA_BLOCK) || below.is(Blocks.CACTUS)
-                    || below.is(Blocks.POWDER_SNOW) || belowFluid.getType() == Fluids.LAVA
-                    || belowFluid.getType() == Fluids.FLOWING_LAVA;
-            if (state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE) || state.is(Blocks.CAMPFIRE)
-                    || state.is(Blocks.SOUL_CAMPFIRE) || state.is(Blocks.MAGMA_BLOCK)
-                    || state.is(Blocks.CACTUS) || state.is(Blocks.POWDER_SNOW)
-                    || lavaCell || dangerousSupport) {
-                dangerous.add(gridPos);
-            }
-        }
-        // Living entities are dynamic hazards. Capture their current cells and
-        // immediate neighbours so A* prefers a short detour without touching
-        // entities from the worker thread later.
-        AABB scan = new AABB(minX, minY, minZ, maxX + 1.0, maxY + 1.0, maxZ + 1.0);
-        for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, scan)) {
-            if (entity == observer || !entity.isAlive() || entity.isRemoved() || entity.isSpectator()) continue;
-            BlockPos entityPos = entity.blockPosition();
-            for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
-                GridPos hazard = new GridPos(entityPos.getX() + dx, entityPos.getY(), entityPos.getZ() + dz);
-                if (hazard.x() >= minX && hazard.x() <= maxX && hazard.y() >= minY && hazard.y() <= maxY
-                        && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
-            }
-        }
-        return new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly, waterCells, freeBody, actionCosts,
-                minX, maxX, minY, maxY, minZ, maxZ, hasUnloadedChunks);
+        Capture capture = beginCapture(level, observer, start, radius, allowWater,
+                allowChunkGeneration, allowBreaking, allowPlacing, generationBudget);
+        while (!capture.step(Integer.MAX_VALUE)) { }
+        return capture.result();
     }
 
-    private static boolean hasClearanceAbove(net.minecraft.world.phys.shapes.VoxelShape aboveShape, double height) {
+    static Capture beginCapture(ServerLevel level, ServerPlayer observer, GridPos start, int radius,
+                                boolean allowWater, boolean allowChunkGeneration, boolean allowBreaking,
+                                boolean allowPlacing, BooleanSupplier generationBudget) {
+        return new Capture(level, observer, start, radius, allowWater,
+                allowChunkGeneration, allowBreaking, allowPlacing, generationBudget);
+    }
+
+    /** Scans a bounded number of cells per server tick before publishing an immutable snapshot. */
+    static final class Capture {
+        private final ServerLevel level;
+        private final ServerPlayer observer;
+        private final GridPos start;
+        private final boolean allowWater, allowChunkGeneration, allowBreaking, allowPlacing;
+        private final BooleanSupplier generationBudget;
+        private final int minX, maxX, minY, maxY, minZ, maxZ;
+        private final Set<GridPos> passable = new HashSet<>();
+        private final Set<GridPos> dangerous = new HashSet<>();
+        private final Set<GridPos> jumpable = new HashSet<>();
+        private final Set<GridPos> jumpOver = new HashSet<>();
+        private final Set<GridPos> crouchOnly = new HashSet<>();
+        private final Set<GridPos> waterCells = new HashSet<>();
+        private final Set<GridPos> freeBody = new HashSet<>();
+        private final Map<GridPos, Double> actionCosts = new HashMap<>();
+        private final Set<Long> generatedChunks = new HashSet<>();
+        private final double standingHeight, crouchingHeight, bodyWidth;
+        private int x, y, z;
+        private boolean hasUnloadedChunks;
+        private WorldSnapshot result;
+
+        private Capture(ServerLevel level, ServerPlayer observer, GridPos start, int radius, boolean allowWater,
+                        boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
+                        BooleanSupplier generationBudget) {
+            this.level = level;
+            this.observer = observer;
+            this.start = start;
+            this.allowWater = allowWater;
+            this.allowChunkGeneration = allowChunkGeneration;
+            this.allowBreaking = allowBreaking;
+            this.allowPlacing = allowPlacing;
+            this.generationBudget = generationBudget;
+            // Keep the snapshot bounded by the requested radius. A distant goal is
+            // intentionally outside this local snapshot; the pathfinder handles it
+            // as a frontier target instead of making the server scan the whole
+            // rectangle.
+            int effectiveRadius = allowChunkGeneration ? Math.min(radius, 16) : radius;
+            minX = start.x() - effectiveRadius; maxX = start.x() + effectiveRadius;
+            minZ = start.z() - effectiveRadius; maxZ = start.z() + effectiveRadius;
+            // A distant vertical goal is handled by frontier segments, just like a
+            // distant horizontal goal. Keep each server-thread capture local.
+            minY = Math.max(level.getMinY(), start.y() - VERTICAL_SNAPSHOT_RADIUS);
+            maxY = Math.min(level.getMinY() + level.getHeight() - 2,
+                    start.y() + VERTICAL_SNAPSHOT_RADIUS);
+            standingHeight = observer.getDimensions(Pose.STANDING).height();
+            crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
+            bodyWidth = observer.getDimensions(Pose.STANDING).width();
+            x = minX; y = minY; z = minZ;
+        }
+
+        boolean step(int maxCells) {
+            if (result != null) return true;
+            int processed = 0;
+            while (x <= maxX && processed++ < maxCells) {
+                int x = this.x, y = this.y, z = this.z;
+                if (++this.y > maxY) {
+                    this.y = minY;
+                    if (++this.z > maxZ) { this.z = minZ; this.x++; }
+                }
+                BlockPos pos = new BlockPos(x, y, z);
+                if (!level.hasChunkAt(pos)) {
+                    if (!allowChunkGeneration) {
+                        hasUnloadedChunks = true;
+                        continue;
+                    }
+                    // Generation is explicit and remains bounded by snapshotRadius.
+                    long chunkKey = ((long) (x >> 4) << 32) ^ ((z >> 4) & 0xffffffffL);
+                    if (!generatedChunks.contains(chunkKey)
+                            && (generationBudget == null || generationBudget.getAsBoolean())) {
+                        generatedChunks.add(chunkKey);
+                        level.getChunkAt(pos);
+                    }
+                    if (!level.hasChunkAt(pos)) {
+                        hasUnloadedChunks = true;
+                        continue;
+                    }
+                }
+                var state = level.getBlockState(pos);
+                var above = level.getBlockState(pos.above());
+                var below = level.getBlockState(pos.below());
+                FluidState fluidState = level.getFluidState(pos);
+                boolean waterCell = fluidState.getType() == Fluids.WATER
+                        || fluidState.getType() == Fluids.FLOWING_WATER;
+                var stateShape = state.getCollisionShape(level, pos);
+                var aboveShape = above.getCollisionShape(level, pos.above());
+                boolean clearBody = clearsCenteredBody(state, stateShape, bodyWidth, 1.0D);
+                boolean clearAbove = clearsCenteredBody(above, aboveShape, bodyWidth, 1.0D);
+                boolean standingClearance = hasClearanceAbove(above, aboveShape, standingHeight, bodyWidth);
+                boolean crouchingClearance = hasClearanceAbove(above, aboveShape, crouchingHeight, bodyWidth);
+                boolean standingBody = clearBody && standingClearance;
+                boolean crouchingBody = clearBody && crouchingClearance;
+                // A bottom slab, carpet or similar partial block is a valid cell
+                // under the player's feet. Full-height stairs/fences remain solid.
+                boolean lowSurface = !stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 0.5D
+                        && (standingClearance || crouchingClearance);
+                boolean climbable = state.is(BlockTags.CLIMBABLE)
+                        && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
+                boolean openable = (isClosedHandOpenableDoor(state) || isClosedHandOpenableTrapdoor(state)
+                        || isClosedFenceGate(state))
+                        && observer.mayInteract(level, pos);
+                boolean openGate = state.getBlock() instanceof FenceGateBlock
+                        && state.hasProperty(FenceGateBlock.OPEN) && state.getValue(FenceGateBlock.OPEN);
+                FluidState belowFluid = level.getFluidState(pos.below());
+                boolean belowWater = belowFluid.getType() == Fluids.WATER
+                        || belowFluid.getType() == Fluids.FLOWING_WATER;
+                boolean lavaCell = fluidState.getType() == Fluids.LAVA
+                        || fluidState.getType() == Fluids.FLOWING_LAVA;
+                boolean fluidAllowed = (!waterCell && !lavaCell) || (allowWater && waterCell);
+                boolean floor = below.getCollisionShape(level, pos.below()).isEmpty()
+                        ? (allowWater && belowWater)
+                        : true;
+                GridPos gridPos = new GridPos(x, y, z);
+                if (clearBody && (standingClearance || crouchingClearance)) freeBody.add(gridPos);
+                boolean breakableBody = allowBreaking && !clearBody && hasUsableTool(observer, state)
+                        && isBreakable(level, pos, state)
+                        && (above.getCollisionShape(level, pos.above()).isEmpty()
+                            || (hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)))
+                        && !below.getCollisionShape(level, pos.below()).isEmpty();
+                boolean breakableAbove = allowBreaking && clearBody && !standingClearance && !crouchingClearance
+                        && hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)
+                        && !below.getCollisionShape(level, pos.below()).isEmpty();
+                boolean supportedPlacement = allowPlacing && (standingBody || crouchingBody)
+                        && below.getCollisionShape(level, pos.below()).isEmpty()
+                        && (hasSolidNeighbour(level, pos.below()) || hasSolidNeighbour(level, pos));
+                boolean passableCell = fluidAllowed && (((standingBody || crouchingBody) && floor)
+                        || lowSurface || climbable || openable || openGate
+                        || breakableBody || breakableAbove || supportedPlacement);
+                if (passableCell || (allowWater && waterCell && (standingClearance || crouchingClearance))) {
+                    passable.add(gridPos);
+                }
+                if (breakableBody) {
+                    actionCosts.merge(gridPos, breakCost(observer, level, pos, state), Math::max);
+                    if (!above.getCollisionShape(level, pos.above()).isEmpty()) {
+                        actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
+                    }
+                } else if (breakableAbove) {
+                    actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
+                } else if (supportedPlacement) {
+                    // Placing is deliberately more expensive than a normal step;
+                    // it is a fallback for gaps, not a preferred flat-ground move.
+                    actionCosts.merge(gridPos, 8.0D, Math::max);
+                }
+                if (passable.contains(gridPos) && !standingClearance && crouchingClearance
+                        && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
+                // A jumping body needs two clear cells at its current height;
+                // unlike a walkable cell, a crouch-height tunnel is never a
+                // valid segment of a long jump.
+                if (clearBody && clearAbove && !waterCell && !lavaCell) {
+                    jumpable.add(gridPos);
+                }
+                if (!clearBody && stateShape.max(Direction.Axis.Y) <= 1.0D && clearAbove
+                        && !waterCell && !lavaCell) jumpOver.add(gridPos);
+                if (waterCell) waterCells.add(gridPos);
+                boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
+                        || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
+                        || below.is(Blocks.MAGMA_BLOCK) || below.is(Blocks.CACTUS)
+                        || below.is(Blocks.POWDER_SNOW) || belowFluid.getType() == Fluids.LAVA
+                        || belowFluid.getType() == Fluids.FLOWING_LAVA;
+                if (state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE) || state.is(Blocks.CAMPFIRE)
+                        || state.is(Blocks.SOUL_CAMPFIRE) || state.is(Blocks.MAGMA_BLOCK)
+                        || state.is(Blocks.CACTUS) || state.is(Blocks.POWDER_SNOW)
+                        || lavaCell || dangerousSupport) {
+                    dangerous.add(gridPos);
+                }
+            }
+            if (x <= maxX) return false;
+            // Living entities are dynamic hazards. Capture their current cells and
+            // immediate neighbours so A* prefers a short detour without touching
+            // entities from the worker thread later.
+            AABB scan = new AABB(minX, minY, minZ, maxX + 1.0, maxY + 1.0, maxZ + 1.0);
+            for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, scan)) {
+                if (entity == observer || !entity.isAlive() || entity.isRemoved() || entity.isSpectator()) continue;
+                BlockPos entityPos = entity.blockPosition();
+                GridPos occupied = new GridPos(entityPos.getX(), entityPos.getY(), entityPos.getZ());
+                if (!occupied.equals(start)) passable.remove(occupied);
+                for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+                    GridPos hazard = new GridPos(entityPos.getX() + dx, entityPos.getY(), entityPos.getZ() + dz);
+                    if (hazard.x() >= minX && hazard.x() <= maxX && hazard.y() >= minY && hazard.y() <= maxY
+                            && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
+                }
+            }
+            result = new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly, waterCells, freeBody, actionCosts,
+                    minX, maxX, minY, maxY, minZ, maxZ, hasUnloadedChunks);
+            return true;
+        }
+
+        WorldSnapshot result() {
+            if (result == null) throw new IllegalStateException("Snapshot capture is incomplete");
+            return result;
+        }
+    }
+
+    private static boolean hasClearanceAbove(BlockState above, VoxelShape aboveShape, double height, double width) {
         double margin = height <= 1.6D ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
-        return aboveShape.isEmpty() || 1.0D + aboveShape.min(Direction.Axis.Y) >= height + margin;
+        double needed = height + margin - 1.0D;
+        return needed <= 0.0D || aboveShape.isEmpty()
+                || clearsCenteredBody(above, aboveShape, width, needed)
+                || aboveShape.min(Direction.Axis.Y) >= needed;
+    }
+
+    private static boolean clearsCenteredBody(BlockState state, VoxelShape shape, double width, double height) {
+        if (shape.isEmpty()) return true;
+        if (!(state.getBlock() instanceof DoorBlock || state.getBlock() instanceof TrapDoorBlock)
+                || !state.hasProperty(DoorBlock.OPEN) || !state.getValue(DoorBlock.OPEN)) return false;
+        double halfWidth = width / 2.0D;
+        AABB body = new AABB(0.5D - halfWidth, 0.0D, 0.5D - halfWidth,
+                0.5D + halfWidth, height, 0.5D + halfWidth);
+        for (AABB part : shape.toAabbs()) if (part.intersects(body)) return false;
+        return true;
     }
 
     private static boolean isClosedHandOpenableDoor(net.minecraft.world.level.block.state.BlockState state) {
@@ -366,7 +445,7 @@ final class WorldSnapshot implements GridWorld {
     }
     @Override public boolean requiresSneak(GridPos pos) { return crouchOnly.contains(pos); }
     @Override public boolean isWater(GridPos pos) { return waterCells.contains(pos); }
-    @Override public int maxWaterSteps() { return MAX_WATER_STEPS; }
+    @Override public int maxWaterSteps() { return Integer.MAX_VALUE; }
     @Override public double cost(GridPos from, GridPos to) {
         double base = GridWorld.super.cost(from, to);
         return base + (waterCells.contains(to) ? WATER_STEP_COST : 0.0D)

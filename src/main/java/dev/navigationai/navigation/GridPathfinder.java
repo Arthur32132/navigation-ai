@@ -57,8 +57,12 @@ public final class GridPathfinder {
         Map<SearchNode, SearchNode> parent = new HashMap<>();
         Map<SearchNode, Integer> steps = new HashMap<>();
         Set<SearchNode> closed = new HashSet<>();
-        int startWaterSteps = world.isWater(start) ? 1 : 0;
-        if (startWaterSteps > world.maxWaterSteps()) return new GridPath(List.of(), 0);
+        int waterLimit = world.maxWaterSteps();
+        // Unlimited swimming needs no extra A* state dimension. Counting
+        // every water cell there would revisit the same position with many
+        // different counters and exhaust the node budget.
+        int startWaterSteps = waterLimit == Integer.MAX_VALUE ? 0 : world.isWater(start) ? 1 : 0;
+        if (startWaterSteps > waterLimit) return new GridPath(List.of(), 0);
         SearchNode startNode = new SearchNode(start, startWaterSteps);
         score.put(startNode, 0.0);
         steps.put(startNode, 0);
@@ -98,8 +102,9 @@ public final class GridPathfinder {
                 if (jump
                         ? !world.passable(next) || !world.canJump(current, next)
                         : !world.canTraverse(current, next)) continue;
-                int nextWaterSteps = currentNode.waterSteps() + (world.isWater(next) ? 1 : 0);
-                if (nextWaterSteps > world.maxWaterSteps()) continue;
+                int nextWaterSteps = waterLimit == Integer.MAX_VALUE ? 0
+                        : currentNode.waterSteps() + (world.isWater(next) ? 1 : 0);
+                if (nextWaterSteps > waterLimit) continue;
                 SearchNode nextNode = new SearchNode(next, nextWaterSteps);
                 if (closed.contains(nextNode)) continue;
                 int nextSteps = steps.get(currentNode) + 1;
@@ -127,9 +132,10 @@ public final class GridPathfinder {
                     if (dropDistance > policy.maxFallDistance()) continue;
                     GridPos next = current.add(move[0], move[1], move[2]);
                     if (!world.canDrop(current, next)) continue;
-                    SearchNode nextNode = new SearchNode(next, currentNode.waterSteps()
-                            + (world.isWater(next) ? 1 : 0));
-                    if (nextNode.waterSteps() > world.maxWaterSteps() || closed.contains(nextNode)) continue;
+                    int nextWaterSteps = waterLimit == Integer.MAX_VALUE ? 0
+                            : currentNode.waterSteps() + (world.isWater(next) ? 1 : 0);
+                    SearchNode nextNode = new SearchNode(next, nextWaterSteps);
+                    if (nextNode.waterSteps() > waterLimit || closed.contains(nextNode)) continue;
                     int nextSteps = steps.get(currentNode) + 1;
                     if (nextSteps > policy.maxPathLength()) {
                         pathLengthReached = true;

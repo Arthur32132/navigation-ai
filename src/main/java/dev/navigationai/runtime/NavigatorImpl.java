@@ -42,6 +42,7 @@ import net.minecraft.world.level.block.TrapDoorBlock;
 import net.minecraft.world.level.block.state.BlockState;
 
 final class NavigatorImpl implements Navigator {
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(NavigatorImpl.class);
     private static final double STANDING_CLEARANCE_MARGIN = 0.10D;
     private static final double CROUCHING_CLEARANCE_MARGIN = 0.02D;
     private final BotRuntime runtime;
@@ -64,6 +65,9 @@ final class NavigatorImpl implements Navigator {
     private MiningTask navigationMining;
     private long nextHazardRepathNanos;
     private WorldSnapshot plannedSnapshot;
+    private WorldSnapshot.Capture pendingCapture;
+    private GridPos captureStart, captureGoal;
+    private long captureGeneration, captureNanos;
     private boolean finalPlanningSegment;
     private boolean planningDeferred;
     private boolean waitingForFrontierChunks;
@@ -76,6 +80,7 @@ final class NavigatorImpl implements Navigator {
     private static final int MAX_BUDGET_DEFERRALS = 3;
     private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
     private static final int FRONTIER_CHUNK_RETRY_DELAY_TICKS = 5;
+    private static final int SNAPSHOT_CELLS_PER_BOT_TICK = 2_048;
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
 
@@ -120,6 +125,7 @@ final class NavigatorImpl implements Navigator {
         repathAttempts = 0;
         lastTargetDistance = Double.POSITIVE_INFINITY;
         plannedSnapshot = null;
+        pendingCapture = null;
         finalPlanningSegment = false;
         planningDeferred = false;
         waitingForFrontierChunks = false;
@@ -140,6 +146,7 @@ final class NavigatorImpl implements Navigator {
         }
         navigationMining = null;
         planningDeferred = false;
+        pendingCapture = null;
     }
     @Override public NavigationStatus status() { return task == null ? NavigationStatus.IDLE : task.status(); }
     @Override public Optional<NavigationGoal> goal() { return Optional.ofNullable(goal); }
@@ -326,6 +333,11 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        if (task.status() == NavigationStatus.COMPUTING) holdPositionWhilePlanning();
+        if (pendingCapture != null) {
+            advanceCapture();
+            return;
+        }
         if (waitingForFrontierChunks) {
             if (runtime.server().getTickCount() < nextFrontierRetryTick) return;
             waitingForFrontierChunks = false;
@@ -384,7 +396,7 @@ final class NavigatorImpl implements Navigator {
                 // keep rebuilding the same one-cell route forever.
                 if (++repathAttempts >= 3) {
                     owner.actions().stop();
-                    task.stuck(resultNodesVisited());
+                    finishStuck("segment_end", null);
                 } else {
                     requestPath();
                 }
@@ -400,7 +412,11 @@ final class NavigatorImpl implements Navigator {
         Vec3 target = Vec3.atCenterOf(next);
         double dx = target.x - owner.player().getX();
         double dz = target.z - owner.player().getZ();
-        if (dx * dx + dz * dz < 0.14 && Math.abs(target.y - owner.player().getY()) < 1.1) {
+        BlockPos plannedFrom = pathIndex > 0 ? path.get(pathIndex - 1) : owner.player().blockPosition();
+        boolean landingFromJump = isJumpTransition(plannedFrom, next)
+                && crossesUnsupportedGap((ServerLevel) owner.player().level(), plannedFrom, next);
+        if (dx * dx + dz * dz < 0.14 && Math.abs(target.y - owner.player().getY()) < 1.1
+                && (!landingFromJump || owner.player().onGround())) {
             pathIndex++;
             lastTargetDistance = Double.POSITIVE_INFINITY;
             if (pathIndex >= path.size()) {
@@ -421,6 +437,14 @@ final class NavigatorImpl implements Navigator {
         boolean climbing = isClimbable(level, next) || isClimbable(level, currentBlock);
         BlockPos edgeStart = pathIndex > 0 ? path.get(pathIndex - 1) : currentBlock;
         boolean jumpGap = isJumpTransition(edgeStart, next);
+        boolean unsupportedGap = jumpGap && crossesUnsupportedGap(level, edgeStart, next);
+        double jumpDistance = Math.hypot(next.getX() - edgeStart.getX(), next.getZ() - edgeStart.getZ());
+        Vec3 takeoffCenter = Vec3.atCenterOf(edgeStart);
+        double takeoffProgress = unsupportedGap
+                ? ((owner.player().getX() - takeoffCenter.x) * (next.getX() - edgeStart.getX())
+                    + (owner.player().getZ() - takeoffCenter.z) * (next.getZ() - edgeStart.getZ()))
+                    / jumpDistance
+                : 0.0D;
         boolean sneak = requiresSneak(currentBlock) || requiresSneak(next)
                 || (climbing && next.getY() < currentBlock.getY());
         boolean stepUp = !climbing && next.getY() == currentBlock.getY() + 1
@@ -439,7 +463,10 @@ final class NavigatorImpl implements Navigator {
         // swimming. Keep the pose explicit while a planned transition enters,
         // crosses, or exits water so vanilla travel applies water movement.
         owner.player().setSwimming(swimming);
-        boolean jump = jumpGap ? owner.player().onGround()
+        // Starting a long jump as soon as the takeoff cell is entered leaves
+        // too little range for a three-block gap, particularly after a door
+        // slows entry. Move toward its front edge while still on solid ground.
+        boolean jump = jumpGap ? owner.player().onGround() && (!unsupportedGap || takeoffProgress >= 0.25D)
                 : climbing ? next.getY() > currentBlock.getY()
                 : next.getY() > currentBlock.getY() && owner.player().onGround();
         if (swimming && next.getY() > currentBlock.getY()) jump = true;
@@ -455,7 +482,7 @@ final class NavigatorImpl implements Navigator {
         if (ticksWithoutProgress > 40) {
             if (++repathAttempts >= 3) {
                 owner.actions().stop();
-                task.stuck(resultNodesVisited());
+                finishStuck("no_progress", next);
             } else {
                 task.status = NavigationStatus.COMPUTING;
                 requestPath();
@@ -469,9 +496,18 @@ final class NavigatorImpl implements Navigator {
         if (replan) runtime.recordReplan();
         long generation = ++requestGeneration;
         cancelSearchFuture();
+        pendingCapture = null;
         task.status = NavigationStatus.COMPUTING;
         path = List.of(); pathIndex = 0;
         owner.actions().stop();
+        // A frontier path can end beside a gap. Input stops immediately, but
+        // sprint momentum otherwise carries the player off that ledge while
+        // the next snapshot is being captured over several ticks.
+        if (owner.player().onGround() || owner.player().isInWater()) {
+            Vec3 motion = owner.player().getDeltaMovement();
+            owner.player().setDeltaMovement(0.0D, motion.y, 0.0D);
+        }
+        holdPositionWhilePlanning();
         if (runtime.shouldDeferPathSearch(searchPriority())) {
             runtime.recordBackpressureDeferral();
             planningDeferred = true;
@@ -509,6 +545,11 @@ final class NavigatorImpl implements Navigator {
         }
         player = owner.player();
         ServerLevel level = (ServerLevel)player.level();
+        if (!(goal instanceof NavigationGoal.FollowGoal) && reachedGoal()) {
+            pathStartedNanos = System.nanoTime();
+            finishSuccess();
+            return;
+        }
         if (goal instanceof NavigationGoal.FollowGoal follow) followPlanPosition = follow.target().position();
         GridPos startPos = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(), player.blockPosition().getZ());
         BlockPos requestedTarget = targetBlock();
@@ -517,20 +558,72 @@ final class NavigatorImpl implements Navigator {
         // world read around the bot, while GridPathfinder can return a useful
         // frontier path when the goal is beyond that snapshot.
         finalPlanningSegment = false;
-        long snapshotStarted = System.nanoTime();
-        WorldSnapshot snapshot;
-        try {
-            if (policy.allowChunkGeneration()) {
-                runtime.updateNavigationTickets(owner.id(), level, startPos, policy.snapshotRadius());
-            } else {
-                runtime.releaseNavigationTickets(owner.id());
-            }
-            snapshot = WorldSnapshot.capture(level, player, startPos, policy.snapshotRadius(),
-                    policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing(),
-                    runtime::tryAcquireChunkGeneration);
-        } finally {
-            runtime.recordSnapshot(System.nanoTime() - snapshotStarted);
+        // Nearby goals only need a local margin. Distant goals still use the
+        // policy's full radius so detours remain available to the planner.
+        int distance = Math.max(Math.abs(desired.x() - startPos.x()), Math.abs(desired.z() - startPos.z()));
+        // Long requests are handled by successive local frontier plans. Keep
+        // each server-thread capture small enough that a bot does not stand
+        // idle for several seconds before every segment.
+        int radius = Math.min(policy.snapshotRadius(), Math.max(8, Math.min(16, distance + 4)));
+        if (policy.allowChunkGeneration()) {
+            runtime.updateNavigationTickets(owner.id(), level, startPos, radius);
+        } else {
+            runtime.releaseNavigationTickets(owner.id());
         }
+        pendingCapture = WorldSnapshot.beginCapture(level, player, startPos, radius,
+                policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing(),
+                runtime::tryAcquireChunkGeneration);
+        captureStart = startPos;
+        captureGoal = desired;
+        captureGeneration = generation;
+        captureNanos = 0;
+        advanceCapture();
+    }
+
+    private void holdPositionWhilePlanning() {
+        if (!policy.allowWater()) return;
+        ServerPlayer player = owner.player();
+        ServerLevel level = (ServerLevel) player.level();
+        BlockPos feet = player.blockPosition();
+        boolean inWater = player.isInWater() || isWater(level, feet) || isWater(level, feet.below());
+        owner.actions().setMovement(0, 0, inWater, false, false);
+        player.setSwimming(inWater);
+        if (inWater) {
+            Vec3 motion = player.getDeltaMovement();
+            player.setDeltaMovement(0.0D, motion.y, 0.0D);
+        }
+    }
+
+    private void advanceCapture() {
+        if (pendingCapture == null) return;
+        int cells = runtime.acquireSnapshotCells(SNAPSHOT_CELLS_PER_BOT_TICK);
+        if (cells == 0) return;
+        long captureStepStarted = System.nanoTime();
+        boolean complete;
+        try {
+            complete = pendingCapture.step(cells);
+        } finally {
+            captureNanos += System.nanoTime() - captureStepStarted;
+        }
+        if (!complete) return;
+        WorldSnapshot snapshot = pendingCapture.result();
+        pendingCapture = null;
+        runtime.recordSnapshot(captureNanos);
+        if (task == null || task.cancelled.get() || isTerminal(task.status())
+                || captureGeneration != requestGeneration) return;
+        ServerPlayer player = owner.player();
+        GridPos current = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(),
+                player.blockPosition().getZ());
+        if (!current.equals(captureStart) && !snapshot.passable(current)) {
+            requestPath();
+            return;
+        }
+        // Water currents and buoyancy can move a fake player while a snapshot
+        // is being collected. The captured area is still valid at the new
+        // position; restarting the whole capture would keep it in COMPUTING.
+        GridPos startPos = current;
+        GridPos desired = captureGoal;
+        long generation = captureGeneration;
         plannedSnapshot = snapshot;
         GridPos searchGoal = selectSearchGoal(snapshot, desired);
         long started = System.nanoTime();
@@ -718,9 +811,42 @@ final class NavigatorImpl implements Navigator {
         return distance >= 2.0D && distance <= 4.0D;
     }
 
+    private boolean crossesUnsupportedGap(ServerLevel level, BlockPos from, BlockPos to) {
+        int dx = to.getX() - from.getX();
+        int dz = to.getZ() - from.getZ();
+        int steps = Math.max(Math.abs(dx), Math.abs(dz));
+        for (int step = 1; step < steps; step++) {
+            BlockPos support = new BlockPos(
+                    Math.round(from.getX() + dx * step / (float) steps),
+                    from.getY() - 1,
+                    Math.round(from.getZ() + dz * step / (float) steps));
+            if (level.getBlockState(support).getCollisionShape(level, support).isEmpty()) return true;
+        }
+        return false;
+    }
+
     private boolean hasJumpHeadroom(ServerLevel level, BlockPos position) {
-        return level.getBlockState(position.above()).getCollisionShape(level, position.above()).isEmpty()
-                && hasBodyClearance(level, position.above(), Pose.STANDING);
+        BlockPos head = position.above();
+        BlockState state = level.getBlockState(head);
+        if ((state.getBlock() instanceof DoorBlock || state.getBlock() instanceof TrapDoorBlock)
+                && state.hasProperty(DoorBlock.OPEN)) {
+            // Open doors and trapdoors keep a side-panel collision shape. The
+            // centred jump column can still be clear at this block.
+            if (!state.getValue(DoorBlock.OPEN)) {
+                if (!openDoorOrTrapdoor(level, head, state)) return false;
+                state = level.getBlockState(head);
+            }
+            if (!state.getValue(DoorBlock.OPEN)) return false;
+            double halfWidth = owner.player().getDimensions(Pose.STANDING).width() / 2.0D;
+            AABB jumpColumn = new AABB(0.5D - halfWidth, 0.0D, 0.5D - halfWidth,
+                    0.5D + halfWidth, 1.0D, 0.5D + halfWidth);
+            if (state.getCollisionShape(level, head).toAabbs().stream().anyMatch(jumpColumn::intersects)) {
+                return false;
+            }
+            return hasClearanceAbove(level, head, Pose.STANDING);
+        }
+        return state.getCollisionShape(level, head).isEmpty()
+                && hasBodyClearance(level, head, Pose.STANDING);
     }
 
     private boolean requiresSneak(BlockPos position) {
@@ -730,7 +856,8 @@ final class NavigatorImpl implements Navigator {
 
     private boolean hasBodyClearance(ServerLevel level, BlockPos position, Pose pose) {
         BlockState state = level.getBlockState(position);
-        if (!state.getCollisionShape(level, position).isEmpty()) return false;
+        var shape = state.getCollisionShape(level, position);
+        if (!shape.isEmpty() && !hasCenteredOpenPassage(state, shape, 1.0D)) return false;
         return hasClearanceAbove(level, position, pose);
     }
 
@@ -740,8 +867,20 @@ final class NavigatorImpl implements Navigator {
         double height = owner.player().getDimensions(pose).height();
         double margin = pose == Pose.CROUCHING ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
         return aboveShape.isEmpty()
+                || hasCenteredOpenPassage(above, aboveShape, height + margin - 1.0D)
                 || 1.0D + aboveShape.min(net.minecraft.core.Direction.Axis.Y)
                 >= height + margin;
+    }
+
+    private boolean hasCenteredOpenPassage(BlockState state,
+                                           net.minecraft.world.phys.shapes.VoxelShape shape, double height) {
+        if (!(state.getBlock() instanceof DoorBlock || state.getBlock() instanceof TrapDoorBlock)
+                || !state.hasProperty(DoorBlock.OPEN) || !state.getValue(DoorBlock.OPEN)) return false;
+        double halfWidth = owner.player().getDimensions(Pose.STANDING).width() / 2.0D;
+        AABB body = new AABB(0.5D - halfWidth, 0.0D, 0.5D - halfWidth,
+                0.5D + halfWidth, height, 0.5D + halfWidth);
+        for (AABB part : shape.toAabbs()) if (part.intersects(body)) return false;
+        return true;
     }
 
     private boolean hasDynamicObstacle(BlockPos position) {
@@ -854,12 +993,20 @@ final class NavigatorImpl implements Navigator {
         nextHazardRepathNanos = now + 250_000_000L;
         if (++repathAttempts >= 3) {
             owner.actions().stop();
-            task.stuck(resultNodesVisited());
+            finishStuck("changed_obstacle", pathIndex < path.size() ? path.get(pathIndex) : null);
             return true;
         }
         task.status = NavigationStatus.COMPUTING;
         requestPath();
         return true;
+    }
+
+    private void finishStuck(String reason, BlockPos next) {
+        ServerPlayer player = owner.player();
+        LOGGER.warn("Navigation stuck: bot={} reason={} pos={} next={} goal={} pathIndex={} pathSize={} pose={} velocity={}",
+                owner.name(), reason, player.position(), next, goal, pathIndex, path.size(),
+                player.getPose(), player.getDeltaMovement());
+        task.stuck(resultNodesVisited());
     }
 
     private void tickFinalApproach() {
@@ -881,7 +1028,7 @@ final class NavigatorImpl implements Navigator {
         if (ticksWithoutProgress > 40) {
             if (++repathAttempts >= 3) {
                 owner.actions().stop();
-                task.stuck(resultNodesVisited());
+                finishStuck("final_approach", targetBlock());
             } else {
                 task.status = NavigationStatus.COMPUTING;
                 requestPath();

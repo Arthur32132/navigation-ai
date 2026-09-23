@@ -52,6 +52,7 @@ import org.slf4j.LoggerFactory;
 public final class BotRuntime implements BotService, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger("navigation_ai/runtime");
     private static final int SNAPSHOT_BUDGET_PER_TICK = 4;
+    private static final int SNAPSHOT_CELLS_BUDGET_PER_TICK = 4_096;
     private static final int PATH_NODES_BUDGET_PER_TICK = 40_000;
     private final MinecraftServer server;
     private final Map<UUID, BotHandleImpl> bots = new ConcurrentHashMap<>();
@@ -63,6 +64,8 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private int restoreDelayTicks = 20;
     private int snapshotBudgetTick = Integer.MIN_VALUE;
     private int snapshotsThisTick;
+    private int snapshotCellsTick = Integer.MIN_VALUE;
+    private int snapshotCellsThisTick;
     private volatile int snapshotBudgetPerTick = SNAPSHOT_BUDGET_PER_TICK;
     private volatile int adaptivePathNodeBudget = PATH_NODES_BUDGET_PER_TICK;
     private volatile int chunkGenerationBudgetPerTick = 4;
@@ -107,6 +110,17 @@ public final class BotRuntime implements BotService, AutoCloseable {
         if (snapshotsThisTick >= snapshotBudgetPerTick) return false;
         snapshotsThisTick++;
         return true;
+    }
+
+    int acquireSnapshotCells(int requested) {
+        int tick = server.getTickCount();
+        if (tick != snapshotCellsTick) {
+            snapshotCellsTick = tick;
+            snapshotCellsThisTick = 0;
+        }
+        int granted = Math.min(requested, SNAPSHOT_CELLS_BUDGET_PER_TICK - snapshotCellsThisTick);
+        snapshotCellsThisTick += granted;
+        return granted;
     }
 
     boolean tryAcquireChunkGeneration() {

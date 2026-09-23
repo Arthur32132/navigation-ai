@@ -38,6 +38,7 @@ public final class RuntimeRegression {
     private NavigationTask navigation;
     private int scenario = -1, ticks, passed, failed;
     private boolean replacementSeen;
+    private int finalScenario;
     private static final String[] NAMES = {"mining_inventory_tool_restore", "mining_cancel_before_tick",
         "mining_no_tool_preserves_slot", "unbreakable_block", "gather_and_pickup", "full_inventory",
         "missing_resource", "gather_timeout_cancels_navigation", "gather_cancel",
@@ -49,7 +50,10 @@ public final class RuntimeRegression {
         "navigation_long_wall_frontier", "navigation_block_goal_solid", "navigation_controlled_drop",
         "navigation_fence_gate", "navigation_bridge_cancel_rollback", "navigation_multi_goal",
         "navigation_patrol", "navigation_look_at", "navigation_dimension_goal", "navigation_escort",
-        "navigation_waterlogged_geometry"};
+        "navigation_waterlogged_geometry", "navigation_jump_with_doors_at_edges",
+        "navigation_open_door", "navigation_open_trapdoor", "navigation_open_overhead_trapdoor",
+        "navigation_open_trapdoor_corner", "navigation_long_deep_water", "navigation_long_flat_route",
+        "navigation_occupied_destination"};
     private boolean dynamicObstaclePlaced;
 
     public static void register() {
@@ -59,12 +63,19 @@ public final class RuntimeRegression {
     }
 
     public static int start(CommandSourceStack source) {
+        return startCase(source, 0, NAMES.length - 1);
+    }
+
+    public static int startCase(CommandSourceStack source, int first, int last) {
         if (active != null) return 0;
+        if (first < 0 || last >= NAMES.length || first > last) return 0;
         // Regression scenarios own their disposable arena. Remove persisted
         // practice bots first so their idle entities cannot affect geometry
         // or the adaptive runtime profile.
         NavigationAiMod.runtime(source.getServer()).service().bots().forEach(BotHandle::remove);
         active = new RuntimeRegression(source);
+        active.scenario = first - 1;
+        active.finalScenario = last;
         active.next();
         return 1;
     }
@@ -90,7 +101,7 @@ public final class RuntimeRegression {
     }
     private void next() {
         cleanup();
-        if (++scenario == NAMES.length) {
+        if (++scenario > finalScenario) {
             report("REGRESSION " + (failed == 0 ? "PASS" : "FAIL") + " passed="+passed+" failed="+failed);
             active = null;
             return;
@@ -413,12 +424,113 @@ public final class RuntimeRegression {
                         new NavigationGoal.PositionGoal(new Vec3(1029.5,200.0,1024.5),0.75),
                         new NavigationPolicy(false,false,true,false,20_000,128,8,0));
             }
+            case 36 -> {
+                // A one-wide corridor has a closed door at both the takeoff
+                // and landing blocks of a three-block gap.
+                for (int x = -16; x <= 16; x++) {
+                    block(x, 0, -1, Blocks.STONE); block(x, 1, -1, Blocks.STONE);
+                    block(x, 0, 1, Blocks.STONE); block(x, 1, 1, Blocks.STONE);
+                }
+                for (int x = 2; x <= 4; x++) block(x, -1, 0, Blocks.AIR);
+                for (int x : new int[]{1, 5}) {
+                    level.setBlockAndUpdate(p(x, 0, 0), Blocks.OAK_DOOR.defaultBlockState()
+                        .setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER)
+                        .setValue(DoorBlock.FACING, Direction.EAST));
+                    level.setBlockAndUpdate(p(x, 1, 0), Blocks.OAK_DOOR.defaultBlockState()
+                        .setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER)
+                        .setValue(DoorBlock.FACING, Direction.EAST));
+                }
+                navigation = bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1030.5, 200.0, 1024.5), 0.75),
+                    new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
+            }
+            case 37, 38, 39 -> {
+                for (int x = -16; x <= 16; x++) {
+                    block(x, 0, -1, Blocks.STONE); block(x, 1, -1, Blocks.STONE);
+                    block(x, 0, 1, Blocks.STONE); block(x, 1, 1, Blocks.STONE);
+                }
+                if (scenario == 37) {
+                    level.setBlockAndUpdate(p(2, 0, 0), Blocks.OAK_DOOR.defaultBlockState()
+                        .setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER)
+                        .setValue(DoorBlock.FACING, Direction.EAST)
+                        .setValue(DoorBlock.OPEN, true));
+                    level.setBlockAndUpdate(p(2, 1, 0), Blocks.OAK_DOOR.defaultBlockState()
+                        .setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER)
+                        .setValue(DoorBlock.FACING, Direction.EAST)
+                        .setValue(DoorBlock.OPEN, true));
+                } else {
+                    int y = scenario == 38 ? 0 : 1;
+                    level.setBlockAndUpdate(p(2, y, 0), Blocks.OAK_TRAPDOOR.defaultBlockState()
+                        .setValue(TrapDoorBlock.FACING, Direction.NORTH)
+                        .setValue(TrapDoorBlock.OPEN, true));
+                }
+                navigation = bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1029.5, 200.0, 1024.5), 0.75),
+                    new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
+            }
+            case 40 -> {
+                // An open trapdoor has a vertical side panel. Its center is
+                // free, but the panel blocks the south exit. The route must
+                // use the short detour around it instead of walking into it.
+                for (int x = -1; x <= 4; x++) for (int z = -1; z <= 3; z++) {
+                    for (int y = 0; y <= 2; y++) block(x, y, z, Blocks.STONE);
+                }
+                for (int[] cell : new int[][]{{0,0}, {1,0}, {2,0}, {3,0}, {3,1}, {2,1}, {2,2}}) {
+                    for (int y = 0; y <= 2; y++) block(cell[0], y, cell[1], Blocks.AIR);
+                }
+                level.setBlockAndUpdate(p(2,0,0), Blocks.OAK_TRAPDOOR.defaultBlockState()
+                    .setValue(TrapDoorBlock.FACING, Direction.SOUTH)
+                    .setValue(TrapDoorBlock.OPEN, true));
+                navigation = bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1026.5, 200.0, 1026.5), 0.75),
+                    new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
+            }
+            case 41 -> {
+                // A long swim used to fail at the eight-cell water budget.
+                // During replanning the bot must keep afloat while the next
+                // snapshot is captured over multiple server ticks.
+                for (int x = -16; x <= 30; x++) {
+                    for (int y = 0; y <= 2; y++) {
+                        block(x, y, -1, Blocks.STONE);
+                        block(x, y, 1, Blocks.STONE);
+                    }
+                }
+                for (int x = 2; x <= 23; x++) for (int y = -3; y <= 0; y++) {
+                    block(x, y, 0, Blocks.WATER);
+                }
+                for (int x = 2; x <= 23; x++) block(x, 2, 0, Blocks.STONE);
+                navigation = bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1050.5, 200.0, 1024.5), 0.75),
+                    new NavigationPolicy(false, false, true, false, 40_000, 128, 32, 0));
+            }
+            case 42 -> {
+                for (int x = 17; x <= 34; x++) {
+                    block(x, -1, 0, Blocks.STONE);
+                    for (int y = 0; y <= 5; y++) block(x, y, 0, Blocks.AIR);
+                }
+                navigation = bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(new Vec3(1056.5, 200.0, 1024.5), 0.75),
+                    new NavigationPolicy(false, false, false, false, 40_000, 128, 32, 0));
+            }
+            case 43 -> {
+                for (int x = -16; x <= 16; x++) {
+                    block(x, 0, -1, Blocks.STONE); block(x, 1, -1, Blocks.STONE);
+                    block(x, 0, 1, Blocks.STONE); block(x, 1, 1, Blocks.STONE);
+                }
+                target = create("reg_target", 5, 0);
+                navigation = bot.navigator().goTo(
+                    new NavigationGoal.PositionGoal(target.player().position(), 1.5),
+                    new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
+            }
         }
     }
 
     private void tick() {
         try {
             ticks++;
+            if (scenario >= 41 && ticks % 40 == 0) report("REGRESSION DEBUG " + NAMES[scenario]
+                    + " tick=" + ticks + " status=" + navigation.status()
+                    + " pos=" + bot.player().position() + " swimming=" + bot.player().isSwimming());
             if(scenario>=9 && scenario<=11 && ticks%100==0) report("REGRESSION DEBUG "+NAMES[scenario]
                 +" actor="+bot.player().position()+" target="+target.player().position()
                 +" hp="+target.player().getHealth()+" arrows="+bot.player().getInventory().getItem(21).getCount()
@@ -484,14 +596,17 @@ public final class RuntimeRegression {
             case 22 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
                     && level.getBlockState(p(2,0,0)).getValue(DoorBlock.OPEN), navigation.completion().join().toString()); }
             case 23 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
-                    && bot.player().getX() >= 1038.75, navigation.completion().join().toString()); }
+                    && bot.player().getX() >= 1038.75, navigation.completion().join().toString()
+                        + " pos=" + bot.player().position() + " grounded=" + bot.player().onGround()); }
             case 24 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
                     && bot.player().getX() >= 1025.75, navigation.completion().join().toString()); }
             case 25 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
                     && bot.player().getX() >= 1063.5 && Math.abs(bot.player().getZ()-1024.5) <= 1.5,
                     navigation.completion().join().toString()); }
             case 26 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
-                    && bot.player().getX() >= 1025.0 && bot.player().getX() < 1027.5,
+                    && bot.player().position().distanceTo(Vec3.atCenterOf(p(3,0,0))) <= 1.0
+                    && !bot.player().blockPosition().equals(p(3,0,0))
+                    && level.getBlockState(p(3,0,0)).is(Blocks.STONE),
                     navigation.completion().join().toString()); }
             case 27 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
                     && bot.player().getX() >= 1025.0 && bot.player().getY() < 201.0,
@@ -532,8 +647,32 @@ public final class RuntimeRegression {
             case 35 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
                     && level.getBlockState(p(2,0,0)).getValue(SlabBlock.WATERLOGGED)
                     && bot.player().getX() >= 1028.75, navigation.completion().join().toString()); }
+            case 36 -> { if (navigation.completion().isDone()) finish(navigation.status() == NavigationStatus.SUCCESS
+                    && bot.player().getX() >= 1029.75
+                    && level.getBlockState(p(1,0,0)).getValue(DoorBlock.OPEN)
+                    && level.getBlockState(p(5,0,0)).getValue(DoorBlock.OPEN),
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()
+                        + " grounded=" + bot.player().onGround()); }
+            case 37, 38, 39 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS && bot.player().getX() >= 1028.75,
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()); }
+            case 40 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS && bot.player().getZ() >= 1025.75,
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()); }
+            case 41 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS && bot.player().getX() >= 1049.75,
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()); }
+            case 42 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS && bot.player().getX() >= 1055.75,
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()); }
+            case 43 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS
+                            && bot.player().distanceTo(target.player()) <= 1.5,
+                    navigation.completion().join().toString() + " actor=" + bot.player().position()
+                            + " target=" + target.player().position()); }
             }
-            if(active!=null && ticks>400) finish(false,"timed out after 400 ticks");
+            if(active!=null && ticks>(scenario == 41 ? 800 : 400)) finish(false,"timed out at " + bot.player().position()
+                    + " status=" + (navigation == null ? "none" : navigation.status()));
         } catch(Exception e) {
             LoggerFactory.getLogger("navigation_ai_regression").error("Regression exception",e);
             finish(false,e.toString());
