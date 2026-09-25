@@ -77,7 +77,9 @@ final class MinerImpl implements Miner {
         }
         boolean broken = player.gameMode.destroyBlock(position);
         restoreToolSlot(player);
-        if (broken && level.getBlockState(position).isAir()) task.complete();
+        // A waterlogged block leaves water behind when destroyed. The old
+        // block must be gone, but the position need not become air.
+        if (broken && level.getBlockState(position).getBlock() != state.getBlock()) task.complete();
         else task.fail("break_rejected");
     }
 

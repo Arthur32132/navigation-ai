@@ -62,12 +62,16 @@ final class NavigatorImpl implements Navigator {
     private Vec3 followPlanPosition;
     private int ticksWithoutProgress;
     private int repathAttempts;
+    private Vec3 stallAnchor;
+    private int ticksNearStallAnchor;
     private MiningTask navigationMining;
     private long nextHazardRepathNanos;
     private WorldSnapshot plannedSnapshot;
     private WorldSnapshot.Capture pendingCapture;
     private GridPos captureStart, captureGoal;
     private long captureGeneration, captureNanos;
+    private int captureRadius;
+    private int expandedSnapshotRadius;
     private boolean finalPlanningSegment;
     private boolean planningDeferred;
     private boolean waitingForFrontierChunks;
@@ -76,11 +80,13 @@ final class NavigatorImpl implements Navigator {
     private Future<?> searchFuture;
     private int budgetDeferrals;
     private final List<PlacedAction> placedActions = new ArrayList<>();
+    private boolean waitingForLanding;
 
     private static final int MAX_BUDGET_DEFERRALS = 3;
     private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
     private static final int FRONTIER_CHUNK_RETRY_DELAY_TICKS = 5;
     private static final int SNAPSHOT_CELLS_PER_BOT_TICK = 2_048;
+    private static final int MAX_TICKS_IN_ONE_AREA = 300;
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
 
@@ -93,7 +99,21 @@ final class NavigatorImpl implements Navigator {
     /** Starts a request at a particular flattened sequence element. */
     private NavigationTask startNavigation(NavigationGoal requestedGoal, NavigationPolicy selectedPolicy,
                                            int initialSequenceIndex) {
+        return startNavigation(requestedGoal, selectedPolicy, initialSequenceIndex, List.of());
+    }
+
+    private NavigationTask startNavigation(NavigationGoal requestedGoal, NavigationPolicy selectedPolicy,
+                                           int initialSequenceIndex, List<PlacedAction> restoredActions) {
+        NavigationTaskImpl previousTask = task;
         cancel();
+        // Completing the old cancellation can synchronously start a newer
+        // request. That newer request wins; report this call as cancelled
+        // without replacing its unfinished task or returning the wrong goal.
+        if (task != previousTask && task != null && !isTerminal(task.status())) {
+            NavigationTaskImpl superseded = new NavigationTaskImpl();
+            superseded.cancel();
+            return superseded;
+        }
         this.rootGoal = requestedGoal;
         this.sequence = flatten(requestedGoal);
         if (initialSequenceIndex < 0 || initialSequenceIndex >= sequence.size()) {
@@ -104,6 +124,7 @@ final class NavigatorImpl implements Navigator {
         this.goal = sequence.get(initialSequenceIndex);
         this.policy = selectedPolicy;
         this.task = new NavigationTaskImpl();
+        placedActions.addAll(restoredActions);
         this.budgetDeferrals = 0;
         requestPath();
         return task;
@@ -119,13 +140,19 @@ final class NavigatorImpl implements Navigator {
         // started another navigation request while the old task was cancelled.
         if (task != cancelledTask) return;
         owner.actions().stop();
-        if (navigationMining != null && navigationMining.status() == MiningStatus.RUNNING) navigationMining.cancel();
+        MiningTask mining = navigationMining;
         navigationMining = null;
+        if (mining != null && mining.status() == MiningStatus.RUNNING) mining.cancel();
+        if (task != cancelledTask) return;
         path = List.of(); pathIndex = 0; goal = null; rootGoal = null; sequence = List.of(); sequenceIndex = 0; sequenceLoop = false; followPlanPosition = null;
         repathAttempts = 0;
         lastTargetDistance = Double.POSITIVE_INFINITY;
+        stallAnchor = null;
+        ticksNearStallAnchor = 0;
         plannedSnapshot = null;
         pendingCapture = null;
+        captureRadius = 0;
+        expandedSnapshotRadius = 0;
         finalPlanningSegment = false;
         planningDeferred = false;
         waitingForFrontierChunks = false;
@@ -134,6 +161,7 @@ final class NavigatorImpl implements Navigator {
         budgetDeferrals = 0;
         cancelSearchFuture();
         nextHazardRepathNanos = 0L;
+        waitingForLanding = false;
     }
     /** Stops server-side inputs and workers while retaining resumable navigation state for shutdown persistence. */
     void shutdown() {
@@ -179,10 +207,20 @@ final class NavigatorImpl implements Navigator {
             return;
         }
         output.putBoolean("active", true);
-        output.putInt("version", 2);
+        output.putInt("version", 3);
         output.putInt("sequenceIndex", sequenceIndex);
         savePolicy(output.child("policy"));
         saveGoal(output.child("goal"), rootGoal == null ? goal : rootGoal);
+        ValueOutput.ValueOutputList placements = output.childrenList("placements");
+        for (PlacedAction action : placedActions) {
+            ValueOutput placement = placements.addChild();
+            placement.putString("dimension", action.dimension().identifier().toString());
+            placement.store("position", BlockPos.CODEC, action.position());
+            placement.store("previousState", BlockState.CODEC, action.previousState());
+            placement.store("placedState", BlockState.CODEC, action.placedState());
+            placement.putInt("slot", action.slot());
+            placement.store("returnedStack", ItemStack.CODEC, action.returnedStack());
+        }
     }
 
     /** Restores an in-flight request and starts a fresh plan against the current world. */
@@ -201,7 +239,26 @@ final class NavigatorImpl implements Navigator {
         int savedIndex = input.getIntOr("sequenceIndex", 0);
         List<NavigationGoal> restoredSequence = flatten(restored);
         if (savedIndex < 0 || savedIndex >= restoredSequence.size()) return false;
-        startNavigation(restored, restoredPolicy, savedIndex);
+        List<PlacedAction> restoredActions;
+        try {
+            restoredActions = input.childrenListOrEmpty("placements").stream().map(placement -> {
+                ResourceKey<Level> dimension = ResourceKey.create(Registries.DIMENSION,
+                        Identifier.parse(placement.getString("dimension").orElseThrow()));
+                BlockPos position = placement.read("position", BlockPos.CODEC).orElseThrow();
+                BlockState previous = placement.read("previousState", BlockState.CODEC).orElseThrow();
+                BlockState placed = placement.read("placedState", BlockState.CODEC).orElseThrow();
+                int slot = placement.getInt("slot").orElseThrow();
+                ItemStack returned = placement.read("returnedStack", ItemStack.CODEC).orElseThrow();
+                if (slot < 0 || slot >= owner.player().getInventory().getContainerSize()
+                        || returned.isEmpty() || returned.getCount() != 1) {
+                    throw new IllegalArgumentException("Invalid persisted placement");
+                }
+                return new PlacedAction(dimension, position.immutable(), previous, placed, slot, returned);
+            }).toList();
+        } catch (RuntimeException invalid) {
+            return false;
+        }
+        startNavigation(restored, restoredPolicy, savedIndex, restoredActions);
         return true;
     }
 
@@ -333,6 +390,20 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        if (waitingForLanding) {
+            if (!stableForArrival(owner.player())) return;
+            waitingForLanding = false;
+            if (reachedGoal()) finishSuccess();
+            else requestPath();
+            return;
+        }
+        // Snapshot capture can legitimately take many ticks for an expanded
+        // route. Count only ticks when the bot is actually following a path.
+        if (navigationMining != null) {
+            stallAnchor = null;
+            ticksNearStallAnchor = 0;
+        } else if (task.status() == NavigationStatus.RUNNING
+                && !(goal instanceof NavigationGoal.FollowGoal) && checkSpatialStall()) return;
         if (task.status() == NavigationStatus.COMPUTING) holdPositionWhilePlanning();
         if (pendingCapture != null) {
             advanceCapture();
@@ -466,11 +537,17 @@ final class NavigatorImpl implements Navigator {
         // Starting a long jump as soon as the takeoff cell is entered leaves
         // too little range for a three-block gap, particularly after a door
         // slows entry. Move toward its front edge while still on solid ground.
-        boolean jump = jumpGap ? owner.player().onGround() && (!unsupportedGap || takeoffProgress >= 0.25D)
+        // A jump edge remains active until its landing waypoint is reached.
+        // Once the player has landed in that cell, walk to its centre instead
+        // of launching the same jump again from a corner of a small platform.
+        boolean settlingJumpLanding = jumpGap && owner.player().onGround()
+                && currentBlock.equals(next);
+        boolean jump = jumpGap ? !settlingJumpLanding && owner.player().onGround()
+                && (!unsupportedGap || takeoffProgress >= 0.25D)
                 : climbing ? next.getY() > currentBlock.getY()
                 : next.getY() > currentBlock.getY() && owner.player().onGround();
         if (swimming && next.getY() > currentBlock.getY()) jump = true;
-        owner.actions().setMovement(0, 1, jump, !climbing && !sneak, sneak);
+        owner.actions().setMovement(0, 1, jump, !climbing && !sneak && !settlingJumpLanding, sneak);
         Vec3 current = owner.player().position();
         boolean progressed = progressedToward(target);
         if (progressed) {
@@ -558,19 +635,22 @@ final class NavigatorImpl implements Navigator {
         // world read around the bot, while GridPathfinder can return a useful
         // frontier path when the goal is beyond that snapshot.
         finalPlanningSegment = false;
-        // Nearby goals only need a local margin. Distant goals still use the
-        // policy's full radius so detours remain available to the planner.
+        // Start with a small local capture. If a visible goal is unreachable
+        // inside it, retry with more of the policy's search area so an access
+        // route beginning behind the bot can be found.
         int distance = Math.max(Math.abs(desired.x() - startPos.x()), Math.abs(desired.z() - startPos.z()));
         // Long requests are handled by successive local frontier plans. Keep
         // each server-thread capture small enough that a bot does not stand
         // idle for several seconds before every segment.
-        int radius = Math.min(policy.snapshotRadius(), Math.max(8, Math.min(16, distance + 4)));
+        int radius = Math.min(policy.snapshotRadius(),
+                Math.max(expandedSnapshotRadius, Math.max(8, Math.min(16, distance + 4))));
+        captureRadius = radius;
         if (policy.allowChunkGeneration()) {
             runtime.updateNavigationTickets(owner.id(), level, startPos, radius);
         } else {
             runtime.releaseNavigationTickets(owner.id());
         }
-        pendingCapture = WorldSnapshot.beginCapture(level, player, startPos, radius,
+        pendingCapture = WorldSnapshot.beginCapture(level, player, startPos, desired, radius,
                 policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing(),
                 runtime::tryAcquireChunkGeneration);
         captureStart = startPos;
@@ -1063,6 +1143,20 @@ final class NavigatorImpl implements Navigator {
         return progressed;
     }
 
+    private boolean checkSpatialStall() {
+        Vec3 position = owner.player().position();
+        if (stallAnchor == null || Math.hypot(position.x - stallAnchor.x, position.z - stallAnchor.z) >= 1.5D
+                || Math.abs(position.y - stallAnchor.y) >= 2.0D) {
+            stallAnchor = position;
+            ticksNearStallAnchor = 0;
+            return false;
+        }
+        if (++ticksNearStallAnchor <= MAX_TICKS_IN_ONE_AREA) return false;
+        owner.actions().stop();
+        finishStuck("oscillating_in_place", pathIndex < path.size() ? path.get(pathIndex) : null);
+        return true;
+    }
+
     private boolean placeSupport(ServerLevel level, BlockPos position) {
         ServerPlayer player = owner.player();
         if (!player.mayInteract(level, position)) return false;
@@ -1151,6 +1245,12 @@ final class NavigatorImpl implements Navigator {
                 deferForFrontierChunks(result.nodesVisited());
                 return;
             }
+            if (result.nodesVisited() > 0 && captureRadius < policy.snapshotRadius()) {
+                expandedSnapshotRadius = Math.min(policy.snapshotRadius(),
+                        Math.max(captureRadius + 8, captureRadius * 2));
+                requestPath();
+                return;
+            }
             task.fail("unreachable", result.nodesVisited());
             return;
         }
@@ -1184,6 +1284,16 @@ final class NavigatorImpl implements Navigator {
     private void finishSuccess() {
         if (goal instanceof NavigationGoal.LookAtGoal) lookAt(goalPoint());
         owner.actions().stop();
+        // A position tolerance can be met in mid-jump. Completing then lets
+        // the next request plan from an airborne cell while sprint momentum
+        // carries the bot off a narrow landing. Wait for a stable arrival.
+        ServerPlayer player = owner.player();
+        if (!(goal instanceof NavigationGoal.LookAtGoal) && !stableForArrival(player)) {
+            Vec3 motion = player.getDeltaMovement();
+            player.setDeltaMovement(0.0D, motion.y, 0.0D);
+            waitingForLanding = true;
+            return;
+        }
         if (advanceSequence()) return;
         runtime.releaseNavigationTickets(owner.id());
         requestGeneration++;
@@ -1197,6 +1307,11 @@ final class NavigatorImpl implements Navigator {
         path = List.of();
         placedActions.clear();
         task.complete(NavigationResult.success(nodes, duration));
+    }
+
+    private boolean stableForArrival(ServerPlayer player) {
+        return player.onGround() || player.isInWater()
+                || isClimbable((ServerLevel) player.level(), player.blockPosition());
     }
 
     private void lookAt(Vec3 target) {
@@ -1221,10 +1336,13 @@ final class NavigatorImpl implements Navigator {
         path = List.of();
         pathIndex = 0;
         plannedSnapshot = null;
+        expandedSnapshotRadius = 0;
         finalPlanningSegment = false;
         lastTargetDistance = Double.POSITIVE_INFINITY;
         ticksWithoutProgress = 0;
         repathAttempts = 0;
+        stallAnchor = null;
+        ticksNearStallAnchor = 0;
         followPlanPosition = null;
         task.status = NavigationStatus.COMPUTING;
         requestPath();
@@ -1256,6 +1374,12 @@ final class NavigatorImpl implements Navigator {
         placedActions.clear();
     }
 
+    private void cancelNavigationMining() {
+        MiningTask mining = navigationMining;
+        navigationMining = null;
+        if (mining != null && mining.status() == MiningStatus.RUNNING) mining.cancel();
+    }
+
     private record PlacedAction(ResourceKey<Level> dimension, BlockPos position,
                                 BlockState previousState, BlockState placedState,
                                 int slot, ItemStack returnedStack) { }
@@ -1275,20 +1399,16 @@ final class NavigatorImpl implements Navigator {
                     owner.actions().stop();
                     MiningTask mining = NavigatorImpl.this.navigationMining;
                     NavigatorImpl.this.navigationMining = null;
-                    if (mining != null && mining.status() == MiningStatus.RUNNING) {
-                        mining.cancel();
-                    }
-                    if (NavigatorImpl.this.task == this) {
-                        NavigatorImpl.this.requestGeneration++;
-                        NavigatorImpl.this.planningDeferred = false;
-                        NavigatorImpl.this.cancelSearchFuture();
-                        NavigatorImpl.this.path = List.of();
-                        NavigatorImpl.this.pathIndex = 0;
-                        NavigatorImpl.this.goal = null;
-                        NavigatorImpl.this.followPlanPosition = null;
-                        NavigatorImpl.this.rollbackPlacedActions();
-                        NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
-                    }
+                    NavigatorImpl.this.requestGeneration++;
+                    NavigatorImpl.this.planningDeferred = false;
+                    NavigatorImpl.this.cancelSearchFuture();
+                    NavigatorImpl.this.path = List.of();
+                    NavigatorImpl.this.pathIndex = 0;
+                    NavigatorImpl.this.goal = null;
+                    NavigatorImpl.this.followPlanPosition = null;
+                    NavigatorImpl.this.rollbackPlacedActions();
+                    NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
+                    if (mining != null && mining.status() == MiningStatus.RUNNING) mining.cancel();
                 }
                 completion.complete(new NavigationResult(NavigationStatus.CANCELLED, "cancelled", 0, 0));
             }
@@ -1303,6 +1423,7 @@ final class NavigatorImpl implements Navigator {
             status = NavigationStatus.FAILED;
             NavigatorImpl.this.rollbackPlacedActions();
             NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
+            cancelNavigationMining();
             completion.complete(NavigationResult.failure(reason, nodes, System.nanoTime() - pathStartedNanos));
         }
         void stuck(int nodes) {
@@ -1315,6 +1436,7 @@ final class NavigatorImpl implements Navigator {
             status = NavigationStatus.STUCK;
             NavigatorImpl.this.rollbackPlacedActions();
             NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
+            cancelNavigationMining();
             completion.complete(NavigationResult.stuck(nodes, System.nanoTime() - pathStartedNanos));
         }
         void complete(NavigationResult result) { status = result.status(); completion.complete(result); }

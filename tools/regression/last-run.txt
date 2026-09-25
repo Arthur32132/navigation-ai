@@ -48,3 +48,6 @@
 [2026-09-22 10:35] Chunk-ticket/generation-enabled verification: loadgen count=10 PASS completed=10/10 ticks=46 maxTickMs=18.7235 avgTickMs=0.2062301286 searches=10 nodes=130 queued=0.
 [2026-09-23 20:50] Navigation fixes: REGRESSION PASS passed=44 failed=0 (including long deep water, 32-block route, open trapdoor turn, and occupied destination). Library JUnit: 26/26.
 [2026-09-23 20:50] Load verification after navigation fixes: count=10 PASS completed=10/10 ticks=98 maxTickMs=27.4084 avgTickMs=0.3663420561 searches=10 nodes=130 queued=0.
+[2026-09-26] Fix verification on a disposable Fabric 26.2 server: SELFTEST PASS (22 checks); full regression PASS passed=51 failed=0; JUnit 26/26; library and consumer builds PASS.
+[2026-09-26] The first full regression run was 50/51 because gather_and_pickup reported resources_exhausted after breaking one dirt block. The isolated retry passed, then the second full run passed 51/51. New mining_waterlogged_block, navigation_reentrant_cancel_callback and navigation_airborne_arrival scenarios passed in both full runs.
+[2026-09-26] After the final cancellation-order change, navigation_bridge_cancel_rollback passed individually with a real NBT save/restore round trip before the second cancellation (1/1).

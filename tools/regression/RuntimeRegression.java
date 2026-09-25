@@ -53,8 +53,12 @@ public final class RuntimeRegression {
         "navigation_waterlogged_geometry", "navigation_jump_with_doors_at_edges",
         "navigation_open_door", "navigation_open_trapdoor", "navigation_open_overhead_trapdoor",
         "navigation_open_trapdoor_corner", "navigation_long_deep_water", "navigation_long_flat_route",
-        "navigation_occupied_destination"};
+        "navigation_occupied_destination", "navigation_grounded_edge_start",
+        "navigation_elevated_goal_distant_access", "navigation_consecutive_gap_jumps_door",
+        "navigation_come_from_below_elevated_finish", "mining_waterlogged_block",
+        "navigation_reentrant_cancel_callback", "navigation_airborne_arrival"};
     private boolean dynamicObstaclePlaced;
+    private boolean approachedFinishBeforeEntrance;
 
     public static void register() {
         ServerTickEvents.END_SERVER_TICK.register(server -> {
@@ -109,6 +113,7 @@ public final class RuntimeRegression {
         ticks = 0;
         replacementSeen = false;
         dynamicObstaclePlaced = false;
+        approachedFinishBeforeEntrance = false;
         mining = null;
         gathering = null;
         navigation = null;
@@ -125,7 +130,7 @@ public final class RuntimeRegression {
                 for (int y=0; y<=5; y++) block(x,y,z,Blocks.AIR);
             }
         }
-        bot = create("reg_actor",0,scenario == 27 ? 3 : 0);
+        bot = create("reg_actor",0,scenario == 27 || scenario == 50 ? 3 : 0);
         bot.player().getInventory().setSelectedSlot(4);
         report("REGRESSION START " + NAMES[scenario]);
         switch (scenario) {
@@ -138,6 +143,25 @@ public final class RuntimeRegression {
                 bot.player().getInventory().setItem(4,new ItemStack(Items.APPLE,3));
                 block(1,0,0,Blocks.STONE);
                 mining=bot.miner().breakBlock(p(1,0,0));
+            }
+            case 48 -> {
+                bot.player().getInventory().setItem(20, new ItemStack(Items.IRON_PICKAXE));
+                level.setBlockAndUpdate(p(1,0,0), Blocks.STONE_BRICK_STAIRS.defaultBlockState()
+                        .setValue(StairBlock.WATERLOGGED, true));
+                mining = bot.miner().breakBlock(p(1,0,0));
+            }
+            case 49 -> {
+                NavigationPolicy policy = new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0);
+                NavigationTask old = bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(new Vec3(1027.5, 200.0, 1024.5), 0.75), policy);
+                old.completion().thenRun(() -> navigation = bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(new Vec3(1029.5, 200.0, 1024.5), 0.75), policy));
+                NavigationTask superseded = bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(new Vec3(1031.5, 200.0, 1024.5), 0.75), policy);
+                replacementSeen = old.status() == NavigationStatus.CANCELLED
+                        && superseded.status() == NavigationStatus.CANCELLED
+                        && superseded.completion().isDone()
+                        && navigation != null && !navigation.completion().isDone();
             }
             case 1 -> { block(1,0,0,Blocks.DIRT); mining=bot.miner().breakBlock(p(1,0,0)); mining.cancel(); }
             case 2 -> { block(1,0,0,Blocks.DIAMOND_ORE); mining=bot.miner().breakBlock(p(1,0,0)); }
@@ -219,10 +243,11 @@ public final class RuntimeRegression {
                     new NavigationPolicy(false,false,false,false,20_000,128,8,0));
             }
             case 17 -> {
-                // A ladder is the only route to a higher platform.
+                // Approach the ladder from the front, then climb it. Starting
+                // inside the ladder misses failures at its lower entrance.
+                bot.player().setPos(1022.5, 200.0, 1028.5);
                 for (int y=0; y<=4; y++) {
                     block(0,y,-1,Blocks.STONE);
-                    block(0,y,1,Blocks.STONE);
                 }
                 for (int y=0; y<=3; y++) {
                     level.setBlockAndUpdate(p(0,y,0), Blocks.LADDER.defaultBlockState()
@@ -522,6 +547,74 @@ public final class RuntimeRegression {
                     new NavigationGoal.PositionGoal(target.player().position(), 1.5),
                     new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
             }
+            case 44 -> {
+                // The player's collision box is supported by x=1 even though
+                // its centre is in the unsupported x=0 cell.
+                block(0,-1,0,Blocks.AIR);
+                bot.player().setPos(1024.78, 200.0, 1024.5);
+            }
+            case 45 -> {
+                // The goal is directly above nearby ground, but the only
+                // entrance to its raised walkway is outside a 16-cell scan.
+                for (int x=-22; x<=8; x++) {
+                    block(x,-1,0,Blocks.STONE);
+                    if (x < -16) for (int y=0; y<=5; y++) block(x,y,0,Blocks.AIR);
+                }
+                for (int y=0; y<=4; y++) block(-20,y,-1,Blocks.STONE);
+                for (int y=0; y<=3; y++) {
+                    level.setBlockAndUpdate(p(-20,y,0), Blocks.LADDER.defaultBlockState()
+                            .setValue(LadderBlock.FACING, Direction.SOUTH));
+                }
+                for (int x=-19; x<=8; x++) block(x,3,0,Blocks.STONE);
+                NavigationPolicy safe = NavigationPolicy.safeDefaults();
+                navigation = bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(new Vec3(1032.5,204.0,1024.5),0.75),
+                        new NavigationPolicy(safe.allowBreaking(), safe.allowPlacing(), safe.allowWater(),
+                                true, safe.maxSearchNodes(), safe.maxPathLength(), safe.snapshotRadius(),
+                                safe.dangerCost(), safe.maxFallDistance()));
+            }
+            case 46 -> {
+                // Two two-block gaps with a single door block between them.
+                // The bot must settle on that block before taking off again.
+                bot.player().setPos(1024.78, 200.0, 1024.78);
+                for (int x=0; x<=6; x++) for (int z=-4; z<=4; z++) {
+                    for (int y=-3; y<=-1; y++) block(x,y,z,Blocks.AIR);
+                }
+                block(0,-1,0,Blocks.STONE);
+                block(3,-1,0,Blocks.STONE);
+                block(3,-1,3,Blocks.STONE);
+                level.setBlockAndUpdate(p(3,0,0), Blocks.OAK_DOOR.defaultBlockState()
+                        .setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER)
+                        .setValue(DoorBlock.FACING, Direction.EAST));
+                level.setBlockAndUpdate(p(3,1,0), Blocks.OAK_DOOR.defaultBlockState()
+                        .setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER)
+                        .setValue(DoorBlock.FACING, Direction.EAST));
+                navigation = bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(new Vec3(1027.5,200.0,1027.5),0.2),
+                        new NavigationPolicy(false,false,false,false,20_000,128,8,0,0));
+            }
+            case 47 -> {
+                // The caller stands on a raised finish. The bot starts below
+                // and must head away from the caller to find the ladder.
+                bot.player().setPos(1029.5, 200.0, 1024.5);
+                for (int x=-22; x<=8; x++) {
+                    block(x,-1,0,Blocks.STONE);
+                    for (int y=0; y<=20; y++) block(x,y,0,Blocks.AIR);
+                }
+                for (int y=0; y<=20; y++) block(-20,y,-1,Blocks.STONE);
+                for (int y=0; y<=19; y++) {
+                    level.setBlockAndUpdate(p(-20,y,0), Blocks.LADDER.defaultBlockState()
+                            .setValue(LadderBlock.FACING, Direction.SOUTH));
+                }
+                for (int x=-19; x<=8; x++) block(x,19,0,Blocks.STONE);
+                target = create("reg_target", 8, 20);
+                NavigationPolicy safe = NavigationPolicy.safeDefaults();
+                navigation = bot.navigator().goTo(
+                        new NavigationGoal.PositionGoal(target.player().position(), 1.5),
+                        new NavigationPolicy(safe.allowBreaking(), safe.allowPlacing(), safe.allowWater(),
+                                true, safe.maxSearchNodes(), safe.maxPathLength(), safe.snapshotRadius(),
+                                safe.dangerCost(), safe.maxFallDistance()));
+            }
         }
     }
 
@@ -529,18 +622,37 @@ public final class RuntimeRegression {
         try {
             ticks++;
             if (scenario >= 41 && ticks % 40 == 0) report("REGRESSION DEBUG " + NAMES[scenario]
-                    + " tick=" + ticks + " status=" + navigation.status()
+                    + " tick=" + ticks + " status=" + (navigation == null ? "none" : navigation.status())
                     + " pos=" + bot.player().position() + " swimming=" + bot.player().isSwimming());
             if(scenario>=9 && scenario<=11 && ticks%100==0) report("REGRESSION DEBUG "+NAMES[scenario]
                 +" actor="+bot.player().position()+" target="+target.player().position()
                 +" hp="+target.player().getHealth()+" arrows="+bot.player().getInventory().getItem(21).getCount()
                 +" combat="+bot.combat().status()+" using="+bot.player().isUsingItem());
             switch(scenario) {
-                case 0 -> { if(mining.completion().isDone()) finish(mining.status()==MiningStatus.SUCCESS
+            case 0 -> { if(mining.completion().isDone()) finish(mining.status()==MiningStatus.SUCCESS
                     && level.getBlockState(p(1,0,0)).isAir() && bot.player().getInventory().getSelectedSlot()==4
                     && bot.player().getInventory().getItem(4).is(Items.APPLE)
                     && bot.player().getInventory().getItem(20).is(Items.WOODEN_PICKAXE)
                     && bot.player().getInventory().getItem(21).is(Items.IRON_PICKAXE), mining.completion().join().toString()); }
+                case 48 -> { if (mining.completion().isDone()) finish(
+                        mining.status() == MiningStatus.SUCCESS && mining.completion().join().blockBroken()
+                                && level.getBlockState(p(1,0,0)).is(Blocks.WATER),
+                        mining.completion().join().toString()); }
+                case 49 -> { if (navigation != null && navigation.completion().isDone()) finish(
+                        replacementSeen && navigation.status() == NavigationStatus.SUCCESS
+                                && bot.player().getX() >= 1028.75,
+                        navigation.completion().join().toString()); }
+                case 50 -> {
+                    if (navigation == null && !bot.player().onGround()
+                            && bot.player().getY() > 200.2 && bot.player().getY() < 201.0) {
+                        navigation = bot.navigator().goTo(
+                                new NavigationGoal.PositionGoal(new Vec3(1024.5, 200.0, 1024.5), 1.2),
+                                new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
+                    } else if (navigation != null && navigation.completion().isDone()) {
+                        finish(navigation.status() == NavigationStatus.SUCCESS && bot.player().onGround(),
+                                navigation.completion().join().toString());
+                    }
+                }
                 case 1 -> finish(mining.status()==MiningStatus.CANCELLED && bot.player().getInventory().getSelectedSlot()==4
                     && level.getBlockState(p(1,0,0)).is(Blocks.DIRT), "cancel preserves block and selected slot");
                 case 2 -> { if(mining.completion().isDone()) finish(mining.status()==MiningStatus.FAILED
@@ -619,11 +731,31 @@ public final class RuntimeRegression {
                         +" x="+bot.player().getX()); }
             case 29 -> {
                 if (level.getBlockState(p(2,-1,0)).is(Blocks.COBBLESTONE)) {
+                    var saved = net.minecraft.world.level.storage.TagValueOutput.createWithContext(
+                            net.minecraft.util.ProblemReporter.DISCARDING, source.getServer().registryAccess());
+                    var save = bot.navigator().getClass().getDeclaredMethod("saveState",
+                            net.minecraft.world.level.storage.ValueOutput.class);
+                    save.setAccessible(true);
+                    save.invoke(bot.navigator(), saved);
                     navigation.cancel();
-                    finish(navigation.completion().join().status()==NavigationStatus.CANCELLED
+                    boolean firstRollback = navigation.completion().join().status()==NavigationStatus.CANCELLED
                             && level.getBlockState(p(2,-1,0)).isAir()
+                            && bot.player().getInventory().getItem(10).getCount() == 8;
+                    // Recreate the saved world and inventory, then restore the
+                    // navigation NBT as a server restart would do.
+                    block(2,-1,0,Blocks.COBBLESTONE);
+                    bot.player().getInventory().getItem(10).shrink(1);
+                    var restore = bot.navigator().getClass().getDeclaredMethod("restoreState",
+                            net.minecraft.world.level.storage.ValueInput.class);
+                    restore.setAccessible(true);
+                    var input = net.minecraft.world.level.storage.TagValueInput.create(
+                            net.minecraft.util.ProblemReporter.DISCARDING,
+                            source.getServer().registryAccess(), saved.buildResult());
+                    boolean restored = (boolean) restore.invoke(bot.navigator(), input);
+                    bot.navigator().cancel();
+                    finish(firstRollback && restored && level.getBlockState(p(2,-1,0)).isAir()
                             && bot.player().getInventory().getItem(10).getCount() == 8,
-                            "cancel compensated partial bridge");
+                            "cancel compensated partial bridge after NBT restore");
                 }
             }
             case 30,31 -> { if(navigation.completion().isDone()) finish(navigation.status()==NavigationStatus.SUCCESS
@@ -670,8 +802,36 @@ public final class RuntimeRegression {
                             && bot.player().distanceTo(target.player()) <= 1.5,
                     navigation.completion().join().toString() + " actor=" + bot.player().position()
                             + " target=" + target.player().position()); }
+            case 44 -> {
+                if (navigation == null && ticks >= 5 && bot.player().onGround()) {
+                    navigation = bot.navigator().goTo(
+                            new NavigationGoal.PositionGoal(new Vec3(1028.5, 200.0, 1024.5), 0.75),
+                            new NavigationPolicy(false, false, false, false, 20_000, 128, 8, 0));
+                } else if (navigation != null && navigation.completion().isDone()) {
+                    finish(navigation.status() == NavigationStatus.SUCCESS,
+                            navigation.completion().join().toString() + " pos=" + bot.player().position());
+                }
             }
-            if(active!=null && ticks>(scenario == 41 ? 800 : 400)) finish(false,"timed out at " + bot.player().position()
+            case 45 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS && bot.player().getY() >= 204.0,
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()); }
+            case 46 -> { if (navigation.completion().isDone()) finish(
+                    navigation.status() == NavigationStatus.SUCCESS && bot.player().getZ() >= 1026.75
+                            && level.getBlockState(p(3,0,0)).getValue(DoorBlock.OPEN),
+                    navigation.completion().join().toString() + " pos=" + bot.player().position()); }
+            case 47 -> {
+                if (bot.player().getX() > 1031.0 && bot.player().getY() < 202.0) {
+                    approachedFinishBeforeEntrance = true;
+                }
+                if (navigation.completion().isDone()) finish(
+                        navigation.status() == NavigationStatus.SUCCESS
+                                && bot.player().getY() >= 220.0
+                                && !approachedFinishBeforeEntrance,
+                        navigation.completion().join().toString() + " pos=" + bot.player().position()
+                                + " headedUnderFinish=" + approachedFinishBeforeEntrance);
+            }
+            }
+            if(active!=null && ticks>(scenario == 41 ? 800 : scenario == 47 ? 700 : 400)) finish(false,"timed out at " + bot.player().position()
                     + " status=" + (navigation == null ? "none" : navigation.status()));
         } catch(Exception e) {
             LoggerFactory.getLogger("navigation_ai_regression").error("Regression exception",e);

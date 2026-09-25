@@ -31,11 +31,13 @@ final class WorldSnapshot implements GridWorld {
     private static final double STANDING_CLEARANCE_MARGIN = 0.10D;
     private static final double CROUCHING_CLEARANCE_MARGIN = 0.02D;
     private static final int VERTICAL_SNAPSHOT_RADIUS = 16;
+    private static final int MAX_VERTICAL_GOAL_RADIUS = 32;
     private final Set<GridPos> passable;
     private final Set<GridPos> dangerous;
     private final Set<GridPos> jumpable;
     private final Set<GridPos> jumpOver;
     private final Set<GridPos> crouchOnly;
+    private final Set<GridPos> climbableCells;
     private final Set<GridPos> waterCells;
     private final Set<GridPos> freeBody;
     private final Map<GridPos, Double> actionCosts;
@@ -44,7 +46,7 @@ final class WorldSnapshot implements GridWorld {
 
     private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, Set<GridPos> jumpable,
                           Set<GridPos> jumpOver,
-                          Set<GridPos> crouchOnly, Set<GridPos> waterCells,
+                          Set<GridPos> crouchOnly, Set<GridPos> climbableCells, Set<GridPos> waterCells,
                           Set<GridPos> freeBody,
                           Map<GridPos, Double> actionCosts,
                           int minX, int maxX, int minY, int maxY, int minZ, int maxZ,
@@ -56,6 +58,7 @@ final class WorldSnapshot implements GridWorld {
         this.jumpable = jumpable;
         this.jumpOver = jumpOver;
         this.crouchOnly = crouchOnly;
+        this.climbableCells = climbableCells;
         this.waterCells = waterCells;
         this.freeBody = freeBody;
         this.actionCosts = actionCosts;
@@ -75,8 +78,15 @@ final class WorldSnapshot implements GridWorld {
     static Capture beginCapture(ServerLevel level, ServerPlayer observer, GridPos start, int radius,
                                 boolean allowWater, boolean allowChunkGeneration, boolean allowBreaking,
                                 boolean allowPlacing, BooleanSupplier generationBudget) {
-        return new Capture(level, observer, start, radius, allowWater,
+        return beginCapture(level, observer, start, null, radius, allowWater,
                 allowChunkGeneration, allowBreaking, allowPlacing, generationBudget);
+    }
+
+    static Capture beginCapture(ServerLevel level, ServerPlayer observer, GridPos start, GridPos destination,
+                                int radius, boolean allowWater, boolean allowChunkGeneration,
+                                boolean allowBreaking, boolean allowPlacing, BooleanSupplier generationBudget) {
+        return new Capture(level, observer, start, radius, allowWater,
+                allowChunkGeneration, allowBreaking, allowPlacing, generationBudget, destination);
     }
 
     /** Scans a bounded number of cells per server tick before publishing an immutable snapshot. */
@@ -84,6 +94,7 @@ final class WorldSnapshot implements GridWorld {
         private final ServerLevel level;
         private final ServerPlayer observer;
         private final GridPos start;
+        private final GridPos destination;
         private final boolean allowWater, allowChunkGeneration, allowBreaking, allowPlacing;
         private final BooleanSupplier generationBudget;
         private final int minX, maxX, minY, maxY, minZ, maxZ;
@@ -92,6 +103,7 @@ final class WorldSnapshot implements GridWorld {
         private final Set<GridPos> jumpable = new HashSet<>();
         private final Set<GridPos> jumpOver = new HashSet<>();
         private final Set<GridPos> crouchOnly = new HashSet<>();
+        private final Set<GridPos> climbableCells = new HashSet<>();
         private final Set<GridPos> waterCells = new HashSet<>();
         private final Set<GridPos> freeBody = new HashSet<>();
         private final Map<GridPos, Double> actionCosts = new HashMap<>();
@@ -103,10 +115,11 @@ final class WorldSnapshot implements GridWorld {
 
         private Capture(ServerLevel level, ServerPlayer observer, GridPos start, int radius, boolean allowWater,
                         boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
-                        BooleanSupplier generationBudget) {
+                        BooleanSupplier generationBudget, GridPos destination) {
             this.level = level;
             this.observer = observer;
             this.start = start;
+            this.destination = destination;
             this.allowWater = allowWater;
             this.allowChunkGeneration = allowChunkGeneration;
             this.allowBreaking = allowBreaking;
@@ -116,14 +129,23 @@ final class WorldSnapshot implements GridWorld {
             // intentionally outside this local snapshot; the pathfinder handles it
             // as a frontier target instead of making the server scan the whole
             // rectangle.
-            int effectiveRadius = allowChunkGeneration ? Math.min(radius, 16) : radius;
+            int effectiveRadius = radius;
             minX = start.x() - effectiveRadius; maxX = start.x() + effectiveRadius;
             minZ = start.z() - effectiveRadius; maxZ = start.z() + effectiveRadius;
-            // A distant vertical goal is handled by frontier segments, just like a
-            // distant horizontal goal. Keep each server-thread capture local.
-            minY = Math.max(level.getMinY(), start.y() - VERTICAL_SNAPSHOT_RADIUS);
+            // Include a nearby elevated or lowered destination in the scan.
+            // Otherwise an endpoint twenty blocks above the bot is invisible
+            // even while it is directly overhead, so a partial route heads
+            // to the ground below it instead of finding the access route.
+            int goalRadius = destination == null ? VERTICAL_SNAPSHOT_RADIUS
+                    : (int) Math.min(MAX_VERTICAL_GOAL_RADIUS,
+                            Math.abs((long) destination.y() - start.y()) + 4L);
+            int belowRadius = destination != null && destination.y() < start.y()
+                    ? Math.max(VERTICAL_SNAPSHOT_RADIUS, goalRadius) : VERTICAL_SNAPSHOT_RADIUS;
+            int aboveRadius = destination != null && destination.y() > start.y()
+                    ? Math.max(VERTICAL_SNAPSHOT_RADIUS, goalRadius) : VERTICAL_SNAPSHOT_RADIUS;
+            minY = Math.max(level.getMinY(), start.y() - belowRadius);
             maxY = Math.min(level.getMinY() + level.getHeight() - 2,
-                    start.y() + VERTICAL_SNAPSHOT_RADIUS);
+                    start.y() + aboveRadius);
             standingHeight = observer.getDimensions(Pose.STANDING).height();
             crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
             bodyWidth = observer.getDimensions(Pose.STANDING).width();
@@ -177,6 +199,7 @@ final class WorldSnapshot implements GridWorld {
                         && (standingClearance || crouchingClearance);
                 boolean climbable = state.is(BlockTags.CLIMBABLE)
                         && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
+                if (climbable) climbableCells.add(new GridPos(x, y, z));
                 boolean openable = (isClosedHandOpenableDoor(state) || isClosedHandOpenableTrapdoor(state)
                         || isClosedFenceGate(state))
                         && observer.mayInteract(level, pos);
@@ -207,7 +230,14 @@ final class WorldSnapshot implements GridWorld {
                 boolean passableCell = fluidAllowed && (((standingBody || crouchingBody) && floor)
                         || lowSurface || climbable || openable || openGate
                         || breakableBody || breakableAbove || supportedPlacement);
-                if (passableCell || (allowWater && waterCell && (standingClearance || crouchingClearance))) {
+                // A player can stand on the edge of an adjacent block while
+                // its position falls inside an unsupported grid cell. The
+                // actual grounded player is a valid search start, even when
+                // that cell would not be a safe destination for a path.
+                boolean groundedStart = gridPos.equals(start) && observer.onGround()
+                        && fluidAllowed && (standingBody || crouchingBody);
+                if (passableCell || groundedStart
+                        || (allowWater && waterCell && (standingClearance || crouchingClearance))) {
                     passable.add(gridPos);
                 }
                 if (breakableBody) {
@@ -254,14 +284,20 @@ final class WorldSnapshot implements GridWorld {
                 if (entity == observer || !entity.isAlive() || entity.isRemoved() || entity.isSpectator()) continue;
                 BlockPos entityPos = entity.blockPosition();
                 GridPos occupied = new GridPos(entityPos.getX(), entityPos.getY(), entityPos.getZ());
-                if (!occupied.equals(start)) passable.remove(occupied);
+                // The requested position can be occupied by the player who
+                // issued a "come" command. Keep that geometrically walkable
+                // cell as the planning endpoint. Live collision checks still
+                // prevent the bot from walking into the entity, and arrival
+                // tolerance normally completes the task from a neighbour.
+                if (!occupied.equals(start) && !occupied.equals(destination)) passable.remove(occupied);
                 for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
                     GridPos hazard = new GridPos(entityPos.getX() + dx, entityPos.getY(), entityPos.getZ() + dz);
                     if (hazard.x() >= minX && hazard.x() <= maxX && hazard.y() >= minY && hazard.y() <= maxY
                             && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
                 }
             }
-            result = new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly, waterCells, freeBody, actionCosts,
+            result = new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly,
+                    climbableCells, waterCells, freeBody, actionCosts,
                     minX, maxX, minY, maxY, minZ, maxZ, hasUnloadedChunks);
             return true;
         }
@@ -384,6 +420,9 @@ final class WorldSnapshot implements GridWorld {
     @Override public boolean dangerous(GridPos pos) { return dangerous.contains(pos); }
     @Override public boolean canJump(GridPos from, GridPos to) {
         if (!passable(from) || !passable(to) || from.y() != to.y()) return false;
+        // Climbable blocks are not landing platforms for long sprint jumps.
+        // Enter them with short walking transitions before climbing.
+        if (climbableCells.contains(from) || climbableCells.contains(to)) return false;
         int dx = to.x() - from.x();
         int dz = to.z() - from.z();
         double distance = Math.hypot(dx, dz);
