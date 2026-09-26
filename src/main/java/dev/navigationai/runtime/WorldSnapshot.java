@@ -6,6 +6,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Set;
+import java.util.List;
 import java.util.function.BooleanSupplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerPlayer;
@@ -34,34 +35,44 @@ final class WorldSnapshot implements GridWorld {
     private static final int MAX_VERTICAL_GOAL_RADIUS = 32;
     private final Set<GridPos> passable;
     private final Set<GridPos> dangerous;
-    private final Set<GridPos> jumpable;
-    private final Set<GridPos> jumpOver;
     private final Set<GridPos> crouchOnly;
     private final Set<GridPos> climbableCells;
     private final Set<GridPos> waterCells;
     private final Set<GridPos> freeBody;
     private final Map<GridPos, Double> actionCosts;
+    private final Map<GridPos, Double> surfaceOffsets;
+    private final Map<GridPos, List<AABB>> collisions;
+    private final double bodyWidth, standingHeight;
+    private final Set<GridPos> knownCells;
+    private final Set<GridPos> placementCells;
+    private final int availablePlacements;
     private final int minX, maxX, minY, maxY, minZ, maxZ;
     private final boolean hasUnloadedChunks;
 
-    private WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous, Set<GridPos> jumpable,
-                          Set<GridPos> jumpOver,
+    WorldSnapshot(Set<GridPos> passable, Set<GridPos> dangerous,
                           Set<GridPos> crouchOnly, Set<GridPos> climbableCells, Set<GridPos> waterCells,
                           Set<GridPos> freeBody,
-                          Map<GridPos, Double> actionCosts,
+                          Map<GridPos, Double> actionCosts, Map<GridPos, Double> surfaceOffsets,
+                          Map<GridPos, List<AABB>> collisions, Set<GridPos> knownCells,
+                          double bodyWidth, double standingHeight, Set<GridPos> placementCells, int availablePlacements,
                           int minX, int maxX, int minY, int maxY, int minZ, int maxZ,
                           boolean hasUnloadedChunks) {
         // Capture owns these collections and stops mutating them after this
         // point. Reusing them avoids a large final copy on the server tick.
         this.passable = passable;
         this.dangerous = dangerous;
-        this.jumpable = jumpable;
-        this.jumpOver = jumpOver;
         this.crouchOnly = crouchOnly;
         this.climbableCells = climbableCells;
         this.waterCells = waterCells;
         this.freeBody = freeBody;
         this.actionCosts = actionCosts;
+        this.surfaceOffsets = surfaceOffsets;
+        this.collisions = collisions;
+        this.bodyWidth = bodyWidth;
+        this.standingHeight = standingHeight;
+        this.knownCells = knownCells;
+        this.placementCells = placementCells;
+        this.availablePlacements = availablePlacements;
         this.minX = minX; this.maxX = maxX; this.minY = minY; this.maxY = maxY; this.minZ = minZ; this.maxZ = maxZ;
         this.hasUnloadedChunks = hasUnloadedChunks;
     }
@@ -100,13 +111,16 @@ final class WorldSnapshot implements GridWorld {
         private final int minX, maxX, minY, maxY, minZ, maxZ;
         private final Set<GridPos> passable = new HashSet<>();
         private final Set<GridPos> dangerous = new HashSet<>();
-        private final Set<GridPos> jumpable = new HashSet<>();
-        private final Set<GridPos> jumpOver = new HashSet<>();
         private final Set<GridPos> crouchOnly = new HashSet<>();
         private final Set<GridPos> climbableCells = new HashSet<>();
         private final Set<GridPos> waterCells = new HashSet<>();
         private final Set<GridPos> freeBody = new HashSet<>();
         private final Map<GridPos, Double> actionCosts = new HashMap<>();
+        private final Map<GridPos, Double> surfaceOffsets = new HashMap<>();
+        private final Map<GridPos, List<AABB>> collisions = new HashMap<>();
+        private final Set<GridPos> knownCells = new HashSet<>();
+        private final Set<GridPos> placementCells = new HashSet<>();
+        private final int availablePlacements;
         private final Set<Long> generatedChunks = new HashSet<>();
         private final double standingHeight, crouchingHeight, bodyWidth;
         private int x, y, z;
@@ -124,6 +138,7 @@ final class WorldSnapshot implements GridWorld {
             this.allowChunkGeneration = allowChunkGeneration;
             this.allowBreaking = allowBreaking;
             this.allowPlacing = allowPlacing;
+            this.availablePlacements = allowPlacing ? NavigationSafety.availableBuildingBlocks(observer, level) : 0;
             this.generationBudget = generationBudget;
             // Keep the snapshot bounded by the requested radius. A distant goal is
             // intentionally outside this local snapshot; the pathfinder handles it
@@ -152,10 +167,13 @@ final class WorldSnapshot implements GridWorld {
             x = minX; y = minY; z = minZ;
         }
 
-        boolean step(int maxCells) {
+        boolean step(int maxCells) { return step(maxCells, Long.MAX_VALUE); }
+
+        boolean step(int maxCells, long deadlineNanos) {
             if (result != null) return true;
             int processed = 0;
             while (x <= maxX && processed++ < maxCells) {
+                if (System.nanoTime() >= deadlineNanos) return false;
                 int x = this.x, y = this.y, z = this.z;
                 if (++this.y > maxY) {
                     this.y = minY;
@@ -187,10 +205,25 @@ final class WorldSnapshot implements GridWorld {
                         || fluidState.getType() == Fluids.FLOWING_WATER;
                 var stateShape = state.getCollisionShape(level, pos);
                 var aboveShape = above.getCollisionShape(level, pos.above());
+                var belowShape = below.getCollisionShape(level, pos.below());
+                double offset = NavigationGeometry.feetOffset(stateShape, belowShape);
+                GridPos gridPos = new GridPos(x, y, z);
+                knownCells.add(gridPos);
+                if (offset != 0.0D) surfaceOffsets.put(gridPos, offset);
+                var planningState = NavigationGeometry.planningState(state, observer.mayInteract(level, pos));
+                var planningShape = planningState.getCollisionShape(level, pos);
+                if (!planningShape.isEmpty()) {
+                    collisions.put(gridPos, planningShape.toAabbs().stream().map(box -> box.move(pos)).toList());
+                }
                 boolean clearBody = clearsCenteredBody(state, stateShape, bodyWidth, 1.0D);
-                boolean clearAbove = clearsCenteredBody(above, aboveShape, bodyWidth, 1.0D);
-                boolean standingClearance = hasClearanceAbove(above, aboveShape, standingHeight, bodyWidth);
-                boolean crouchingClearance = hasClearanceAbove(above, aboveShape, crouchingHeight, bodyWidth);
+                boolean standingClearance = hasClearanceAbove(above, aboveShape, standingHeight, bodyWidth, offset);
+                boolean crouchingClearance = hasClearanceAbove(above, aboveShape, crouchingHeight, bodyWidth, offset);
+                if (offset != 0.0D) {
+                    standingClearance = NavigationGeometry.bodyFits(level, pos, offset, bodyWidth,
+                            standingHeight + STANDING_CLEARANCE_MARGIN, false);
+                    crouchingClearance = NavigationGeometry.bodyFits(level, pos, offset, bodyWidth,
+                            crouchingHeight + CROUCHING_CLEARANCE_MARGIN, false);
+                }
                 boolean standingBody = clearBody && standingClearance;
                 boolean crouchingBody = clearBody && crouchingClearance;
                 // A bottom slab, carpet or similar partial block is a valid cell
@@ -214,7 +247,6 @@ final class WorldSnapshot implements GridWorld {
                 boolean floor = below.getCollisionShape(level, pos.below()).isEmpty()
                         ? (allowWater && belowWater)
                         : true;
-                GridPos gridPos = new GridPos(x, y, z);
                 if (clearBody && (standingClearance || crouchingClearance)) freeBody.add(gridPos);
                 boolean breakableBody = allowBreaking && !clearBody && hasUsableTool(observer, state)
                         && isBreakable(level, pos, state)
@@ -224,7 +256,7 @@ final class WorldSnapshot implements GridWorld {
                 boolean breakableAbove = allowBreaking && clearBody && !standingClearance && !crouchingClearance
                         && hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)
                         && !below.getCollisionShape(level, pos.below()).isEmpty();
-                boolean supportedPlacement = allowPlacing && (standingBody || crouchingBody)
+                boolean supportedPlacement = allowPlacing && availablePlacements > 0 && (standingBody || crouchingBody)
                         && below.getCollisionShape(level, pos.below()).isEmpty()
                         && (hasSolidNeighbour(level, pos.below()) || hasSolidNeighbour(level, pos));
                 boolean passableCell = fluidAllowed && (((standingBody || crouchingBody) && floor)
@@ -251,17 +283,10 @@ final class WorldSnapshot implements GridWorld {
                     // Placing is deliberately more expensive than a normal step;
                     // it is a fallback for gaps, not a preferred flat-ground move.
                     actionCosts.merge(gridPos, 8.0D, Math::max);
+                    if (!floor && !climbable && !openable && !openGate) placementCells.add(gridPos);
                 }
                 if (passable.contains(gridPos) && !standingClearance && crouchingClearance
                         && (crouchingBody || lowSurface)) crouchOnly.add(gridPos);
-                // A jumping body needs two clear cells at its current height;
-                // unlike a walkable cell, a crouch-height tunnel is never a
-                // valid segment of a long jump.
-                if (clearBody && clearAbove && !waterCell && !lavaCell) {
-                    jumpable.add(gridPos);
-                }
-                if (!clearBody && stateShape.max(Direction.Axis.Y) <= 1.0D && clearAbove
-                        && !waterCell && !lavaCell) jumpOver.add(gridPos);
                 if (waterCell) waterCells.add(gridPos);
                 boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
                         || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
@@ -296,8 +321,9 @@ final class WorldSnapshot implements GridWorld {
                             && hazard.z() >= minZ && hazard.z() <= maxZ) dangerous.add(hazard);
                 }
             }
-            result = new WorldSnapshot(passable, dangerous, jumpable, jumpOver, crouchOnly,
+            result = new WorldSnapshot(passable, dangerous, crouchOnly,
                     climbableCells, waterCells, freeBody, actionCosts,
+                    surfaceOffsets, collisions, knownCells, bodyWidth, standingHeight, placementCells, availablePlacements,
                     minX, maxX, minY, maxY, minZ, maxZ, hasUnloadedChunks);
             return true;
         }
@@ -308,9 +334,10 @@ final class WorldSnapshot implements GridWorld {
         }
     }
 
-    private static boolean hasClearanceAbove(BlockState above, VoxelShape aboveShape, double height, double width) {
+    private static boolean hasClearanceAbove(BlockState above, VoxelShape aboveShape, double height, double width,
+                                            double surfaceOffset) {
         double margin = height <= 1.6D ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
-        double needed = height + margin - 1.0D;
+        double needed = height + surfaceOffset + margin - 1.0D;
         return needed <= 0.0D || aboveShape.isEmpty()
                 || clearsCenteredBody(above, aboveShape, width, needed)
                 || aboveShape.min(Direction.Axis.Y) >= needed;
@@ -422,46 +449,24 @@ final class WorldSnapshot implements GridWorld {
         if (!passable(from) || !passable(to) || from.y() != to.y()) return false;
         // Climbable blocks are not landing platforms for long sprint jumps.
         // Enter them with short walking transitions before climbing.
-        if (climbableCells.contains(from) || climbableCells.contains(to)) return false;
-        int dx = to.x() - from.x();
-        int dz = to.z() - from.z();
-        double distance = Math.hypot(dx, dz);
-        if (distance < 2.0D || distance > 4.0D) return false;
+        if (climbableCells.contains(from) || climbableCells.contains(to)
+                || requiresSneak(from) || requiresSneak(to) || isWater(from) || isWater(to)) return false;
+        return NavigationGeometry.clearJump(feetPoint(from), feetPoint(to), bodyWidth, standingHeight,
+                this::collisionFree, pos -> dangerous.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ()))
+                        || waterCells.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())));
+    }
 
-        // Sample the swept horizontal line.  A clear body cell represents a
-        // gap or open air.  For a one-block wall, the body must instead have
-        // room one block higher and the parabolic jump must reach that height.
-        // This rejects two-block walls, liquids and hazards while allowing a
-        // diagonal jump that safely clears one ordinary wall block.
-        Map<GridPos, Double> highestArcByCell = new HashMap<>();
-        int samples = Math.max(1, (int) Math.ceil(distance * 8.0D));
-        for (int sample = 1; sample < samples; sample++) {
-            double progress = sample / (double) samples;
-            GridPos crossed = new GridPos(
-                    (int) Math.floor(from.x() + 0.5D + dx * progress), from.y(),
-                    (int) Math.floor(from.z() + 0.5D + dz * progress));
-            if (crossed.equals(from) || crossed.equals(to)) continue;
-            double arcHeight = 5.0D * progress * (1.0D - progress);
-            highestArcByCell.merge(crossed, arcHeight, Math::max);
-            // A diagonal body has width: at a grid-corner crossing it can
-            // touch either adjoining cell, not only the cell containing the
-            // line's centre.  Include both cells so a jump cannot clip
-            // through two touching wall corners.
-            if (dx != 0 && dz != 0) {
-                highestArcByCell.merge(crossed.add(-Integer.signum(dx), 0, 0), arcHeight, Math::max);
-                highestArcByCell.merge(crossed.add(0, 0, -Integer.signum(dz)), arcHeight, Math::max);
-            }
-        }
-        for (Map.Entry<GridPos, Double> crossed : highestArcByCell.entrySet()) {
-            GridPos cell = crossed.getKey();
-            if (cell.equals(from) || cell.equals(to)) continue;
-            if (dangerous.contains(cell)) return false;
-            // The jump apex occupies the cell one block above the normal
-            // walking volume.  Requiring that full body space prevents a
-            // planned gap jump from entering a low tunnel or hitting a roof.
-            if (jumpable.contains(cell) && freeBody.contains(cell.add(0, 1, 0))) continue;
-            if (crossed.getValue() < 1.0D || !jumpOver.contains(cell)
-                    || !freeBody.contains(cell.add(0, 1, 0))) return false;
+    private net.minecraft.world.phys.Vec3 feetPoint(GridPos pos) {
+        return new net.minecraft.world.phys.Vec3(pos.x() + 0.5D,
+                pos.y() + surfaceOffsets.getOrDefault(pos, 0.0D), pos.z() + 0.5D);
+    }
+
+    private boolean collisionFree(AABB box) {
+        for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY - 1, box.minZ),
+                BlockPos.containing(box.maxX - 1.0E-6D, box.maxY - 1.0E-6D, box.maxZ - 1.0E-6D))) {
+            GridPos cell = new GridPos(pos.getX(), pos.getY(), pos.getZ());
+            if (!knownCells.contains(cell)) return false;
+            for (AABB part : collisions.getOrDefault(cell, List.of())) if (part.intersects(box)) return false;
         }
         return true;
     }
@@ -475,7 +480,7 @@ final class WorldSnapshot implements GridWorld {
         // must have enough clearance and must not be dangerous. A solid wall,
         // disallowed water, or lava in the column invalidates the drop even
         // if the landing cell itself is walkable.
-        for (int y = to.y() + 1; y < from.y(); y++) {
+        for (int y = to.y() + 1; y <= from.y(); y++) {
             GridPos intermediate = new GridPos(to.x(), y, to.z());
             if (!freeBody.contains(intermediate) || dangerous.contains(intermediate)
                     || (waterCells.contains(intermediate) && !passable(intermediate))) return false;
@@ -484,6 +489,12 @@ final class WorldSnapshot implements GridWorld {
     }
     @Override public boolean requiresSneak(GridPos pos) { return crouchOnly.contains(pos); }
     @Override public boolean isWater(GridPos pos) { return waterCells.contains(pos); }
+    @Override public boolean canDescendWithoutFalling(GridPos from, GridPos to) {
+        return climbableCells.contains(from) || climbableCells.contains(to)
+                || (waterCells.contains(from) && waterCells.contains(to));
+    }
+    @Override public boolean requiresPlacement(GridPos pos) { return placementCells.contains(pos); }
+    @Override public int maxPlacements() { return availablePlacements; }
     @Override public int maxWaterSteps() { return Integer.MAX_VALUE; }
     @Override public double cost(GridPos from, GridPos to) {
         double base = GridWorld.super.cost(from, to);

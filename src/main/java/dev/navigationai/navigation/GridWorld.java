@@ -28,6 +28,13 @@ public interface GridWorld {
     /** Returns whether a cell contains water that requires swimming/wading. */
     default boolean isWater(GridPos pos) { return false; }
 
+    /** A ladder or swimming descent is not a fall and can ignore the fall limit. */
+    default boolean canDescendWithoutFalling(GridPos from, GridPos to) { return false; }
+    /** Whether entering this cell consumes one support block. */
+    default boolean requiresPlacement(GridPos pos) { return false; }
+    /** Number of support blocks available for one local route. */
+    default int maxPlacements() { return Integer.MAX_VALUE; }
+
     /** Maximum number of water cells a route may use. */
     default int maxWaterSteps() { return Integer.MAX_VALUE; }
 

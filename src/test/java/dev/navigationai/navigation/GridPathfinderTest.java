@@ -2,12 +2,55 @@ package dev.navigationai.navigation;
 
 import dev.navigationai.api.NavigationPolicy;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class GridPathfinderTest {
+    @Test void zeroFallLimitRejectsOneBlockDropButAllowsLadderDescent() {
+        GridPos start=new GridPos(0,1,0), goal=new GridPos(1,0,0);
+        NavigationPolicy noFalls=new NavigationPolicy(false,false,false,false,512,16,8,0,0);
+        GridWorld falling=pos -> pos.equals(start) || pos.equals(goal);
+        assertTrue(GridPathfinder.find(falling,start,goal,noFalls).nodes().isEmpty());
+        GridWorld ladder=new GridWorld() {
+            public boolean passable(GridPos p) { return falling.passable(p); }
+            public boolean canDescendWithoutFalling(GridPos from,GridPos to) { return true; }
+        };
+        assertEquals(List.of(start,goal),GridPathfinder.find(ladder,start,goal,noFalls).nodes());
+    }
+
+    @Test void keepsShorterMoreExpensiveRouteUnderLengthLimit() {
+        GridPos s=new GridPos(0,0,0), a=new GridPos(1,0,0), b=new GridPos(0,1,0);
+        GridPos c=new GridPos(1,1,0), m=new GridPos(2,0,0), g=new GridPos(3,0,0);
+        Map<GridPos,Set<GridPos>> edges=Map.of(s,Set.of(a,b),a,Set.of(m),b,Set.of(c),c,Set.of(m),m,Set.of(g),g,Set.of());
+        GridWorld world=new GridWorld() {
+            public boolean passable(GridPos p) { return edges.containsKey(p); }
+            public boolean canTraverse(GridPos from,GridPos to) { return edges.getOrDefault(from,Set.of()).contains(to); }
+            public double cost(GridPos from,GridPos to) { return GridWorld.super.cost(from,to)+(to.equals(a)?20:0); }
+        };
+        assertEquals(List.of(s,a,m,g),GridPathfinder.find(world,s,g,policy(512,3,0)).nodes());
+    }
+
+    @Test void searchesAllApproachesWhenFirstEndpointIsUnreachable() {
+        GridPos start=new GridPos(0,0,0), reachable=new GridPos(2,0,0), isolated=new GridPos(2,2,0);
+        GridWorld world=p -> p.equals(isolated) || p.y()==0 && p.z()==0 && p.x()>=0 && p.x()<=2;
+        GridPath result=GridPathfinder.findToAny(world,start,Set.of(isolated,reachable),
+                new GridPos(2,1,0),policy(512),NodeBudget.unlimited(),false);
+        assertTrue(result.goalReached());
+        assertEquals(reachable,result.nodes().getLast());
+    }
+
+    @Test void refusesBridgeLongerThanAvailableMaterials() {
+        GridWorld world=new GridWorld() {
+            public boolean passable(GridPos p) { return p.y()==0 && p.z()==0 && p.x()>=0 && p.x()<=3; }
+            public boolean requiresPlacement(GridPos p) { return p.x()==1 || p.x()==2; }
+            public int maxPlacements() { return 1; }
+        };
+        assertTrue(GridPathfinder.find(world,new GridPos(0,0,0),new GridPos(3,0,0),policy(512)).nodes().isEmpty());
+    }
     private static NavigationPolicy policy(int nodes) {
         return new NavigationPolicy(false, false, false, false, nodes, 512, 8, 0);
     }

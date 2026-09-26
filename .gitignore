@@ -1,5 +1,6 @@
 .gradle/
 build/
+logs/
 run/
 minecraft-server-26.2/
 out/

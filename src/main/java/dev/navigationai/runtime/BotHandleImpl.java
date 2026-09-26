@@ -42,14 +42,19 @@ final class BotHandleImpl implements BotHandle {
     @Override public ResourceCollector collector() { return collector; }
     @Override public CombatController combat() { return combat; }
     MinerImpl minerImpl() { return miner; }
+    void ensureActive() {
+        if (state != BotState.ACTIVE) throw new IllegalStateException("Bot is not active");
+    }
     NavigatorImpl navigatorImpl() { return navigator; }
     @Override public void remove() {
+        runtime.ensureServerThread();
+        if (state == BotState.REMOVED) return;
+        state = BotState.REMOVED;
         navigator.cancel();
         collector.cancel();
         miner.cancel();
         combat.cancel();
         runtime.remove(this);
-        state = BotState.REMOVED;
     }
     void prepareForShutdown() {
         runtime.ensureServerThread();

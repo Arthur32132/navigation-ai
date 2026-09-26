@@ -57,6 +57,7 @@ final class CombatControllerImpl implements CombatController {
     private boolean nearbyMode;
     private double nearbyRadius;
     private int nearbyEmptyTicks;
+    private long startGeneration;
 
     CombatControllerImpl(BotRuntime runtime, BotHandleImpl owner) {
         this.runtime = runtime;
@@ -65,10 +66,14 @@ final class CombatControllerImpl implements CombatController {
 
     @Override public CombatTask fight(LivingEntity target, CombatPolicy policy) {
         runtime.ensureServerThread();
+        owner.ensureActive();
         if (target == null) throw new IllegalArgumentException("target is required");
         if (policy == null) throw new IllegalArgumentException("policy is required");
         if (!isAllowedTarget(target, policy)) throw new IllegalArgumentException("target type is not allowed by policy");
+        long generation = ++startGeneration;
         cancel();
+        if (!cancelOtherControllers(generation)) return superseded();
+        owner.ensureActive();
         this.target = target;
         this.nearbyMode = false;
         this.nearbyRadius = 0.0;
@@ -82,19 +87,20 @@ final class CombatControllerImpl implements CombatController {
         this.bowTicks = 0;
         this.bowUsing = false;
         this.task = new CombatTaskImpl();
-        owner.navigator().cancel();
-        if (owner.miner().task() != null) owner.miner().task().cancel();
-        if (owner.collector().task() != null) owner.collector().task().cancel();
         return task;
     }
 
     @Override public CombatTask fightNearby(double radius, CombatPolicy policy) {
         runtime.ensureServerThread();
+        owner.ensureActive();
         if (policy == null) throw new IllegalArgumentException("policy is required");
         if (!(radius > 0.0 && radius <= policy.maxFollowDistance())) {
             throw new IllegalArgumentException("radius must be in (0, maxFollowDistance]");
         }
+        long generation = ++startGeneration;
         cancel();
+        if (!cancelOtherControllers(generation)) return superseded();
+        owner.ensureActive();
         this.target = null;
         this.nearbyMode = true;
         this.nearbyRadius = radius;
@@ -108,10 +114,23 @@ final class CombatControllerImpl implements CombatController {
         this.bowTicks = 0;
         this.bowUsing = false;
         this.task = new CombatTaskImpl();
-        owner.navigator().cancel();
-        if (owner.miner().task() != null) owner.miner().task().cancel();
-        if (owner.collector().task() != null) owner.collector().task().cancel();
         return task;
+    }
+
+    private boolean cancelOtherControllers(long generation) {
+        if (generation != startGeneration) return false;
+        owner.navigator().cancel();
+        if (generation != startGeneration) return false;
+        if (owner.miner().task() != null) owner.miner().task().cancel();
+        if (generation != startGeneration) return false;
+        if (owner.collector().task() != null) owner.collector().task().cancel();
+        return generation == startGeneration;
+    }
+
+    private CombatTask superseded() {
+        CombatTaskImpl cancelled = new CombatTaskImpl();
+        cancelled.cancel();
+        return cancelled;
     }
 
     @Override public void cancel() {
@@ -513,7 +532,7 @@ final class CombatControllerImpl implements CombatController {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == CombatStatus.RUNNING) {
                 status = CombatStatus.CANCELLED;
-                clearCombatState();
+                if (CombatControllerImpl.this.task == this) clearCombatState();
                 completion.complete(CombatResult.cancelled(attacks, shots));
             }
         }

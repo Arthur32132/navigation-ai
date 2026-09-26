@@ -1,3 +1,95 @@
+2026-09-26 — fixes after deep review
+Minecraft 26.2 / Fabric Loader 0.19.5 / Fabric API 0.161.0+26.2 / JDK 25
+Library SHA256: 66449EFD27BF0E830BDC72AC0F48393F8D1DE26641381D068A103ABBEF5AEA45
+BUILD: library gradlew.bat test build PASS; consumer gradlew.bat build PASS
+JUnit: 39 tests, 0 failures (26 baseline + 13 added)
+Disposable server: build/review-probes/server, review-world, 127.0.0.1:25576
+LOAD timing fields are cumulative BotRuntime.tick measurements, not full server TPS.
+
+[15:52:15] [Server thread/INFO]: REVIEW OK slab_headroom: contract=true
+[15:52:16] [Server thread/INFO]: REVIEW OK block_goal_all_approaches: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=4, durationNanos=1055172900]
+[15:52:28] [Server thread/INFO]: REVIEW OK moving_follow: movement=22.987651790518694 status=RUNNING
+[15:52:29] [Server thread/INFO]: REVIEW OK miner_reentrant_start: contract=true
+[15:52:29] [Server thread/INFO]: REVIEW OK collector_reentrant_start: contract=true
+[15:52:29] [Server thread/INFO]: REVIEW OK combat_reentrant_start: contract=true
+[15:52:30] [Server thread/INFO]: REVIEW OK final_approach_new_hazard: status=STUCK pos=(1024.5494570788944, 200.0, 1024.5) health=20.0
+[15:52:30] [Server thread/INFO]: REVIEW OK unsafe_building_material: NavigationResult[status=FAILED, reason=unreachable, nodesVisited=1, durationNanos=167892600]
+[15:52:30] [Server thread/INFO]: REVIEW OK insufficient_bridge_material: NavigationResult[status=FAILED, reason=unreachable, nodesVisited=4, durationNanos=183414500]
+[15:52:33] [Server thread/INFO]: REVIEW OK request_metrics_across_segments: result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=18, durationNanos=3315613000] elapsed=3317290800 runtimeNodes=18
+[15:52:34] [Server thread/INFO]: REVIEW OK incremental_resource_scan: scanned=1024 phase=DONE
+[15:52:34] [Server thread/INFO]: REVIEW OK resource_reservation: contract=true
+[15:52:34] [Server thread/INFO]: REVIEW OK new_obstacle_inside_jump: status=FAILED pos=(1024.6274000124097, 200.0, 1024.5)
+[15:52:36] [Server thread/INFO]: REVIEW OK new_powder_snow_on_route: status=SUCCESS enteredHazard=false health=20.0
+[15:52:37] [Server thread/INFO]: REVIEW OK fair_resource_scan_budget: minCells=5120 maxCells=5120
+[15:52:37] [Server thread/INFO]: REVIEW PASS passed=15 failed=0
+[15:53:14] [Server thread/INFO]: LOAD START count=1 generation=false (run counts 1, 10, 25 and 50 separately)
+[15:53:16] [Server thread/INFO]: LOAD PASS count=1 completed=1/1 ticks=58 maxTickMs=27.5744 avgTickMs=0.45856528497409327 searches=1 nodes=13 queued=0
+[15:53:56] [Server thread/INFO]: LOAD START count=10 generation=false (run counts 1, 10, 25 and 50 separately)
+[15:54:01] [Server thread/INFO]: LOAD PASS count=10 completed=10/10 ticks=99 maxTickMs=27.5744 avgTickMs=0.359139146491588 searches=10 nodes=130 queued=0
+[15:54:45] [Server thread/INFO]: LOAD START count=25 generation=false (run counts 1, 10, 25 and 50 separately)
+[15:54:54] [Server thread/INFO]: LOAD PASS count=25 completed=25/25 ticks=182 maxTickMs=42.6744 avgTickMs=0.3562854083380925 searches=25 nodes=325 queued=0
+[15:55:33] [Server thread/INFO]: LOAD START count=50 generation=false (run counts 1, 10, 25 and 50 separately)
+[15:55:48] [Server thread/INFO]: LOAD PASS count=50 completed=50/50 ticks=319 maxTickMs=68.268 avgTickMs=0.41821625980819527 searches=50 nodes=650 queued=0
+[15:56:34] [Server thread/INFO]: LOAD START count=10 generation=true (run counts 1, 10, 25 and 50 separately)
+[15:56:39] [Server thread/INFO]: LOAD PASS count=10 completed=10/10 ticks=99 maxTickMs=68.268 avgTickMs=0.3597783851375491 searches=10 nodes=130 queued=0
+
+Final full regression against the same JAR:
+[15:57:47] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state
+[15:57:47] [Server thread/INFO]: TICKET REGRESSION PASS: overlapping routes released; player loading/simulation tickets preserved
+[15:57:47] [Server thread/INFO]: REGRESSION OK mining_inventory_tool_restore: MiningResult[status=SUCCESS, reason=block_broken, blockBroken=true, durationNanos=50265800]
+[15:57:47] [Server thread/INFO]: REGRESSION OK mining_cancel_before_tick: cancel preserves block and selected slot
+[15:57:47] [Server thread/INFO]: REGRESSION OK mining_no_tool_preserves_slot: missing tool
+[15:57:47] [Server thread/INFO]: REGRESSION OK unbreakable_block: cannot_break
+[15:57:49] [Server thread/INFO]: REGRESSION OK gather_and_pickup: GatherResult[status=SUCCESS, reason=target_reached, collectedItems=1, brokenBlocks=1, durationNanos=1734942900]
+[15:57:51] [Server thread/INFO]: REGRESSION OK full_inventory: GatherResult[status=FAILED, reason=inventory_full, collectedItems=0, brokenBlocks=1, durationNanos=2437054000]
+[15:57:51] [Server thread/INFO]: REGRESSION OK missing_resource: GatherResult[status=FAILED, reason=no_resources, collectedItems=0, brokenBlocks=0, durationNanos=71905900]
+[15:57:51] [Server thread/INFO]: REGRESSION OK gather_timeout_cancels_navigation: GatherResult[status=FAILED, reason=timeout, collectedItems=0, brokenBlocks=0, durationNanos=90495000]
+[15:57:52] [Server thread/INFO]: REGRESSION OK gather_cancel: GatherResult[status=CANCELLED, reason=cancelled, collectedItems=0, brokenBlocks=0, durationNanos=44300]
+[15:57:55] [Server thread/INFO]: REGRESSION OK best_sword_and_broken_weapon_replacement: best sword selected; depleted sword replaced; real melee damage
+[15:57:59] [Server thread/INFO]: REGRESSION OK bow_inventory_arrows_damage: arrow consumed and target damaged
+[15:58:02] [Server thread/INFO]: REGRESSION OK combat_one_block_step: climbed step and damaged target
+[15:58:02] [Server thread/INFO]: REGRESSION OK unreachable_resource: GatherResult[status=FAILED, reason=no_resources, collectedItems=0, brokenBlocks=0, durationNanos=218788200]
+[15:58:05] [Server thread/INFO]: REGRESSION OK retry_other_side: GatherResult[status=SUCCESS, reason=target_reached, collectedItems=1, brokenBlocks=1, durationNanos=2291140000]
+[15:58:08] [Server thread/INFO]: REGRESSION OK navigation_breaking: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=394, durationNanos=3168501000]
+[15:58:08] [Server thread/INFO]: REGRESSION OK navigation_bridge: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=90, durationNanos=524789100]
+[15:58:09] [Server thread/INFO]: REGRESSION OK navigation_door: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=524556700]
+[15:58:11] [Server thread/INFO]: REGRESSION OK navigation_ladder: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=27, durationNanos=2390214800]
+[15:58:13] [Server thread/INFO]: REGRESSION OK navigation_dynamic_obstacle: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=23, durationNanos=1670691200]
+[15:58:14] [Server thread/INFO]: REGRESSION OK navigation_stair_geometry: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=22, durationNanos=814753700]
+[15:58:15] [Server thread/INFO]: REGRESSION OK navigation_partial_surface: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=1149318800]
+[15:58:17] [Server thread/INFO]: REGRESSION OK navigation_water: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=8, durationNanos=1982226800]
+[15:58:18] [Server thread/INFO]: REGRESSION OK navigation_copper_door: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=506264600]
+[15:58:21] [Server thread/INFO]: REGRESSION OK navigation_jump_pits: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=29, durationNanos=3032663700] pos=(1038.9967288432501, 200.0, 1024.5) grounded=true
+[15:58:21] [Server thread/INFO]: REGRESSION OK navigation_crouch_tunnel: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=535322800]
+[15:58:32] [Server thread/INFO]: REGRESSION OK navigation_long_wall_frontier: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=2561, durationNanos=10865456000]
+[15:58:33] [Server thread/INFO]: REGRESSION OK navigation_block_goal_solid: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=1428012500]
+[15:58:34] [Server thread/INFO]: REGRESSION OK navigation_controlled_drop: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=2, durationNanos=893898100]
+[15:58:36] [Server thread/INFO]: REGRESSION OK navigation_fence_gate: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=1083361500] gate=true x=1028.933015235308
+[15:58:36] [Server thread/INFO]: REGRESSION OK navigation_bridge_cancel_rollback: cancel compensated partial bridge after NBT restore
+[15:58:38] [Server thread/INFO]: REGRESSION OK navigation_multi_goal: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=14, durationNanos=2469969700] x=1033.0297939575846 goal=PositionGoal[position=(1033.5, 200.0, 1024.5), tolerance=0.75]
+[15:58:41] [Server thread/INFO]: REGRESSION OK navigation_patrol: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=14, durationNanos=2448639200] x=1033.0297939575846 goal=PositionGoal[position=(1033.5, 200.0, 1024.5), tolerance=0.75]
+[15:58:41] [Server thread/INFO]: REGRESSION OK navigation_look_at: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=0, durationNanos=56100] x=1024.5 yaw=-90.0
+[15:58:41] [Server thread/INFO]: REGRESSION OK navigation_dimension_goal: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=0, durationNanos=209312600]
+[15:58:46] [Server thread/INFO]: REGRESSION OK navigation_escort: escort reached target distance
+[15:58:47] [Server thread/INFO]: REGRESSION OK navigation_waterlogged_geometry: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=7, durationNanos=1071134400]
+[15:58:48] [Server thread/INFO]: REGRESSION OK navigation_jump_with_doors_at_edges: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=4, durationNanos=1175023800] pos=(1029.8503128796003, 200.0, 1024.5) grounded=true
+[15:58:50] [Server thread/INFO]: REGRESSION OK navigation_open_door: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=1092609100] pos=(1028.933015235308, 200.0, 1024.5)
+[15:58:51] [Server thread/INFO]: REGRESSION OK navigation_open_trapdoor: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=1085810200] pos=(1028.933015235308, 200.0, 1024.5)
+[15:58:52] [Server thread/INFO]: REGRESSION OK navigation_open_overhead_trapdoor: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=1075896000] pos=(1028.933015235308, 200.0, 1024.5)
+[15:58:53] [Server thread/INFO]: REGRESSION OK navigation_open_trapdoor_corner: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=5, durationNanos=865486200] pos=(1026.5757525457861, 200.0, 1025.831258264843)
+[15:59:02] [Server thread/INFO]: REGRESSION OK navigation_long_deep_water: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=898, durationNanos=9343620600] pos=(1050.1273430538088, 200.21442787537651, 1024.5)
+[15:59:11] [Server thread/INFO]: REGRESSION OK navigation_long_flat_route: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=2418, durationNanos=8521890500] pos=(1055.8153520094238, 200.0, 1024.5)
+[15:59:12] [Server thread/INFO]: REGRESSION OK navigation_occupied_destination: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=936684600] actor=(1028.0912239433278, 200.0, 1024.5) target=(1029.5, 200.0, 1024.5)
+[15:59:13] [Server thread/INFO]: REGRESSION OK navigation_grounded_edge_start: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=5, durationNanos=850213200] pos=(1027.8101566055593, 200.0, 1024.5)
+[15:59:29] [Server thread/INFO]: REGRESSION OK navigation_elevated_goal_distant_access: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=7132, durationNanos=16024703400] pos=(1031.964144596111, 204.0, 1024.5)
+[15:59:31] [Server thread/INFO]: REGRESSION OK navigation_consecutive_gap_jumps_door: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=3, durationNanos=2380522200] pos=(1027.5007233218635, 200.0, 1027.3257199943557)
+[16:00:01] [Server thread/INFO]: REGRESSION OK navigation_come_from_below_elevated_finish: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=13988, durationNanos=30130089200] pos=(1031.1222941762464, 220.0, 1024.5) headedUnderFinish=false
+[16:00:02] [Server thread/INFO]: REGRESSION OK mining_waterlogged_block: MiningResult[status=SUCCESS, reason=block_broken, blockBroken=true, durationNanos=293221100]
+[16:00:03] [Server thread/INFO]: REGRESSION OK navigation_reentrant_cancel_callback: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=6, durationNanos=1092844100]
+[16:00:03] [Server thread/INFO]: REGRESSION OK navigation_airborne_arrival: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=0, durationNanos=140860900]
+[16:00:03] [Server thread/INFO]: REGRESSION PASS passed=51 failed=0
+
+===== Previous validation history =====
 [20:28:28] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state
 [20:28:28] [Server thread/INFO]: REGRESSION START mining_inventory_tool_restore
 [20:28:28] [Server thread/INFO]: REGRESSION OK mining_inventory_tool_restore: MiningResult[status=SUCCESS, reason=block_broken, blockBroken=true, durationNanos=148155300]

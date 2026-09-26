@@ -1,6 +1,9 @@
 package dev.navigationai.api;
 
-/** Immutable runtime performance snapshot for diagnostics and backpressure. */
+/**
+ * Immutable runtime performance snapshot for diagnostics and backpressure.
+ * Tick durations measure BotRuntime.tick(), not the entire Minecraft server tick.
+ */
 public record NavigationMetrics(
         long serverTicks,
         long lastTickNanos,

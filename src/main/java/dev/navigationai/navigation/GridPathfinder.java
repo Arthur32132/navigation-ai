@@ -5,7 +5,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
@@ -13,7 +12,23 @@ import java.util.Set;
 
 /** Deterministic, bounded A* over a snapshot. It never touches Minecraft state. */
 public final class GridPathfinder {
-    private record SearchNode(GridPos pos, int waterSteps) { }
+    private record State(GridPos pos, int waterSteps, int placements) { }
+    private static final class SearchNode {
+        final State state;
+        final int steps;
+        final double cost;
+        final SearchNode parent;
+        boolean superseded;
+
+        SearchNode(State state, int steps, double cost, SearchNode parent) {
+            this.state = state;
+            this.steps = steps;
+            this.cost = cost;
+            this.parent = parent;
+        }
+        GridPos pos() { return state.pos(); }
+        int waterSteps() { return state.waterSteps(); }
+    }
 
     /**
      * The longest safe sprint jump covers four horizontal blocks: a three
@@ -44,60 +59,67 @@ public final class GridPathfinder {
     public static GridPath find(GridWorld world, GridPos start, GridPos goal,
                                 NavigationPolicy policy, NodeBudget budget,
                                 boolean returnBestPartial) {
+        return findToAny(world, start, Set.of(goal), goal, policy, budget, returnBestPartial);
+    }
+
+    /** Searches all acceptable endpoints together instead of choosing an unverified neighbour. */
+    public static GridPath findToAny(GridWorld world, GridPos start, Set<GridPos> goals, GridPos frontierTarget,
+                                    NavigationPolicy policy, NodeBudget budget, boolean returnBestPartial) {
         if (!world.passable(start)) return new GridPath(List.of(), 0);
-        if (start.equals(goal)) return GridPath.reached(List.of(start), 1);
+        goals = Set.copyOf(goals);
+        if (goals.contains(start)) return GridPath.reached(List.of(start), 1);
         record Entry(SearchNode node, double priority) { }
         PriorityQueue<Entry> open = new PriorityQueue<>(Comparator
                 .comparingDouble(Entry::priority)
                 .thenComparingInt(entry -> entry.node().pos().y())
                 .thenComparingInt(entry -> entry.node().pos().x())
                 .thenComparingInt(entry -> entry.node().pos().z())
-                .thenComparingInt(entry -> entry.node().waterSteps()));
-        Map<SearchNode, Double> score = new HashMap<>();
-        Map<SearchNode, SearchNode> parent = new HashMap<>();
-        Map<SearchNode, Integer> steps = new HashMap<>();
-        Set<SearchNode> closed = new HashSet<>();
+                .thenComparingInt(entry -> entry.node().waterSteps())
+                .thenComparingInt(entry -> entry.node().state.placements()));
+        Map<State, List<SearchNode>> labels = new HashMap<>();
         int waterLimit = world.maxWaterSteps();
+        int placementLimit = world.maxPlacements();
         // Unlimited swimming needs no extra A* state dimension. Counting
         // every water cell there would revisit the same position with many
         // different counters and exhaust the node budget.
         int startWaterSteps = waterLimit == Integer.MAX_VALUE ? 0 : world.isWater(start) ? 1 : 0;
         if (startWaterSteps > waterLimit) return new GridPath(List.of(), 0);
-        SearchNode startNode = new SearchNode(start, startWaterSteps);
-        score.put(startNode, 0.0);
-        steps.put(startNode, 0);
-        open.add(new Entry(startNode, heuristic(start, goal)));
+        SearchNode startNode = new SearchNode(new State(start, startWaterSteps, 0), 0, 0.0, null);
+        labels.put(startNode.state, new ArrayList<>(List.of(startNode)));
+        open.add(new Entry(startNode, goalHeuristic(start, goals, frontierTarget)));
         int visited = 0;
         SearchNode bestNode = startNode;
-        double bestFrontierScore = heuristic(start, goal);
+        double bestFrontierScore = heuristic(start, frontierTarget);
         double bestPathCost = 0.0D;
         boolean budgetExhausted = false;
         boolean searchLimitReached = false;
         boolean pathLengthReached = false;
-        boolean goalVisible = world.passable(goal);
+        boolean goalVisible = goals.stream().anyMatch(world::passable);
         while (!open.isEmpty() && visited < policy.maxSearchNodes()) {
             if (Thread.currentThread().isInterrupted()) return new GridPath(List.of(), visited);
+            SearchNode currentNode = open.poll().node();
+            if (currentNode.superseded) continue;
             if (!budget.tryConsume()) {
                 budgetExhausted = true;
                 break;
             }
-            SearchNode currentNode = open.poll().node();
             GridPos current = currentNode.pos();
-            if (!closed.add(currentNode)) continue;
             visited++;
-            double currentCost = score.getOrDefault(currentNode, Double.POSITIVE_INFINITY);
-            double frontierScore = frontierScore(current, goal, currentCost);
+            double currentCost = currentNode.cost;
+            double frontierScore = frontierScore(current, frontierTarget, currentCost);
             if (frontierScore < bestFrontierScore
                     || (frontierScore == bestFrontierScore && currentCost < bestPathCost)) {
                 bestNode = currentNode;
                 bestFrontierScore = frontierScore;
                 bestPathCost = currentCost;
             }
-            if (current.equals(goal)) {
-                return GridPath.reached(reconstruct(parent, currentNode), visited);
+            if (goals.contains(current)) {
+                return GridPath.reached(reconstruct(currentNode), visited);
             }
             for (int[] move : MOVES) {
                 GridPos next = current.add(move[0], move[1], move[2]);
+                if (move[1] < 0 && -move[1] > policy.maxFallDistance()
+                        && !world.canDescendWithoutFalling(current, next)) continue;
                 boolean jump = Math.max(Math.abs(move[0]), Math.abs(move[2])) > 1;
                 if (jump
                         ? !world.passable(next) || !world.canJump(current, next)
@@ -105,9 +127,10 @@ public final class GridPathfinder {
                 int nextWaterSteps = waterLimit == Integer.MAX_VALUE ? 0
                         : currentNode.waterSteps() + (world.isWater(next) ? 1 : 0);
                 if (nextWaterSteps > waterLimit) continue;
-                SearchNode nextNode = new SearchNode(next, nextWaterSteps);
-                if (closed.contains(nextNode)) continue;
-                int nextSteps = steps.get(currentNode) + 1;
+                int nextPlacements = placementLimit == Integer.MAX_VALUE ? 0
+                        : currentNode.state.placements() + (world.requiresPlacement(next) ? 1 : 0);
+                if (nextPlacements > placementLimit) continue;
+                int nextSteps = currentNode.steps + 1;
                 if (nextSteps > policy.maxPathLength()) {
                     pathLengthReached = true;
                     continue;
@@ -117,14 +140,13 @@ public final class GridPathfinder {
                 // gives the executor more control over the arrival point.
                 // Keep the jump available, but make it slightly more
                 // expensive so an equivalent walk wins the tie.
-                double nextScore = score.get(currentNode) + world.cost(current, next)
+                double nextScore = currentNode.cost + world.cost(current, next)
                         + (jump ? 0.35D : 0.0D);
                 if (world.dangerous(next)) nextScore += policy.dangerCost();
-                if (nextScore >= score.getOrDefault(nextNode, Double.POSITIVE_INFINITY)) continue;
-                score.put(nextNode, nextScore);
-                steps.put(nextNode, nextSteps);
-                parent.put(nextNode, currentNode);
-                open.add(new Entry(nextNode, nextScore + heuristic(next, goal)));
+                SearchNode nextNode = new SearchNode(new State(next, nextWaterSteps, nextPlacements), nextSteps, nextScore, currentNode);
+                if (retainLabel(labels, nextNode)) {
+                    open.add(new Entry(nextNode, nextScore + goalHeuristic(next, goals, frontierTarget)));
+                }
             }
             if (policy.maxFallDistance() >= 2) {
                 for (int[] move : DROP_MOVES) {
@@ -134,30 +156,52 @@ public final class GridPathfinder {
                     if (!world.canDrop(current, next)) continue;
                     int nextWaterSteps = waterLimit == Integer.MAX_VALUE ? 0
                             : currentNode.waterSteps() + (world.isWater(next) ? 1 : 0);
-                    SearchNode nextNode = new SearchNode(next, nextWaterSteps);
-                    if (nextNode.waterSteps() > waterLimit || closed.contains(nextNode)) continue;
-                    int nextSteps = steps.get(currentNode) + 1;
+                    if (nextWaterSteps > waterLimit) continue;
+                    int nextPlacements = placementLimit == Integer.MAX_VALUE ? 0
+                            : currentNode.state.placements() + (world.requiresPlacement(next) ? 1 : 0);
+                    if (nextPlacements > placementLimit) continue;
+                    int nextSteps = currentNode.steps + 1;
                     if (nextSteps > policy.maxPathLength()) {
                         pathLengthReached = true;
                         continue;
                     }
-                    double nextScore = score.get(currentNode) + world.cost(current, next)
+                    double nextScore = currentNode.cost + world.cost(current, next)
                             + dropDistance * 0.35D;
                     if (world.dangerous(next)) nextScore += policy.dangerCost();
-                    if (nextScore >= score.getOrDefault(nextNode, Double.POSITIVE_INFINITY)) continue;
-                    score.put(nextNode, nextScore);
-                    steps.put(nextNode, nextSteps);
-                    parent.put(nextNode, currentNode);
-                    open.add(new Entry(nextNode, nextScore + heuristic(next, goal)));
+                    SearchNode nextNode = new SearchNode(new State(next, nextWaterSteps, nextPlacements), nextSteps, nextScore, currentNode);
+                    if (retainLabel(labels, nextNode)) {
+                        open.add(new Entry(nextNode, nextScore + goalHeuristic(next, goals, frontierTarget)));
+                    }
                 }
             }
         }
         if (visited >= policy.maxSearchNodes() && !open.isEmpty()) searchLimitReached = true;
         if (returnBestPartial && bestNode != startNode
                 && (budgetExhausted || searchLimitReached || pathLengthReached || !goalVisible)) {
-            return GridPath.incomplete(reconstruct(parent, bestNode), visited, budgetExhausted);
+            return GridPath.incomplete(reconstruct(bestNode), visited, budgetExhausted);
         }
         return new GridPath(List.of(), visited, budgetExhausted);
+    }
+
+    private static boolean retainLabel(Map<State, List<SearchNode>> labels, SearchNode candidate) {
+        List<SearchNode> alternatives = labels.computeIfAbsent(candidate.state, ignored -> new ArrayList<>());
+        for (SearchNode previous : alternatives) {
+            if (previous.cost <= candidate.cost && previous.steps <= candidate.steps) return false;
+        }
+        alternatives.removeIf(previous -> {
+            boolean dominated = candidate.cost <= previous.cost && candidate.steps <= previous.steps;
+            if (dominated) previous.superseded = true;
+            return dominated;
+        });
+        alternatives.add(candidate);
+        return true;
+    }
+
+    private static double goalHeuristic(GridPos position, Set<GridPos> goals, GridPos frontierTarget) {
+        if (goals.isEmpty()) return heuristic(position, frontierTarget);
+        double nearest = Double.POSITIVE_INFINITY;
+        for (GridPos goal : goals) nearest = Math.min(nearest, heuristic(position, goal));
+        return nearest;
     }
 
     private static double frontierScore(GridPos position, GridPos goal, double pathCost) {
@@ -202,12 +246,12 @@ public final class GridPathfinder {
         return moves.toArray(int[][]::new);
     }
 
-    private static List<GridPos> reconstruct(Map<SearchNode, SearchNode> parent, SearchNode current) {
+    private static List<GridPos> reconstruct(SearchNode current) {
         ArrayList<GridPos> result = new ArrayList<>();
         GridPos position = current.pos();
         result.add(position);
-        while (parent.containsKey(current)) {
-            current = parent.get(current);
+        while (current.parent != null) {
+            current = current.parent;
             result.add(current.pos());
         }
         Collections.reverse(result);

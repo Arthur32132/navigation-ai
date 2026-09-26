@@ -16,6 +16,7 @@ import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.StairBlock;
 import net.minecraft.world.level.block.TrapDoorBlock;
 import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.world.level.block.state.properties.DoorHingeSide;
 import net.minecraft.world.level.block.state.properties.Half;
 import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.core.Direction;
@@ -61,6 +62,7 @@ public final class RuntimeRegression {
     private boolean approachedFinishBeforeEntrance;
 
     public static void register() {
+        ReviewRegression.register();
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (active != null) active.tick();
         });
@@ -577,18 +579,22 @@ public final class RuntimeRegression {
                 // Two two-block gaps with a single door block between them.
                 // The bot must settle on that block before taking off again.
                 bot.player().setPos(1024.78, 200.0, 1024.78);
-                for (int x=0; x<=6; x++) for (int z=-4; z<=4; z++) {
+                for (int x=-8; x<=8; x++) for (int z=-8; z<=8; z++) {
                     for (int y=-3; y<=-1; y++) block(x,y,z,Blocks.AIR);
                 }
                 block(0,-1,0,Blocks.STONE);
                 block(3,-1,0,Blocks.STONE);
                 block(3,-1,3,Blocks.STONE);
+                // The opened panel must be parallel to the second jump. An
+                // east-facing door opens across that flight corridor.
                 level.setBlockAndUpdate(p(3,0,0), Blocks.OAK_DOOR.defaultBlockState()
                         .setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER)
-                        .setValue(DoorBlock.FACING, Direction.EAST));
+                        .setValue(DoorBlock.HINGE, DoorHingeSide.RIGHT)
+                        .setValue(DoorBlock.FACING, Direction.NORTH));
                 level.setBlockAndUpdate(p(3,1,0), Blocks.OAK_DOOR.defaultBlockState()
                         .setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER)
-                        .setValue(DoorBlock.FACING, Direction.EAST));
+                        .setValue(DoorBlock.HINGE, DoorHingeSide.RIGHT)
+                        .setValue(DoorBlock.FACING, Direction.NORTH));
                 navigation = bot.navigator().goTo(
                         new NavigationGoal.PositionGoal(new Vec3(1027.5,200.0,1027.5),0.2),
                         new NavigationPolicy(false,false,false,false,20_000,128,8,0,0));

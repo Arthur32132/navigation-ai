@@ -32,6 +32,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
     private final BotRuntime runtime;
     private final BotHandleImpl owner;
     private GatherTaskImpl task;
+    private long startGeneration;
 
     ResourceCollectorImpl(BotRuntime runtime, BotHandleImpl owner) {
         this.runtime = runtime;
@@ -41,11 +42,25 @@ final class ResourceCollectorImpl implements ResourceCollector {
     @Override
     public GatherTask gather(GatherRequest request, GatherPolicy policy) {
         runtime.ensureServerThread();
+        owner.ensureActive();
+        java.util.Objects.requireNonNull(request, "request");
+        java.util.Objects.requireNonNull(policy, "policy");
+        long generation = ++startGeneration;
         cancel();
+        if (generation != startGeneration) return superseded(request, policy);
         owner.navigator().cancel();
+        if (generation != startGeneration) return superseded(request, policy);
         owner.minerImpl().cancel();
+        if (generation != startGeneration) return superseded(request, policy);
+        owner.ensureActive();
         task = new GatherTaskImpl(request, policy);
         return task;
+    }
+
+    private GatherTask superseded(GatherRequest request, GatherPolicy policy) {
+        GatherTaskImpl cancelled = new GatherTaskImpl(request, policy);
+        cancelled.cancel();
+        return cancelled;
     }
 
     @Override public GatherStatus status() { return task == null ? GatherStatus.IDLE : task.status; }
@@ -85,27 +100,34 @@ final class ResourceCollectorImpl implements ResourceCollector {
                 clearTarget(current);
             }
         }
-        if (current.candidates.isEmpty()) {
-            ServerPlayer player = owner.player();
-            BlockPos origin = player.blockPosition();
+        if (!current.scanComplete) {
             int radius = current.policy.radius();
-            List<BlockPos> found = new ArrayList<>();
-            for (int x = origin.getX() - radius; x <= origin.getX() + radius; x++) {
-                for (int y = origin.getY() - radius; y <= origin.getY() + radius; y++) {
-                    for (int z = origin.getZ() - radius; z <= origin.getZ() + radius; z++) {
-                        BlockPos pos = new BlockPos(x, y, z);
-                        if (level.hasChunkAt(pos) && current.request.blocks().contains(level.getBlockState(pos).getBlock())) found.add(pos);
-                    }
+            if (current.scanOrigin == null) current.scanOrigin = owner.player().blockPosition();
+            BlockPos origin = current.scanOrigin;
+            int side = radius * 2 + 1;
+            int volume = side * side * side;
+            int cells = runtime.acquireResourceScanCells(512);
+            long deadline = runtime.planningDeadline();
+            for (int scanned = 0; scanned < cells && current.scanIndex < volume; scanned++) {
+                if (System.nanoTime() >= deadline) break;
+                int index = current.scanIndex++;
+                BlockPos pos = origin.offset(index / (side * side) - radius,
+                        index / side % side - radius, index % side - radius);
+                if (level.hasChunkAt(pos) && current.request.blocks().contains(level.getBlockState(pos).getBlock())) {
+                    current.candidates.add(pos);
                 }
             }
-            found.sort(Comparator.comparingDouble(pos -> pos.distSqr(origin)));
-            current.candidates.addAll(found);
+            if (current.scanIndex < volume) return;
+            current.scanComplete = true;
         }
-        while (current.candidateIndex < current.candidates.size()) {
-            BlockPos target = current.candidates.get(current.candidateIndex++);
+        int examined = 0;
+        long deadline = runtime.planningDeadline();
+        while (!current.candidates.isEmpty() && examined++ < 512 && System.nanoTime() < deadline) {
+            BlockPos target = current.candidates.remove();
             if (!current.request.blocks().contains(level.getBlockState(target).getBlock())) continue;
             List<BlockPos> standingPositions = findStandingPositions(level, target);
             if (standingPositions.isEmpty()) continue;
+            if (!runtime.reserveResource(level, target, current)) continue;
             current.target = target;
             current.standingPositions = standingPositions;
             current.standingIndex = 0;
@@ -114,6 +136,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
             current.attemptsForBlock++;
             return;
         }
+        if (!current.candidates.isEmpty()) return;
         current.fail(current.brokenBlocks == 0
                 ? (current.lastFailureReason == null ? "no_resources" : current.lastFailureReason)
                 : "resources_exhausted");
@@ -129,6 +152,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
     }
 
     private void clearTarget(GatherTaskImpl current) {
+        runtime.releaseResources(current);
         current.target = null;
         current.stand = null;
         current.standingPositions = List.of();
@@ -224,7 +248,12 @@ final class ResourceCollectorImpl implements ResourceCollector {
         private final GatherPolicy policy;
         private final CompletableFuture<GatherResult> completion = new CompletableFuture<>();
         private final AtomicBoolean cancelled = new AtomicBoolean();
-        private final List<BlockPos> candidates = new ArrayList<>();
+        private BlockPos scanOrigin;
+        private final java.util.PriorityQueue<BlockPos> candidates = new java.util.PriorityQueue<>(
+                Comparator.<BlockPos>comparingDouble(pos -> pos.distSqr(scanOrigin))
+                        .thenComparingInt(BlockPos::getX).thenComparingInt(BlockPos::getY).thenComparingInt(BlockPos::getZ));
+        private int scanIndex;
+        private boolean scanComplete;
         private final long started = System.nanoTime();
         private GatherStatus status = GatherStatus.RUNNING;
         private GatherPhase phase = GatherPhase.SEARCHING;
@@ -233,7 +262,6 @@ final class ResourceCollectorImpl implements ResourceCollector {
         private List<BlockPos> standingPositions = List.of();
         private NavigationTask navigation;
         private MiningTask mining;
-        private int candidateIndex;
         private int standingIndex;
         private int attemptsForBlock;
         private int ticks;
@@ -255,10 +283,11 @@ final class ResourceCollectorImpl implements ResourceCollector {
         @Override public void cancel() {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == GatherStatus.RUNNING) {
-                if (navigation != null) navigation.cancel();
-                if (mining != null) mining.cancel();
                 status = GatherStatus.CANCELLED;
                 phase = GatherPhase.DONE;
+                runtime.releaseResources(this);
+                if (navigation != null) navigation.cancel();
+                if (mining != null) mining.cancel();
                 completion.complete(new GatherResult(status, "cancelled", collected, brokenBlocks, System.nanoTime() - started));
             }
         }
@@ -266,14 +295,16 @@ final class ResourceCollectorImpl implements ResourceCollector {
             if (status != GatherStatus.RUNNING) return;
             status = GatherStatus.SUCCESS;
             phase = GatherPhase.DONE;
+            runtime.releaseResources(this);
             completion.complete(new GatherResult(status, reason, collected, brokenBlocks, System.nanoTime() - started));
         }
         private void fail(String reason) {
             if (status != GatherStatus.RUNNING) return;
-            if (navigation != null) navigation.cancel();
-            if (mining != null) mining.cancel();
             status = GatherStatus.FAILED;
             phase = GatherPhase.DONE;
+            runtime.releaseResources(this);
+            if (navigation != null) navigation.cancel();
+            if (mining != null) mining.cancel();
             completion.complete(new GatherResult(status, reason, collected, brokenBlocks, System.nanoTime() - started));
         }
     }

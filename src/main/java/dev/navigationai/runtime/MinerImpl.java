@@ -19,6 +19,7 @@ final class MinerImpl implements Miner {
     private final BotRuntime runtime;
     private final BotHandleImpl owner;
     private MiningTaskImpl task;
+    private long startGeneration;
 
     MinerImpl(BotRuntime runtime, BotHandleImpl owner) {
         this.runtime = runtime;
@@ -37,50 +38,63 @@ final class MinerImpl implements Miner {
     }
 
     private MiningTask breakBlock(BlockPos position, boolean cancelNavigation) {
+        java.util.Objects.requireNonNull(position, "position");
+        owner.ensureActive();
+        long generation = ++startGeneration;
         cancel();
+        if (generation != startGeneration) return superseded(position);
         if (cancelNavigation) owner.navigator().cancel();
+        if (generation != startGeneration) return superseded(position);
+        owner.ensureActive();
         task = new MiningTaskImpl(position.immutable());
         return task;
+    }
+
+    private MiningTask superseded(BlockPos position) {
+        MiningTaskImpl cancelled = new MiningTaskImpl(position.immutable());
+        cancelled.cancel();
+        return cancelled;
     }
 
     @Override public MiningStatus status() { return task == null ? MiningStatus.IDLE : task.status; }
     @Override public MiningTask task() { return task; }
 
     void tick() {
-        if (task == null || task.status != MiningStatus.RUNNING) return;
-        task.ticks++;
+        MiningTaskImpl current = task;
+        if (current == null || current.status != MiningStatus.RUNNING) return;
+        current.ticks++;
         ServerPlayer player = owner.player();
         ServerLevel level = (ServerLevel) player.level();
-        BlockPos position = task.position;
+        BlockPos position = current.position;
         BlockState state = level.getBlockState(position);
-        if (state.isAir()) { task.fail("block_missing"); return; }
-        if (!player.mayInteract(level, position)) { task.fail("not_allowed"); return; }
-        if (player.distanceToSqr(Vec3.atCenterOf(position)) > 36.0) { task.fail("out_of_range"); return; }
+        if (state.isAir()) { current.fail("block_missing"); return; }
+        if (!player.mayInteract(level, position)) { current.fail("not_allowed"); return; }
+        if (player.distanceToSqr(Vec3.atCenterOf(position)) > 36.0) { current.fail("out_of_range"); return; }
         lookAt(player, position);
-        if (task.ticks == 1) {
+        if (current.ticks == 1) {
             int selected = selectTool(player, state);
-            if (selected < 0) { task.fail("no_suitable_tool"); return; }
-            task.originalSlot = player.getInventory().getSelectedSlot();
-            task.toolSlot = selected;
-            selectToolSlot(player, selected);
-            task.toolPrepared = true;
+            if (selected < 0) { current.fail("no_suitable_tool"); return; }
+            current.originalSlot = player.getInventory().getSelectedSlot();
+            current.toolSlot = selected;
+            selectToolSlot(player, selected, current);
+            current.toolPrepared = true;
         }
         float destroyProgress = state.getDestroyProgress(player, level, position);
         if (destroyProgress <= 0.0f) {
-            task.fail("cannot_break");
+            current.fail("cannot_break");
             return;
         }
-        task.progress += destroyProgress;
-        if (task.progress < 1.0f) {
+        current.progress += destroyProgress;
+        if (current.progress < 1.0f) {
             player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
             return;
         }
         boolean broken = player.gameMode.destroyBlock(position);
-        restoreToolSlot(player);
+        restoreToolSlot(player, current);
         // A waterlogged block leaves water behind when destroyed. The old
         // block must be gone, but the position need not become air.
-        if (broken && level.getBlockState(position).getBlock() != state.getBlock()) task.complete();
-        else task.fail("break_rejected");
+        if (broken && level.getBlockState(position).getBlock() != state.getBlock()) current.complete();
+        else current.fail("break_rejected");
     }
 
     void cancel() {
@@ -132,7 +146,7 @@ final class MinerImpl implements Miner {
         return efficiency > 0 ? speed + efficiency * efficiency + 1.0f : speed;
     }
 
-    private void selectToolSlot(ServerPlayer player, int slot) {
+    private void selectToolSlot(ServerPlayer player, int slot, MiningTaskImpl current) {
         Inventory inventory = player.getInventory();
         int selected = inventory.getSelectedSlot();
         if (slot >= Inventory.getSelectionSize()) {
@@ -140,14 +154,14 @@ final class MinerImpl implements Miner {
             ItemStack tool = inventory.getItem(slot).copy();
             inventory.setItem(selected, tool);
             inventory.setItem(slot, held);
-            task.swapped = true;
+            current.swapped = true;
         }
         else {
             inventory.setSelectedSlot(slot);
         }
     }
 
-    private void restoreToolSlot(ServerPlayer player) {
+    private void restoreToolSlot(ServerPlayer player, MiningTaskImpl task) {
         if (!task.toolPrepared || task.toolRestored) return;
         Inventory inventory = player.getInventory();
         int selected = task.originalSlot;
@@ -182,7 +196,7 @@ final class MinerImpl implements Miner {
         @Override public void cancel() {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == MiningStatus.RUNNING) {
-                restoreToolSlot(playerForRestore());
+                restoreToolSlot(playerForRestore(), this);
                 status = MiningStatus.CANCELLED;
                 completion.complete(MiningResult.cancelled());
             }
@@ -195,7 +209,7 @@ final class MinerImpl implements Miner {
         }
         private void fail(String reason) {
             if (status != MiningStatus.RUNNING) return;
-            restoreToolSlot(owner.player());
+            restoreToolSlot(owner.player(), this);
             status = MiningStatus.FAILED;
             completion.complete(MiningResult.failure(reason, System.nanoTime() - started));
         }

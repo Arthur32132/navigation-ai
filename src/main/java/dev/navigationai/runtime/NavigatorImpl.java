@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
@@ -56,7 +57,6 @@ final class NavigatorImpl implements Navigator {
     private NavigationTaskImpl task;
     private List<BlockPos> path = List.of();
     private int pathIndex;
-    private long pathStartedNanos;
     private long requestGeneration;
     private double lastTargetDistance = Double.POSITIVE_INFINITY;
     private Vec3 followPlanPosition;
@@ -81,6 +81,8 @@ final class NavigatorImpl implements Navigator {
     private int budgetDeferrals;
     private final List<PlacedAction> placedActions = new ArrayList<>();
     private boolean waitingForLanding;
+    private boolean backgroundPlanning;
+    private int lastFollowPathTick;
 
     private static final int MAX_BUDGET_DEFERRALS = 3;
     private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
@@ -92,6 +94,7 @@ final class NavigatorImpl implements Navigator {
 
     @Override public NavigationTask goTo(NavigationGoal goal, NavigationPolicy policy) {
         runtime.ensureServerThread();
+        owner.ensureActive();
         if (goal == null || policy == null) throw new NullPointerException("goal and policy");
         return startNavigation(goal, policy, 0);
     }
@@ -114,6 +117,7 @@ final class NavigatorImpl implements Navigator {
             superseded.cancel();
             return superseded;
         }
+        owner.ensureActive();
         this.rootGoal = requestedGoal;
         this.sequence = flatten(requestedGoal);
         if (initialSequenceIndex < 0 || initialSequenceIndex >= sequence.size()) {
@@ -162,6 +166,7 @@ final class NavigatorImpl implements Navigator {
         cancelSearchFuture();
         nextHazardRepathNanos = 0L;
         waitingForLanding = false;
+        backgroundPlanning = false;
     }
     /** Stops server-side inputs and workers while retaining resumable navigation state for shutdown persistence. */
     void shutdown() {
@@ -407,7 +412,7 @@ final class NavigatorImpl implements Navigator {
         if (task.status() == NavigationStatus.COMPUTING) holdPositionWhilePlanning();
         if (pendingCapture != null) {
             advanceCapture();
-            return;
+            if (task.status() == NavigationStatus.COMPUTING) return;
         }
         if (waitingForFrontierChunks) {
             if (runtime.server().getTickCount() < nextFrontierRetryTick) return;
@@ -417,8 +422,8 @@ final class NavigatorImpl implements Navigator {
         }
         if (planningDeferred) {
             planningDeferred = false;
-            requestPath();
-            if (planningDeferred || task.status() == NavigationStatus.COMPUTING) return;
+            requestPath(backgroundPlanning);
+            if (task.status() == NavigationStatus.COMPUTING) return;
         }
         if (navigationMining != null) {
             if (navigationMining.status() == MiningStatus.RUNNING) return;
@@ -442,12 +447,12 @@ final class NavigatorImpl implements Navigator {
                 owner.actions().stop();
                 path = List.of();
                 pathIndex = 0;
-                if (shouldRepathFollow(follow)) requestPath();
                 return;
             }
             if (task.status() == NavigationStatus.RUNNING
-                    && (path.isEmpty() || shouldRepathFollow(follow))) {
-                requestPath();
+                    && !isPlanning() && (path.isEmpty()
+                    || (runtime.server().getTickCount() - lastFollowPathTick >= 20 && shouldRepathFollow(follow)))) {
+                requestPath(!path.isEmpty() && pathIndex < path.size());
             }
         } else if (reachedGoal()) {
             finishSuccess();
@@ -456,7 +461,7 @@ final class NavigatorImpl implements Navigator {
         if (task.status() != NavigationStatus.RUNNING || path.isEmpty()) return;
         if (pathIndex >= path.size()) {
             if (goal instanceof NavigationGoal.FollowGoal) {
-                requestPath();
+                requestNextFollowPath();
             } else if (reachedGoal()) {
                 finishSuccess();
             } else if (finalPlanningSegment) {
@@ -491,13 +496,18 @@ final class NavigatorImpl implements Navigator {
             pathIndex++;
             lastTargetDistance = Double.POSITIVE_INFINITY;
             if (pathIndex >= path.size()) {
-                if (goal instanceof NavigationGoal.FollowGoal) requestPath();
+                if (goal instanceof NavigationGoal.FollowGoal) requestNextFollowPath();
                 else if (reachedGoal()) finishSuccess();
                 else if (finalPlanningSegment) tickFinalApproach();
                 else requestPath();
                 return;
             }
             next = path.get(pathIndex);
+            if (hasDynamicObstacle(next) || hasNewStaticHazard(next) || hasChangedObstacle(next)) {
+                requestHazardRepath();
+                return;
+            }
+            if (!prepareTransition(next)) return;
             target = Vec3.atCenterOf(next);
             dx = target.x - owner.player().getX(); dz = target.z - owner.player().getZ();
         }
@@ -523,7 +533,8 @@ final class NavigatorImpl implements Navigator {
         // The snapshot normally rejects this transition. Recheck the takeoff
         // and landing headroom against the live world too: a stale route must
         // never make the fake player repeatedly jump into a low ceiling.
-        if ((jumpGap && (sneak || !hasJumpHeadroom(level, edgeStart) || !hasJumpHeadroom(level, next)))
+        if ((jumpGap && (sneak || !hasJumpHeadroom(level, edgeStart) || !hasJumpHeadroom(level, next)
+                || !hasLiveJumpClearance(level, edgeStart, next)))
                 || (stepUp && (sneak || !hasJumpHeadroom(level, currentBlock) || !hasJumpHeadroom(level, next)))) {
             requestHazardRepath();
             return;
@@ -567,24 +578,47 @@ final class NavigatorImpl implements Navigator {
         }
     }
 
-    private void requestPath() {
+    private boolean isPlanning() {
+        return pendingCapture != null || searchFuture != null || planningDeferred;
+    }
+
+    private void requestNextFollowPath() {
+        if (isPlanning()) {
+            task.status = NavigationStatus.COMPUTING;
+            backgroundPlanning = false;
+            owner.actions().stop();
+            brakeHorizontal();
+        } else requestPath();
+    }
+
+    private void brakeHorizontal() {
+        if (owner.player().onGround() || owner.player().isInWater()) {
+            Vec3 motion = owner.player().getDeltaMovement();
+            owner.player().setDeltaMovement(0.0D, motion.y, 0.0D);
+        }
+    }
+
+    private void requestPath() { requestPath(false); }
+
+    private void requestPath(boolean keepFollowingPath) {
         if (task == null || task.cancelled.get() || isTerminal(task.status())) return;
         boolean replan = !planningDeferred && (plannedSnapshot != null || !path.isEmpty());
         if (replan) runtime.recordReplan();
         long generation = ++requestGeneration;
         cancelSearchFuture();
         pendingCapture = null;
-        task.status = NavigationStatus.COMPUTING;
-        path = List.of(); pathIndex = 0;
-        owner.actions().stop();
+        backgroundPlanning = keepFollowingPath && task.status() == NavigationStatus.RUNNING
+                && pathIndex < path.size();
+        if (!backgroundPlanning) {
+            task.status = NavigationStatus.COMPUTING;
+            path = List.of(); pathIndex = 0;
+            owner.actions().stop();
         // A frontier path can end beside a gap. Input stops immediately, but
         // sprint momentum otherwise carries the player off that ledge while
         // the next snapshot is being captured over several ticks.
-        if (owner.player().onGround() || owner.player().isInWater()) {
-            Vec3 motion = owner.player().getDeltaMovement();
-            owner.player().setDeltaMovement(0.0D, motion.y, 0.0D);
+            brakeHorizontal();
+            holdPositionWhilePlanning();
         }
-        holdPositionWhilePlanning();
         if (runtime.shouldDeferPathSearch(searchPriority())) {
             runtime.recordBackpressureDeferral();
             planningDeferred = true;
@@ -600,7 +634,6 @@ final class NavigatorImpl implements Navigator {
         // be treated as a request to walk into the target block (which may be
         // above the bot or otherwise non-walkable).
         if (goal instanceof NavigationGoal.LookAtGoal lookAt) {
-            pathStartedNanos = System.nanoTime();
             lookAt(lookAt.position());
             finishSuccess();
             return;
@@ -623,7 +656,6 @@ final class NavigatorImpl implements Navigator {
         player = owner.player();
         ServerLevel level = (ServerLevel)player.level();
         if (!(goal instanceof NavigationGoal.FollowGoal) && reachedGoal()) {
-            pathStartedNanos = System.nanoTime();
             finishSuccess();
             return;
         }
@@ -681,7 +713,7 @@ final class NavigatorImpl implements Navigator {
         long captureStepStarted = System.nanoTime();
         boolean complete;
         try {
-            complete = pendingCapture.step(cells);
+            complete = pendingCapture.step(cells, runtime.planningDeadline());
         } finally {
             captureNanos += System.nanoTime() - captureStepStarted;
         }
@@ -695,7 +727,7 @@ final class NavigatorImpl implements Navigator {
         GridPos current = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(),
                 player.blockPosition().getZ());
         if (!current.equals(captureStart) && !snapshot.passable(current)) {
-            requestPath();
+            requestPath(backgroundPlanning);
             return;
         }
         // Water currents and buoyancy can move a fake player while a snapshot
@@ -704,23 +736,22 @@ final class NavigatorImpl implements Navigator {
         GridPos startPos = current;
         GridPos desired = captureGoal;
         long generation = captureGeneration;
-        plannedSnapshot = snapshot;
-        GridPos searchGoal = selectSearchGoal(snapshot, desired);
-        long started = System.nanoTime();
-        pathStartedNanos = started;
+        Set<GridPos> searchGoals = selectSearchGoals(snapshot, desired);
+        NavigationPolicy searchPolicy = policy;
         try {
             searchFuture = runtime.pathScheduler().submit(searchPriority(), () -> {
                 long searchStarted = System.nanoTime();
-                GridPath result = GridPathfinder.find(snapshot, startPos, searchGoal, policy,
+                GridPath result = GridPathfinder.findToAny(snapshot, startPos, searchGoals, desired, searchPolicy,
                         runtime.pathNodeBudget()::tryConsume, true);
                 runtime.recordPathSearch(result.nodesVisited(), System.nanoTime() - searchStarted);
-                runtime.server().execute(() -> applyPath(result, started, generation));
+                runtime.server().execute(() -> applyPath(result, snapshot, generation));
             });
             runtime.recordPathSearchSubmitted();
         } catch (RejectedExecutionException rejected) {
             searchFuture = null;
             runtime.recordPathSearchRejected();
-            task.fail("search_queue_full", 0);
+            if (!backgroundPlanning) task.fail("search_queue_full", resultNodesVisited());
+            backgroundPlanning = false;
         }
     }
 
@@ -736,14 +767,15 @@ final class NavigatorImpl implements Navigator {
      * snapshot, leave the real goal untouched so the frontier planner can
      * advance toward it and make this decision later.
      */
-    private GridPos selectSearchGoal(WorldSnapshot snapshot, GridPos desired) {
-        if (!(goal instanceof NavigationGoal.BlockGoal) || snapshot.passable(desired)) return desired;
+    private Set<GridPos> selectSearchGoals(WorldSnapshot snapshot, GridPos desired) {
+        if (!(goal instanceof NavigationGoal.BlockGoal) || snapshot.passable(desired)) return Set.of(desired);
         List<GridPos> candidates = List.of(
                 desired.add(0, 1, 0), desired.add(0, -1, 0),
                 desired.add(1, 0, 0), desired.add(-1, 0, 0),
                 desired.add(0, 0, 1), desired.add(0, 0, -1));
-        for (GridPos candidate : candidates) if (snapshot.passable(candidate)) return candidate;
-        return desired;
+        Set<GridPos> endpoints = new HashSet<>();
+        for (GridPos candidate : candidates) if (snapshot.passable(candidate)) endpoints.add(candidate);
+        return endpoints.isEmpty() ? Set.of(desired) : Set.copyOf(endpoints);
     }
 
     private void cancelSearchFuture() {
@@ -801,8 +833,8 @@ final class NavigatorImpl implements Navigator {
         if (isOpenDoorOrTrapdoor(state)) return true;
         var stateShape = state.getCollisionShape(level, next);
         if (!stateShape.isEmpty() && stateShape.max(net.minecraft.core.Direction.Axis.Y) <= 0.5D
-                && (hasClearanceAbove(level, next, Pose.STANDING)
-                || hasClearanceAbove(level, next, Pose.CROUCHING))) return true;
+                && (hasBodyClearance(level, next, Pose.STANDING)
+                || hasBodyClearance(level, next, Pose.CROUCHING))) return true;
         if (!stateShape.isEmpty()) {
             if (!policy.allowBreaking() || next.equals(player.blockPosition())) {
                 task.fail("obstacle_requires_breaking", resultNodesVisited());
@@ -929,16 +961,33 @@ final class NavigatorImpl implements Navigator {
                 && hasBodyClearance(level, head, Pose.STANDING);
     }
 
+    private boolean hasLiveJumpClearance(ServerLevel level, BlockPos from, BlockPos to) {
+        var dimensions = owner.player().getDimensions(Pose.STANDING);
+        Vec3 start = new Vec3(from.getX() + 0.5D, from.getY() + NavigationGeometry.feetOffset(level, from),
+                from.getZ() + 0.5D);
+        Vec3 end = new Vec3(to.getX() + 0.5D, to.getY() + NavigationGeometry.feetOffset(level, to),
+                to.getZ() + 0.5D);
+        return NavigationGeometry.clearJump(start, end, dimensions.width(), dimensions.height(), box -> {
+            if (!level.noBlockCollision(owner.player(), box)) return false;
+            for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, box)) {
+                if (entity != owner.player() && entity.isAlive() && !entity.isSpectator()
+                        && !(goal instanceof NavigationGoal.FollowGoal follow && entity == follow.target())) return false;
+            }
+            return true;
+        }, pos -> NavigationSafety.dangerous(level, pos) || isWater(level, pos));
+    }
+
     private boolean requiresSneak(BlockPos position) {
-        if (plannedSnapshot == null) return false;
-        return plannedSnapshot.requiresSneak(new GridPos(position.getX(), position.getY(), position.getZ()));
+        ServerLevel level = (ServerLevel) owner.player().level();
+        return !hasBodyClearance(level, position, Pose.STANDING)
+                && hasBodyClearance(level, position, Pose.CROUCHING);
     }
 
     private boolean hasBodyClearance(ServerLevel level, BlockPos position, Pose pose) {
-        BlockState state = level.getBlockState(position);
-        var shape = state.getCollisionShape(level, position);
-        if (!shape.isEmpty() && !hasCenteredOpenPassage(state, shape, 1.0D)) return false;
-        return hasClearanceAbove(level, position, pose);
+        var dimensions = owner.player().getDimensions(pose);
+        double margin = pose == Pose.CROUCHING ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        return NavigationGeometry.bodyFits(level, position, NavigationGeometry.feetOffset(level, position),
+                dimensions.width(), dimensions.height() + margin, false);
     }
 
     private boolean hasClearanceAbove(ServerLevel level, BlockPos position, Pose pose) {
@@ -946,10 +995,11 @@ final class NavigatorImpl implements Navigator {
         var aboveShape = above.getCollisionShape(level, position.above());
         double height = owner.player().getDimensions(pose).height();
         double margin = pose == Pose.CROUCHING ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        double offset = NavigationGeometry.feetOffset(level, position);
         return aboveShape.isEmpty()
-                || hasCenteredOpenPassage(above, aboveShape, height + margin - 1.0D)
+                || hasCenteredOpenPassage(above, aboveShape, height + offset + margin - 1.0D)
                 || 1.0D + aboveShape.min(net.minecraft.core.Direction.Axis.Y)
-                >= height + margin;
+                >= height + offset + margin;
     }
 
     private boolean hasCenteredOpenPassage(BlockState state,
@@ -978,25 +1028,7 @@ final class NavigatorImpl implements Navigator {
     private boolean hasNewStaticHazard(BlockPos position) {
         if (plannedSnapshot == null || policy.dangerCost() <= 0.0) return false;
         ServerLevel level = (ServerLevel) owner.player().level();
-        BlockState state = level.getBlockState(position);
-        boolean hazard = state.is(net.minecraft.world.level.block.Blocks.FIRE)
-                || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
-                || state.is(net.minecraft.world.level.block.Blocks.CAMPFIRE)
-                || state.is(net.minecraft.world.level.block.Blocks.SOUL_CAMPFIRE)
-                || state.is(net.minecraft.world.level.block.Blocks.MAGMA_BLOCK)
-                || state.is(net.minecraft.world.level.block.Blocks.CACTUS)
-                || level.getFluidState(position).getType() == net.minecraft.world.level.material.Fluids.LAVA
-                || level.getFluidState(position).getType() == net.minecraft.world.level.material.Fluids.FLOWING_LAVA
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.FIRE)
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.CAMPFIRE)
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.SOUL_CAMPFIRE)
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.MAGMA_BLOCK)
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.CACTUS)
-                || level.getBlockState(position.below()).is(net.minecraft.world.level.block.Blocks.POWDER_SNOW)
-                || level.getFluidState(position.below()).getType() == net.minecraft.world.level.material.Fluids.LAVA
-                || level.getFluidState(position.below()).getType() == net.minecraft.world.level.material.Fluids.FLOWING_LAVA;
-        return hazard && !plannedSnapshot.dangerous(new GridPos(position.getX(), position.getY(), position.getZ()));
+        return NavigationSafety.dangerous(level, position) && !plannedSnapshot.dangerous(new GridPos(position.getX(), position.getY(), position.getZ()));
     }
 
     private boolean hasChangedObstacle(BlockPos position) {
@@ -1042,8 +1074,8 @@ final class NavigatorImpl implements Navigator {
     private boolean isLowSurface(ServerLevel level, BlockPos position, BlockState state) {
         return !state.getCollisionShape(level, position).isEmpty()
                 && state.getCollisionShape(level, position).max(net.minecraft.core.Direction.Axis.Y) <= 0.5D
-                && (hasClearanceAbove(level, position, Pose.STANDING)
-                || hasClearanceAbove(level, position, Pose.CROUCHING));
+                && (hasBodyClearance(level, position, Pose.STANDING)
+                || hasBodyClearance(level, position, Pose.CROUCHING));
     }
 
     private boolean isOpenDoorOrTrapdoor(BlockState state) {
@@ -1068,6 +1100,8 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean requestHazardRepath() {
+        owner.actions().stop();
+        brakeHorizontal();
         long now = System.nanoTime();
         if (now < nextHazardRepathNanos) return false;
         nextHazardRepathNanos = now + 250_000_000L;
@@ -1090,14 +1124,55 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void tickFinalApproach() {
+        if (!stableForArrival(owner.player())) {
+            // The last drop node can be passed horizontally before landing.
+            // Its airborne cell needs no bridge; let vanilla finish the fall.
+            owner.actions().stop();
+            waitingForLanding = true;
+            return;
+        }
         Vec3 target = goalPoint();
         Vec3 current = owner.player().position();
         double dx = target.x - current.x;
         double dz = target.z - current.z;
+        ServerPlayer player = owner.player();
+        ServerLevel level = (ServerLevel) player.level();
+        double horizontal = Math.hypot(dx, dz);
+        double step = Math.min(0.2D, horizontal);
+        Vec3 ahead = horizontal < 1.0E-6D ? current
+                : current.add(dx / horizontal * step, 0, dz / horizontal * step);
+        BlockPos cell = BlockPos.containing(ahead);
+        boolean sneak = requiresSneak(player.blockPosition()) || requiresSneak(cell);
+        Pose pose = sneak ? Pose.CROUCHING : Pose.STANDING;
+        var dimensions = player.getDimensions(pose);
+        AABB aheadBody = NavigationGeometry.body(ahead.x, ahead.y, ahead.z,
+                dimensions.width(), dimensions.height());
+        for (int x = (int) Math.floor(aheadBody.minX); x <= (int) Math.floor(aheadBody.maxX - 1.0E-6D); x++) {
+            for (int z = (int) Math.floor(aheadBody.minZ); z <= (int) Math.floor(aheadBody.maxZ - 1.0E-6D); z++) {
+                BlockPos touched = new BlockPos(x, (int) Math.floor(ahead.y), z);
+                if (isLava(level, touched) || (!policy.allowWater() && isWater(level, touched))
+                        || (policy.dangerCost() > 0.0D && NavigationSafety.dangerous(level, touched))) {
+                    requestHazardRepath();
+                    return;
+                }
+            }
+        }
+        if (hasDynamicObstacle(cell) || hasNewStaticHazard(cell) || hasChangedObstacle(cell)
+                || !level.noBlockCollision(player, aheadBody)
+                || isLava(level, cell) || (!policy.allowWater() && isWater(level, cell))) {
+            requestHazardRepath();
+            return;
+        }
+        if (!prepareTransition(cell)) return;
         float yaw = (float)(Math.atan2(-dx, dz) * 180.0 / Math.PI);
         owner.actions().look(yaw, 0);
-        boolean jump = target.y > current.y + 0.35 && owner.player().onGround();
-        owner.actions().setMovement(0, 1, jump, true, false);
+        boolean jump = target.y > current.y + 0.6D && player.onGround()
+                && !sneak && hasJumpHeadroom(level, player.blockPosition());
+        boolean swimming = policy.allowWater() && player.isInWater();
+        player.setSwimming(swimming);
+        if (horizontal < 0.6D && player.onGround()) brakeHorizontal();
+        float forward = (float) Math.min(1.0D, Math.max(0.15D, horizontal * 1.5D));
+        owner.actions().setMovement(0, forward, jump || swimming && target.y > current.y, false, sneak);
         boolean progressed = progressedToward(target);
         if (progressed) {
             ticksWithoutProgress = 0;
@@ -1122,8 +1197,19 @@ final class NavigatorImpl implements Navigator {
         if (goal instanceof NavigationGoal.ReturnGoal returnGoal) return returnGoal.position();
         if (goal instanceof NavigationGoal.DimensionGoal dimension) return dimension.position();
         if (goal instanceof NavigationGoal.BlockGoal block) {
-            return new Vec3(block.position().getX() + 0.5, block.position().getY() + 0.5,
-                    block.position().getZ() + 0.5);
+            Vec3 center = Vec3.atCenterOf(block.position());
+            Vec3 current = owner.player().position();
+            double horizontal = Math.hypot(center.x - current.x, center.z - current.z);
+            double vertical = center.y - current.y;
+            if (horizontal > 1.0E-6D && Math.abs(vertical) <= block.tolerance()) {
+                // Approach the boundary of the arrival sphere, which can be
+                // outside a solid target. Looking ahead towards its centre
+                // otherwise rejects a safe final step into the tolerance.
+                double radius = Math.sqrt(Math.max(0, block.tolerance() * block.tolerance() - vertical * vertical));
+                return center.add((current.x - center.x) / horizontal * radius, 0,
+                        (current.z - center.z) / horizontal * radius);
+            }
+            return center;
         }
         return owner.player().position();
     }
@@ -1165,11 +1251,10 @@ final class NavigatorImpl implements Navigator {
         if (!existing.canBeReplaced() || !level.getFluidState(position).isEmpty()) return false;
         for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
             ItemStack stack = player.getInventory().getItem(slot);
-            if (!(stack.getItem() instanceof BlockItem blockItem)) continue;
+            if (!NavigationSafety.buildingMaterial(stack, level, position)) continue;
+            BlockItem blockItem = (BlockItem) stack.getItem();
             Block block = blockItem.getBlock();
             var state = block.defaultBlockState();
-            if (!state.isSolid() || block instanceof net.minecraft.world.level.block.FallingBlock
-                    || !state.canSurvive(level, position)) continue;
             if (level.setBlock(position, state, 3)
                     && level.getBlockState(position).getBlock() == block) {
                 ItemStack returnedStack = stack.copy();
@@ -1205,9 +1290,7 @@ final class NavigatorImpl implements Navigator {
                     && owner.player().position().distanceTo(dimension.position()) <= dimension.tolerance();
         }
         if (goal instanceof NavigationGoal.BlockGoal block) {
-            Vec3 center = new Vec3(block.position().getX() + 0.5, block.position().getY() + 0.5,
-                    block.position().getZ() + 0.5);
-            return owner.player().position().distanceTo(center) <= block.tolerance();
+            return owner.player().position().distanceTo(Vec3.atCenterOf(block.position())) <= block.tolerance();
         }
         return false;
     }
@@ -1217,18 +1300,25 @@ final class NavigatorImpl implements Navigator {
                 || status == NavigationStatus.SUCCESS || status == NavigationStatus.STUCK;
     }
 
-    private int resultNodesVisited() { return path.size(); }
+    private int resultNodesVisited() { return task == null ? 0 : task.nodesVisited; }
 
-    private void applyPath(GridPath result, long started, long generation) {
+    private void applyPath(GridPath result, WorldSnapshot snapshot, long generation) {
         if (task == null || task.cancelled.get() || goal == null || isTerminal(task.status())) return;
         if (generation != requestGeneration) return;
+        searchFuture = null;
+        task.nodesVisited = (int) Math.min(Integer.MAX_VALUE, (long) task.nodesVisited + result.nodesVisited());
+        boolean keepOldPath = backgroundPlanning && task.status() == NavigationStatus.RUNNING
+                && pathIndex < path.size();
+        backgroundPlanning = false;
+        lastFollowPathTick = runtime.server().getTickCount();
+        if (keepOldPath && result.nodes().isEmpty()) return;
         // A global node budget may end a search after it has already produced
         // a usable frontier.  Execute that frontier first; only an empty
         // result should be deferred and retried.
         if (result.budgetExhausted() && result.nodes().isEmpty()) {
             runtime.recordNodeBudgetDeferral();
             if (++budgetDeferrals > MAX_BUDGET_DEFERRALS) {
-                task.fail("search_budget_exhausted", result.nodesVisited());
+                task.fail("search_budget_exhausted", resultNodesVisited());
                 return;
             }
             planningDeferred = true;
@@ -1241,8 +1331,8 @@ final class NavigatorImpl implements Navigator {
             // the server finishes loading the next chunk. Retrying on later
             // ticks lets normal player-driven chunk loading catch up instead
             // of turning a 40–60 block route into an immediate failure.
-            if (plannedSnapshot != null && plannedSnapshot.hasUnloadedChunks()) {
-                deferForFrontierChunks(result.nodesVisited());
+            if (snapshot.hasUnloadedChunks()) {
+                deferForFrontierChunks(resultNodesVisited());
                 return;
             }
             if (result.nodesVisited() > 0 && captureRadius < policy.snapshotRadius()) {
@@ -1251,18 +1341,23 @@ final class NavigatorImpl implements Navigator {
                 requestPath();
                 return;
             }
-            task.fail("unreachable", result.nodesVisited());
+            task.fail("unreachable", resultNodesVisited());
             return;
         }
         waitingForFrontierChunks = false;
         frontierChunkWaitAttempts = 0;
         if (result.nodes().size() - 1 > policy.maxPathLength()) {
-            task.fail("path_too_long", result.nodesVisited());
+            task.fail("path_too_long", resultNodesVisited());
             return;
         }
         ArrayList<BlockPos> converted = new ArrayList<>(result.nodes().size());
         for (GridPos pos : result.nodes()) converted.add(new BlockPos(pos.x(), pos.y(), pos.z()));
-        path = List.copyOf(converted); pathIndex = Math.min(1, path.size());
+        int joinIndex = converted.indexOf(owner.player().blockPosition());
+        // Never redirect a bot in mid-flight to a fresh plan whose start it has passed.
+        if (keepOldPath && (!stableForArrival(owner.player()) || joinIndex < 0)) return;
+        plannedSnapshot = snapshot;
+        path = List.copyOf(converted);
+        pathIndex = joinIndex >= 0 ? Math.min(joinIndex + 1, path.size()) : Math.min(1, path.size());
         finalPlanningSegment = result.goalReached();
         lastTargetDistance = Double.POSITIVE_INFINITY; ticksWithoutProgress = 0;
         task.status = NavigationStatus.RUNNING;
@@ -1302,8 +1397,9 @@ final class NavigatorImpl implements Navigator {
         waitingForFrontierChunks = false;
         frontierChunkWaitAttempts = 0;
         nextFrontierRetryTick = 0;
-        int nodes = path.size();
-        long duration = System.nanoTime() - pathStartedNanos;
+        int nodes = resultNodesVisited();
+        long duration = System.nanoTime() - task.startedNanos;
+        brakeHorizontal();
         path = List.of();
         placedActions.clear();
         task.complete(NavigationResult.success(nodes, duration));
@@ -1388,6 +1484,8 @@ final class NavigatorImpl implements Navigator {
         private volatile NavigationStatus status = NavigationStatus.IDLE;
         private final CompletableFuture<NavigationResult> completion = new CompletableFuture<>();
         private final AtomicBoolean cancelled = new AtomicBoolean();
+        private final long startedNanos = System.nanoTime();
+        private int nodesVisited;
         @Override public NavigationStatus status() { return status; }
         @Override public CompletableFuture<NavigationResult> completion() { return completion; }
         @Override public void cancel() {
@@ -1410,7 +1508,8 @@ final class NavigatorImpl implements Navigator {
                     NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
                     if (mining != null && mining.status() == MiningStatus.RUNNING) mining.cancel();
                 }
-                completion.complete(new NavigationResult(NavigationStatus.CANCELLED, "cancelled", 0, 0));
+                completion.complete(new NavigationResult(NavigationStatus.CANCELLED, "cancelled", nodesVisited,
+                        System.nanoTime() - startedNanos));
             }
         }
         void fail(String reason, int nodes) {
@@ -1424,7 +1523,7 @@ final class NavigatorImpl implements Navigator {
             NavigatorImpl.this.rollbackPlacedActions();
             NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
             cancelNavigationMining();
-            completion.complete(NavigationResult.failure(reason, nodes, System.nanoTime() - pathStartedNanos));
+            completion.complete(NavigationResult.failure(reason, nodesVisited, System.nanoTime() - startedNanos));
         }
         void stuck(int nodes) {
             owner.actions().stop();
@@ -1437,7 +1536,7 @@ final class NavigatorImpl implements Navigator {
             NavigatorImpl.this.rollbackPlacedActions();
             NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
             cancelNavigationMining();
-            completion.complete(NavigationResult.stuck(nodes, System.nanoTime() - pathStartedNanos));
+            completion.complete(NavigationResult.stuck(nodesVisited, System.nanoTime() - startedNanos));
         }
         void complete(NavigationResult result) { status = result.status(); completion.complete(result); }
     }

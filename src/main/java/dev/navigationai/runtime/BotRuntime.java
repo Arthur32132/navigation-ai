@@ -31,6 +31,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
@@ -76,6 +77,13 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private final Map<ChunkTicket, Integer> navigationTicketRefs = new ConcurrentHashMap<>();
     /** A failed load must never be followed by a write of partial state. */
     private boolean persistenceLoadFailed;
+    private int nextBotIndex;
+    private int planningBudgetTick = Integer.MIN_VALUE;
+    private long planningDeadlineNanos;
+    private long planningTimeBudgetNanos = 5_000_000L;
+    private int resourceScanTick = Integer.MIN_VALUE;
+    private int resourceScanCells;
+    private final Map<ResourceTarget, Object> resourceReservations = new java.util.HashMap<>();
 
     public BotRuntime(MinecraftServer server) {
         this.server = server;
@@ -103,6 +111,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
     boolean shouldDeferPathSearch(int priority) { return pathScheduler.shouldDefer(priority); }
 
     boolean tryAcquireSnapshotBudget() {
+        if (System.nanoTime() >= planningDeadline()) return false;
         int tick = server.getTickCount();
         if (tick != snapshotBudgetTick) {
             snapshotBudgetTick = tick;
@@ -114,6 +123,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
     }
 
     int acquireSnapshotCells(int requested) {
+        if (System.nanoTime() >= planningDeadline()) return 0;
         int tick = server.getTickCount();
         if (tick != snapshotCellsTick) {
             snapshotCellsTick = tick;
@@ -123,6 +133,32 @@ public final class BotRuntime implements BotService, AutoCloseable {
         snapshotCellsThisTick += granted;
         return granted;
     }
+
+    long planningDeadline() {
+        int tick = server.getTickCount();
+        if (tick != planningBudgetTick) {
+            planningBudgetTick = tick;
+            planningDeadlineNanos = System.nanoTime() + planningTimeBudgetNanos;
+        }
+        return planningDeadlineNanos;
+    }
+
+    int acquireResourceScanCells(int requested) {
+        if (System.nanoTime() >= planningDeadline()) return 0;
+        int tick = server.getTickCount();
+        if (tick != resourceScanTick) { resourceScanTick = tick; resourceScanCells = 0; }
+        int granted = Math.min(requested, 1_024 - resourceScanCells);
+        resourceScanCells += granted;
+        return granted;
+    }
+
+    boolean reserveResource(ServerLevel level, BlockPos pos, Object owner) {
+        ResourceTarget target = new ResourceTarget(level.dimension(), pos.immutable());
+        Object previous = resourceReservations.putIfAbsent(target, owner);
+        return previous == null || previous == owner;
+    }
+
+    void releaseResources(Object owner) { resourceReservations.values().removeIf(value -> value == owner); }
 
     boolean tryAcquireChunkGeneration() {
         int tick = server.getTickCount();
@@ -254,7 +290,12 @@ public final class BotRuntime implements BotService, AutoCloseable {
             } else {
                 restorePendingNavigations();
             }
-            bots.values().forEach(BotHandleImpl::tick);
+            List<BotHandleImpl> active = new ArrayList<>(bots.values());
+            active.sort(java.util.Comparator.comparing(BotHandleImpl::id));
+            if (!active.isEmpty()) {
+                int first = Math.floorMod(nextBotIndex++, active.size());
+                for (int index = 0; index < active.size(); index++) active.get((first + index) % active.size()).tick();
+            }
         } finally {
             metrics.recordServerTick(System.nanoTime() - started);
         }
@@ -280,7 +321,10 @@ public final class BotRuntime implements BotService, AutoCloseable {
         }
         chunkGenerationBudgetPerTick = count <= 1 ? 4 : count <= 10 ? 4 : count <= 25 ? 3 : 2;
         // A slow recent tick takes precedence over the static bot-count tier.
-        long lastTick = metrics.snapshot(pathScheduler.queuedTasks(), pathScheduler.activeTasks()).lastTickNanos();
+        long lastTick = Math.max(server.getAverageTickTimeNanos(),
+                metrics.snapshot(pathScheduler.queuedTasks(), pathScheduler.activeTasks()).lastTickNanos());
+        planningTimeBudgetNanos = lastTick > 75_000_000L ? 2_000_000L
+                : lastTick > 50_000_000L ? 3_000_000L : 5_000_000L;
         if (lastTick > 75_000_000L) {
             snapshotLimit = Math.max(1, snapshotLimit - 1);
             nodeLimit = Math.max(8_000, nodeLimit * 3 / 4);
@@ -414,6 +458,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private record PendingNavigation(BotHandleImpl handle, ValueInput input) { }
 
     private record ChunkTicket(ResourceKey<Level> dimension, long chunk) { }
+    private record ResourceTarget(ResourceKey<Level> dimension, BlockPos position) { }
 
     /** A disconnected connection is sufficient for server simulation and never queues packets. */
     private static final class BotConnection extends Connection {
