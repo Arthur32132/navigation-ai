@@ -67,6 +67,13 @@ public final class GridPathfinder {
     /** Searches all acceptable endpoints together instead of choosing an unverified neighbour. */
     public static GridPath findToAny(GridWorld world, GridPos start, Set<GridPos> goals, GridPos frontierTarget,
                                     NavigationPolicy policy, NodeBudget budget, boolean returnBestPartial) {
+        return findToAny(world, start, goals, frontierTarget, policy, budget, returnBestPartial, Set.of());
+    }
+
+    /** Excludes previously used frontier cells while retaining them as ordinary route cells. */
+    public static GridPath findToAny(GridWorld world, GridPos start, Set<GridPos> goals, GridPos frontierTarget,
+                                    NavigationPolicy policy, NodeBudget budget, boolean returnBestPartial,
+                                    Set<GridPos> exploredFrontiers) {
         if (!world.passable(start)) return new GridPath(List.of(), 0);
         goals = Set.copyOf(goals);
         if (goals.contains(start)) return GridPath.reached(List.of(start), 1);
@@ -91,6 +98,7 @@ public final class GridPathfinder {
         open.add(new Entry(startNode, goalHeuristic(start, goals, frontierTarget)));
         int visited = 0;
         SearchNode bestNode = startNode;
+        SearchNode bestFrontier = null;
         double bestFrontierScore = heuristic(start, frontierTarget);
         double bestPathCost = 0.0D;
         boolean budgetExhausted = false;
@@ -108,6 +116,11 @@ public final class GridPathfinder {
             GridPos current = currentNode.pos();
             visited++;
             double currentCost = currentNode.cost;
+            if (currentNode != startNode && world.isFrontier(current) && !exploredFrontiers.contains(current)) {
+                if (bestFrontier == null || preferFrontier(currentNode, bestFrontier, start, frontierTarget)) {
+                    bestFrontier = currentNode;
+                }
+            }
             double frontierScore = frontierScore(current, frontierTarget, currentCost);
             if (frontierScore < bestFrontierScore
                     || (frontierScore == bestFrontierScore && currentCost < bestPathCost)) {
@@ -176,9 +189,10 @@ public final class GridPathfinder {
             }
         }
         if (visited >= policy.maxSearchNodes() && !open.isEmpty()) searchLimitReached = true;
-        if (returnBestPartial && bestNode != startNode
+        SearchNode partial = !goalVisible ? bestFrontier : bestNode;
+        if (returnBestPartial && partial != null && partial != startNode
                 && (budgetExhausted || searchLimitReached || pathLengthReached || !goalVisible)) {
-            return new GridPath(reconstruct(bestNode), visited, budgetExhausted, false, true, reconstructTransitions(bestNode));
+            return new GridPath(reconstruct(partial), visited, budgetExhausted, false, true, reconstructTransitions(partial));
         }
         return new GridPath(List.of(), visited, budgetExhausted);
     }
@@ -210,6 +224,23 @@ public final class GridPathfinder {
         return heuristic(position, goal) + pathCost * 0.05D;
     }
 
+    private static boolean preferFrontier(SearchNode candidate, SearchNode previous, GridPos start, GridPos target) {
+        double startDistance = heuristic(start, target);
+        double candidateDistance = heuristic(candidate.pos(), target);
+        double previousDistance = heuristic(previous.pos(), target);
+        boolean candidateImproves = candidateDistance < startDistance;
+        boolean previousImproves = previousDistance < startDistance;
+        if (candidateImproves != previousImproves) return candidateImproves;
+        if (candidateImproves) {
+            if (candidateDistance != previousDistance) return candidateDistance < previousDistance;
+        } else {
+            double candidateTravel = heuristic(start, candidate.pos());
+            double previousTravel = heuristic(start, previous.pos());
+            if (candidateTravel != previousTravel) return candidateTravel > previousTravel;
+        }
+        return candidate.cost < previous.cost;
+    }
+
     private static double heuristic(GridPos a, GridPos b) {
         return Math.max(Math.abs(a.x() - b.x()), Math.abs(a.z() - b.z()))
                 + Math.abs(a.y() - b.y());
@@ -219,6 +250,8 @@ public final class GridPathfinder {
         ArrayList<int[]> moves = new ArrayList<>();
         moves.add(new int[] {1, 0, 0}); moves.add(new int[] {-1, 0, 0});
         moves.add(new int[] {0, 0, 1}); moves.add(new int[] {0, 0, -1});
+        moves.add(new int[] {1, 0, 1}); moves.add(new int[] {1, 0, -1});
+        moves.add(new int[] {-1, 0, 1}); moves.add(new int[] {-1, 0, -1});
         moves.add(new int[] {0, 1, 0}); moves.add(new int[] {0, -1, 0});
         moves.add(new int[] {1, 1, 0}); moves.add(new int[] {-1, 1, 0});
         moves.add(new int[] {0, 1, 1}); moves.add(new int[] {0, 1, -1});

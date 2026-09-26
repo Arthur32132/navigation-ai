@@ -6,6 +6,7 @@ import dev.navigationai.api.BotCreateOptions;
 import dev.navigationai.api.BotHandle;
 import dev.navigationai.api.BotService;
 import dev.navigationai.api.NavigationMetrics;
+import dev.navigationai.api.NavigationValidationMetrics;
 import java.util.Collection;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -75,6 +76,11 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private int generatedChunksThisTick;
     private final Map<UUID, java.util.Set<ChunkTicket>> navigationTickets = new ConcurrentHashMap<>();
     private final Map<ChunkTicket, Integer> navigationTicketRefs = new ConcurrentHashMap<>();
+    private final Map<UUID, NavigationTicketDemand> navigationTicketDemands = new ConcurrentHashMap<>();
+    private static final int MAX_PENDING_CHUNK_REQUESTS = 32;
+    private final Set<ChunkTicket> pendingTicketLoads = new HashSet<>();
+    private int nextTicketBotIndex;
+    private long transitionValidationCalls, transitionValidationNanos, transitionValidationDeferrals;
     /** A failed load must never be followed by a write of partial state. */
     private boolean persistenceLoadFailed;
     private int nextBotIndex;
@@ -96,6 +102,14 @@ public final class BotRuntime implements BotService, AutoCloseable {
     public MinecraftServer server() { return server; }
     public BotService service() { return this; }
     public NavigationMetrics metrics() { return metrics.snapshot(pathScheduler.queuedTasks(), pathScheduler.activeTasks()); }
+    public NavigationValidationMetrics transitionValidationMetrics() {
+        ensureServerThread();
+        return new NavigationValidationMetrics(transitionValidationCalls, transitionValidationNanos, transitionValidationDeferrals);
+    }
+    void recordTransitionValidation(long nanos, boolean deferred) {
+        transitionValidationCalls++; transitionValidationNanos+=nanos;
+        if (deferred) transitionValidationDeferrals++;
+    }
     PathSearchScheduler pathScheduler() { return pathScheduler; }
     PathNodeBudget pathNodeBudget() { return pathNodeBudget; }
 
@@ -189,15 +203,50 @@ public final class BotRuntime implements BotService, AutoCloseable {
 
         Set<ChunkTicket> tickets = navigationTickets.computeIfAbsent(botId,
                 ignored -> ConcurrentHashMap.newKeySet());
-        for (ChunkTicket ticket : desired) {
-            if (tickets.add(ticket)) retainNavigationTicket(ticket);
-        }
         for (ChunkTicket ticket : new HashSet<>(tickets)) {
             if (!desired.contains(ticket) && tickets.remove(ticket)) {
                 releaseNavigationTicket(ticket);
             }
         }
+        navigationTicketDemands.put(botId, new NavigationTicketDemand(center, desired));
+        serviceNavigationTicketDemands();
         if (tickets.isEmpty()) navigationTickets.remove(botId, tickets);
+    }
+
+    private void serviceNavigationTicketDemands() {
+        pendingTicketLoads.removeIf(ticket -> {
+            ServerLevel level = server.getLevel(ticket.dimension());
+            ChunkPos pos = ChunkPos.unpack(ticket.chunk());
+            return level == null || level.hasChunk(pos.x(), pos.z());
+        });
+        if (navigationTicketDemands.isEmpty()) return;
+        List<UUID> waiting = new ArrayList<>(navigationTicketDemands.keySet());
+        waiting.sort(UUID::compareTo);
+        int first = Math.floorMod(nextTicketBotIndex++, waiting.size());
+        for (int index = 0; index < waiting.size(); index++) {
+            UUID botId = waiting.get((first + index) % waiting.size());
+            NavigationTicketDemand demand = navigationTicketDemands.get(botId);
+            if (demand == null) continue;
+            Set<ChunkTicket> retained = navigationTickets.computeIfAbsent(botId,
+                    ignored -> ConcurrentHashMap.newKeySet());
+            ChunkTicket next = demand.tickets().stream().filter(ticket -> !retained.contains(ticket))
+                    .min(java.util.Comparator.comparingInt(ticket -> {
+                        ChunkPos pos = ChunkPos.unpack(ticket.chunk());
+                        return Math.abs(pos.x() - demand.center().x()) + Math.abs(pos.z() - demand.center().z());
+                    })).orElse(null);
+            if (next == null) {
+                navigationTicketDemands.remove(botId, demand);
+                continue;
+            }
+            if (!navigationTicketRefs.containsKey(next)) {
+                ServerLevel level = server.getLevel(next.dimension());
+                ChunkPos pos = ChunkPos.unpack(next.chunk());
+                if (level != null && !level.hasChunk(pos.x(), pos.z())
+                        && pendingTicketLoads.size() >= MAX_PENDING_CHUNK_REQUESTS) continue;
+                if (!tryAcquireChunkGeneration()) continue;
+            }
+            if (retained.add(next)) retainNavigationTicket(next);
+        }
     }
 
     private void retainNavigationTicket(ChunkTicket ticket) {
@@ -205,13 +254,16 @@ public final class BotRuntime implements BotService, AutoCloseable {
         if (references == 1) {
             ServerLevel level = server.getLevel(ticket.dimension());
             if (level != null) {
+                ChunkPos pos = ChunkPos.unpack(ticket.chunk());
+                if (!level.hasChunk(pos.x(), pos.z())) pendingTicketLoads.add(ticket);
                 level.getChunkSource().addTicketWithRadius(NavigationAiMod.NAVIGATION_TICKET,
-                        ChunkPos.unpack(ticket.chunk()), 2);
+                        pos, 2);
             }
         }
     }
 
     void releaseNavigationTickets(UUID botId) {
+        navigationTicketDemands.remove(botId);
         Set<ChunkTicket> tickets = navigationTickets.remove(botId);
         if (tickets == null) return;
         for (ChunkTicket ticket : tickets) {
@@ -225,6 +277,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
             return count - 1;
         });
         if (references == null) {
+            pendingTicketLoads.remove(ticket);
             ServerLevel level = server.getLevel(ticket.dimension());
             if (level != null) {
                 level.getChunkSource().removeTicketWithRadius(NavigationAiMod.NAVIGATION_TICKET,
@@ -285,6 +338,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
         try {
             updateAdaptiveBudgets();
             pathNodeBudget.beginTick(server.getTickCount(), adaptivePathNodeBudget);
+            serviceNavigationTicketDemands();
             if (restoreDelayTicks > 0) {
                 restoreDelayTicks--;
             } else {
@@ -458,6 +512,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
     private record PendingNavigation(BotHandleImpl handle, ValueInput input) { }
 
     private record ChunkTicket(ResourceKey<Level> dimension, long chunk) { }
+    private record NavigationTicketDemand(ChunkPos center, Set<ChunkTicket> tickets) { }
     private record ResourceTarget(ResourceKey<Level> dimension, BlockPos position) { }
 
     /** A disconnected connection is sufficient for server simulation and never queues packets. */

@@ -8,4 +8,6 @@ public interface Navigator {
     void cancel();
     NavigationStatus status();
     Optional<NavigationGoal> goal();
+    /** Placements awaiting a safe rollback; inspect after cancellation or failure. */
+    default int pendingRollbackCount() { return 0; }
 }

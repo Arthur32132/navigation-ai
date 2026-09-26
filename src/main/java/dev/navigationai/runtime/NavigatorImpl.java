@@ -1,6 +1,7 @@
 package dev.navigationai.runtime;
 
 import dev.navigationai.api.NavigationGoal;
+import dev.navigationai.api.NavigationFailureContext;
 import dev.navigationai.api.NavigationPolicy;
 import dev.navigationai.api.NavigationResult;
 import dev.navigationai.api.NavigationStatus;
@@ -19,6 +20,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
@@ -63,6 +65,9 @@ final class NavigatorImpl implements Navigator {
     private final MovementController movement = new MovementController();
     private WorldSnapshot liveTransitionView;
     private GridTransition validatedTransition;
+    private WorldSnapshot.Capture pendingTransitionValidation;
+    private GridTransition pendingValidationEdge;
+    private boolean validationDeferred;
     private boolean recoverAfterLanding;
     private int pathIndex;
     private long requestGeneration;
@@ -88,6 +93,8 @@ final class NavigatorImpl implements Navigator {
     private Future<?> searchFuture;
     private int budgetDeferrals;
     private final List<PlacedAction> placedActions = new ArrayList<>();
+    private final List<PlacedAction> pendingRollbacks = new ArrayList<>();
+    private int pendingRollbackCursor;
     private boolean waitingForLanding;
     private boolean backgroundPlanning;
     private int lastFollowPathTick;
@@ -178,6 +185,7 @@ final class NavigatorImpl implements Navigator {
         backgroundPlanning = false;
         recoverAfterLanding = false;
         transitions = List.of(); movement.reset(); liveTransitionView = null; validatedTransition = null;
+        pendingTransitionValidation = null; pendingValidationEdge = null; validationDeferred = false;
     }
     /** Stops server-side inputs and workers while retaining resumable navigation state for shutdown persistence. */
     void shutdown() {
@@ -216,8 +224,9 @@ final class NavigatorImpl implements Navigator {
         return List.of(requested);
     }
 
-    /** Writes only an in-flight navigation request; completed and cancelled tasks are not resumed. */
+    /** Writes the active request and any supports whose safe rollback is still pending. */
     void saveState(ValueOutput output) {
+        writePlacements(output.childrenList("pendingRollbacks"), pendingRollbacks);
         if (goal == null || task == null || isTerminal(task.status())) {
             output.putBoolean("active", false);
             return;
@@ -227,8 +236,11 @@ final class NavigatorImpl implements Navigator {
         output.putInt("sequenceIndex", sequenceIndex);
         savePolicy(output.child("policy"));
         saveGoal(output.child("goal"), rootGoal == null ? goal : rootGoal);
-        ValueOutput.ValueOutputList placements = output.childrenList("placements");
-        for (PlacedAction action : placedActions) {
+        writePlacements(output.childrenList("placements"), placedActions);
+    }
+
+    private void writePlacements(ValueOutput.ValueOutputList placements, List<PlacedAction> actions) {
+        for (PlacedAction action : actions) {
             ValueOutput placement = placements.addChild();
             placement.putString("dimension", action.dimension().identifier().toString());
             placement.store("position", BlockPos.CODEC, action.position());
@@ -241,6 +253,13 @@ final class NavigatorImpl implements Navigator {
 
     /** Restores an in-flight request and starts a fresh plan against the current world. */
     boolean restoreState(ValueInput input) {
+        List<PlacedAction> restoredPending;
+        try {
+            restoredPending = readPlacements(input, "pendingRollbacks");
+        } catch (RuntimeException invalid) {
+            return false;
+        }
+        pendingRollbacks.addAll(restoredPending);
         if (!input.getBooleanOr("active", false)) return true;
         ValueInput goalInput = input.childOrEmpty("goal");
         NavigationGoal restored;
@@ -257,25 +276,29 @@ final class NavigatorImpl implements Navigator {
         if (savedIndex < 0 || savedIndex >= restoredSequence.size()) return false;
         List<PlacedAction> restoredActions;
         try {
-            restoredActions = input.childrenListOrEmpty("placements").stream().map(placement -> {
-                ResourceKey<Level> dimension = ResourceKey.create(Registries.DIMENSION,
-                        Identifier.parse(placement.getString("dimension").orElseThrow()));
-                BlockPos position = placement.read("position", BlockPos.CODEC).orElseThrow();
-                BlockState previous = placement.read("previousState", BlockState.CODEC).orElseThrow();
-                BlockState placed = placement.read("placedState", BlockState.CODEC).orElseThrow();
-                int slot = placement.getInt("slot").orElseThrow();
-                ItemStack returned = placement.read("returnedStack", ItemStack.CODEC).orElseThrow();
-                if (slot < 0 || slot >= owner.player().getInventory().getContainerSize()
-                        || returned.isEmpty() || returned.getCount() != 1) {
-                    throw new IllegalArgumentException("Invalid persisted placement");
-                }
-                return new PlacedAction(dimension, position.immutable(), previous, placed, slot, returned);
-            }).toList();
+            restoredActions = readPlacements(input, "placements");
         } catch (RuntimeException invalid) {
             return false;
         }
         startNavigation(restored, restoredPolicy, savedIndex, restoredActions);
         return true;
+    }
+
+    private List<PlacedAction> readPlacements(ValueInput input, String key) {
+        return input.childrenListOrEmpty(key).stream().map(placement -> {
+            ResourceKey<Level> dimension = ResourceKey.create(Registries.DIMENSION,
+                    Identifier.parse(placement.getString("dimension").orElseThrow()));
+            BlockPos position = placement.read("position", BlockPos.CODEC).orElseThrow();
+            BlockState previous = placement.read("previousState", BlockState.CODEC).orElseThrow();
+            BlockState placed = placement.read("placedState", BlockState.CODEC).orElseThrow();
+            int slot = placement.getInt("slot").orElseThrow();
+            ItemStack returned = placement.read("returnedStack", ItemStack.CODEC).orElseThrow();
+            if (slot < 0 || slot >= owner.player().getInventory().getContainerSize()
+                    || returned.isEmpty() || returned.getCount() != 1) {
+                throw new IllegalArgumentException("Invalid persisted placement");
+            }
+            return new PlacedAction(dimension, position.immutable(), previous, placed, slot, returned);
+        }).toList();
     }
 
     private void saveGoal(ValueOutput output, NavigationGoal value) {
@@ -406,6 +429,7 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        validationDeferred = false;
         task.observe();
         if (recoverAfterLanding && stableForArrival(owner.player())) {
             recoverAfterLanding = false;
@@ -515,6 +539,7 @@ final class NavigatorImpl implements Navigator {
         }
         GridTransition transition = activeTransition();
         if (transition == null || !validateTransition(transition)) {
+            if (validationDeferred) { holdForTransitionValidation(); return; }
             requestHazardRepath();
             return;
         }
@@ -541,7 +566,11 @@ final class NavigatorImpl implements Navigator {
                 return;
             }
             transition = activeTransition();
-            if (transition == null || !validateTransition(transition)) { requestHazardRepath(); return; }
+            if (transition == null || !validateTransition(transition)) {
+                if (validationDeferred) holdForTransitionValidation();
+                else requestHazardRepath();
+                return;
+            }
             if (!prepareTransition(next)) return;
             if (!readyAfterActions(transition)) { requestHazardRepath(); return; }
             target = transitionTarget(transition);
@@ -598,15 +627,60 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean validateTransition(GridTransition transition) {
+        long started = System.nanoTime();
+        validationDeferred = false;
+        try {
+            return validateTransitionGeometry(transition);
+        } finally {
+            runtime.recordTransitionValidation(System.nanoTime()-started, validationDeferred);
+        }
+    }
+
+    private boolean validateTransitionGeometry(GridTransition transition) {
         ServerLevel level = (ServerLevel) owner.player().level();
         if (!transition.equals(validatedTransition) || liveTransitionView == null
                 || liveTransitionView.sprintAvailable() != (owner.player().getFoodData().getFoodLevel() > 6)
                 || !liveTransitionView.geometryCurrent(level)) {
-            liveTransitionView = WorldSnapshot.transitionView(level, owner.player(), transition.from(), transition.to(),
-                    policy.allowWater(), policy.allowBreaking(), policy.allowPlacing());
+            boolean sprint = owner.player().getFoodData().getFoodLevel() > 6;
+            if (plannedSnapshot != null && plannedSnapshot.sprintAvailable() == sprint
+                    && plannedSnapshot.geometryCurrent(level) && plannedSnapshot.passable(transition.from())
+                    && plannedSnapshot.passable(transition.to())) {
+                liveTransitionView = plannedSnapshot;
+                pendingTransitionValidation = null;
+                pendingValidationEdge = null;
+            } else {
+                if (pendingTransitionValidation == null || !transition.equals(pendingValidationEdge)) {
+                    pendingTransitionValidation = WorldSnapshot.beginTransitionView(level, owner.player(),
+                            transition.from(), transition.to(), policy.allowWater(), policy.allowBreaking(),
+                            policy.allowPlacing());
+                    pendingValidationEdge = transition;
+                }
+                int cells = runtime.acquireSnapshotCells(512);
+                if (cells == 0 || !pendingTransitionValidation.step(cells, runtime.planningDeadline())) {
+                    validationDeferred = true;
+                    return false;
+                }
+                liveTransitionView = WorldSnapshot.finishTransitionView(pendingTransitionValidation);
+                pendingTransitionValidation = null;
+                pendingValidationEdge = null;
+                if (!liveTransitionView.geometryCurrent(level)) {
+                    liveTransitionView = null;
+                    validationDeferred = true;
+                    return false;
+                }
+            }
             validatedTransition = transition;
         }
         return TransitionRules.valid(liveTransitionView, transition, policy);
+    }
+
+    private void holdForTransitionValidation() {
+        if (!stableForArrival(owner.player())) {
+            requestHazardRepath();
+            return;
+        }
+        owner.actions().stop();
+        brakeHorizontal();
     }
 
     private boolean readyAfterActions(GridTransition transition) {
@@ -648,6 +722,7 @@ final class NavigatorImpl implements Navigator {
             task.status = NavigationStatus.COMPUTING;
             path = List.of(); pathIndex = 0;
             transitions = List.of(); movement.reset(); validatedTransition = null;
+            liveTransitionView = null; pendingTransitionValidation = null; pendingValidationEdge = null;
             owner.actions().stop();
             // Stop residual momentum at an exhausted or unsafe segment boundary.
             brakeHorizontal();
@@ -803,12 +878,18 @@ final class NavigatorImpl implements Navigator {
         GridPos desired = captureGoal;
         long generation = captureGeneration;
         Set<GridPos> searchGoals = selectSearchGoals(snapshot, desired);
+        Set<GridPos> exploredFrontiers = Set.copyOf(task.exploredFrontierCells);
+        if (searchGoals.isEmpty()) {
+            if (!backgroundPlanning) task.fail("unreachable", resultNodesVisited());
+            backgroundPlanning = false;
+            return;
+        }
         NavigationPolicy searchPolicy = policy;
         try {
             searchFuture = runtime.pathScheduler().submit(searchPriority(), () -> {
                 long searchStarted = System.nanoTime();
                 GridPath result = GridPathfinder.findToAny(snapshot, startPos, searchGoals, desired, searchPolicy,
-                        runtime.pathNodeBudget()::tryConsume, true);
+                        runtime.pathNodeBudget()::tryConsume, true, exploredFrontiers);
                 runtime.recordPathSearch(result.nodesVisited(), System.nanoTime() - searchStarted);
                 runtime.server().execute(() -> applyPath(result, snapshot, generation));
             });
@@ -848,6 +929,12 @@ final class NavigatorImpl implements Navigator {
      */
     private Set<GridPos> selectSearchGoals(WorldSnapshot snapshot, GridPos desired) {
         if (goal instanceof NavigationGoal.PositionGoal position) {
+            if (snapshot.passable(desired) && !snapshot.occupiedByEntity(desired)) {
+                Vec3 point = new Vec3(position.position().x(), snapshot.supportHeight(desired),
+                        position.position().z());
+                return point.distanceTo(position.position()) <= position.tolerance()
+                        ? Set.of(desired) : Set.of();
+            }
             // Search the arrival region, including safe neighbours of an occupied destination.
             // Otherwise A* can pick a long jump directly onto the caller and the live executor refuses it forever.
             Set<GridPos> endpoints = new HashSet<>();
@@ -855,13 +942,18 @@ final class NavigatorImpl implements Navigator {
             for (int dx = -radius; dx <= radius; dx++) for (int dy = -radius; dy <= radius; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     GridPos candidate = desired.add(dx, dy, dz);
-                    Vec3 point = new Vec3(candidate.x() + .5, snapshot.supportHeight(candidate), candidate.z() + .5);
-                    if (snapshot.passable(candidate) && point.distanceTo(position.position()) <= position.tolerance()) {
+                    Vec3 point = new Vec3(
+                            Math.clamp(position.position().x(), candidate.x() + .25, candidate.x() + .75),
+                            snapshot.supportHeight(candidate),
+                            Math.clamp(position.position().z(), candidate.z() + .25, candidate.z() + .75));
+                    if (snapshot.passable(candidate) && !snapshot.occupiedByEntity(candidate)
+                            && point.distanceTo(position.position()) <= position.tolerance()) {
                         endpoints.add(candidate);
                     }
                 }
             }
             if (!endpoints.isEmpty()) return Set.copyOf(endpoints);
+            if (snapshot.occupiedByEntity(desired)) return Set.of();
         }
         if (!(goal instanceof NavigationGoal.BlockGoal) || snapshot.passable(desired)) return Set.of(desired);
         List<GridPos> candidates = List.of(
@@ -1190,10 +1282,14 @@ final class NavigatorImpl implements Navigator {
 
     private void finishStuck(String reason, BlockPos next) {
         ServerPlayer player = owner.player();
+        GridTransition edge = activeTransition();
+        task.failureContext = new NavigationFailureContext(reason, player.blockPosition().immutable(),
+                next == null ? null : next.immutable(), edge == null ? List.of()
+                        : edge.actions().stream().map(Enum::name).toList());
         LOGGER.warn("Navigation stuck: bot={} reason={} pos={} next={} goal={} pathIndex={} pathSize={} pose={} velocity={}",
                 owner.name(), reason, player.position(), next, goal, pathIndex, path.size(),
                 player.getPose(), player.getDeltaMovement());
-        task.stuck(resultNodesVisited());
+        task.stuck(reason);
     }
 
     private void tickFinalApproach() {
@@ -1441,6 +1537,7 @@ final class NavigatorImpl implements Navigator {
             joinedTransitions.addAll(result.transitions().subList(newJoin, result.transitions().size()));
             path = List.copyOf(joined); transitions = List.copyOf(joinedTransitions);
             plannedSnapshot = snapshot; finalPlanningSegment = result.goalReached();
+            rememberFrontier(result);
             return;
         }
         plannedSnapshot = snapshot;
@@ -1448,8 +1545,17 @@ final class NavigatorImpl implements Navigator {
         transitions = result.transitions();
         pathIndex = joinIndex >= 0 ? Math.min(joinIndex + 1, path.size()) : Math.min(1, path.size());
         finalPlanningSegment = result.goalReached();
+        rememberFrontier(result);
         lastTargetDistance = Double.POSITIVE_INFINITY; ticksWithoutProgress = 0;
         task.status = NavigationStatus.RUNNING;
+    }
+
+    private void rememberFrontier(GridPath result) {
+        if (!result.partial()) return;
+        task.exploredFrontierCells.addAll(result.nodes());
+        while (task.exploredFrontierCells.size() > 8192) {
+            task.exploredFrontierCells.remove(task.exploredFrontierCells.iterator().next());
+        }
     }
 
     /** Waits for ordinary chunk loading; this never requests world generation. */
@@ -1520,6 +1626,7 @@ final class NavigatorImpl implements Navigator {
             return false;
         }
         goal = sequence.get(sequenceIndex);
+        task.exploredFrontierCells.clear();
         path = List.of();
         pathIndex = 0;
         plannedSnapshot = null;
@@ -1536,29 +1643,50 @@ final class NavigatorImpl implements Navigator {
         return true;
     }
 
-    /** Compensates simple bridge placements when a navigation transaction fails. */
+    /** Moves compensation into a safe, retryable phase. */
     private void rollbackPlacedActions() {
         if (placedActions.isEmpty()) return;
+        pendingRollbacks.addAll(placedActions);
+        placedActions.clear();
+        tickPendingRollbacks();
+    }
+
+    @Override public int pendingRollbackCount() {
+        runtime.ensureServerThread();
+        return pendingRollbacks.size();
+    }
+
+    void tickPendingRollbacks() {
+        if (pendingRollbacks.isEmpty()) return;
         ServerPlayer player = owner.player();
-        for (int index = placedActions.size() - 1; index >= 0; index--) {
-            PlacedAction action = placedActions.get(index);
+        int remaining = Math.min(16, pendingRollbacks.size());
+        while (remaining-- > 0 && !pendingRollbacks.isEmpty()) {
+            int index = Math.floorMod(pendingRollbackCursor++, pendingRollbacks.size());
+            PlacedAction action = pendingRollbacks.get(index);
             ServerLevel level = runtime.server().getLevel(action.dimension());
             if (level == null) continue;
-            if (level.getBlockState(action.position()).equals(action.placedState())) {
-                level.setBlock(action.position(), action.previousState(), 3);
+            if (!level.hasChunkAt(action.position())) continue;
+            if (!level.getBlockState(action.position()).equals(action.placedState())) {
+                pendingRollbacks.remove(index);
+                pendingRollbackCursor--;
+                continue;
+            }
+            AABB spaceAbove = new AABB(action.position().above());
+            if (player.level() == level && !player.isRemoved() && player.getBoundingBox().intersects(spaceAbove)) continue;
+            if (!level.getEntities(player, spaceAbove, entity -> entity.isAlive() && !entity.isSpectator()).isEmpty()) continue;
+            if (level.setBlock(action.position(), action.previousState(), 3)
+                    && level.getBlockState(action.position()).equals(action.previousState())) {
                 ItemStack returned = action.returnedStack().copy();
                 ItemStack current = player.getInventory().getItem(action.slot());
                 if (current.isEmpty()) {
                     player.getInventory().setItem(action.slot(), returned);
-                } else if (current.getItem() == returned.getItem()
-                        && current.getCount() < current.getMaxStackSize()) {
-                    current.grow(1);
                 } else if (!player.getInventory().add(returned.copy())) {
                     player.drop(returned.copy(), false);
                 }
+                pendingRollbacks.remove(index);
+                pendingRollbackCursor--;
             }
         }
-        placedActions.clear();
     }
 
     private void cancelNavigationMining() {
@@ -1584,6 +1712,8 @@ final class NavigatorImpl implements Navigator {
         private float damageTaken;
         private int firstMovementTick = -1, terminalTick = -1, replans;
         private long reusedSnapshotCells, ticksWithoutMovement;
+        private final Set<GridPos> exploredFrontierCells = new LinkedHashSet<>();
+        private NavigationFailureContext failureContext;
         void observe() {
             Vec3 position = owner.player().position();
             if (firstMovementTick < 0 && position.distanceToSqr(initialPosition) >= .0025) {
@@ -1601,10 +1731,13 @@ final class NavigatorImpl implements Navigator {
                     firstMovementTick, replans, damageTaken, reusedSnapshotCells, completion.isDone(), ticksWithoutMovement);
         }
         @Override public NavigationStatus status() { return status; }
-        @Override public CompletableFuture<NavigationResult> completion() { return completion; }
+        @Override public Optional<NavigationFailureContext> failureContext() {
+            return Optional.ofNullable(failureContext);
+        }
+        @Override public CompletableFuture<NavigationResult> completion() { return completion.copy(); }
         @Override public void cancel() {
             NavigatorImpl.this.runtime.ensureServerThread();
-            if (completion.isDone()) return;
+            if (isTerminal(status)) return;
             if (cancelled.compareAndSet(false, true)) {
                 observe(); terminalTick = runtime.server().getTickCount();
                 status = NavigationStatus.CANCELLED;
@@ -1641,7 +1774,7 @@ final class NavigatorImpl implements Navigator {
             cancelNavigationMining();
             completion.complete(NavigationResult.failure(reason, nodesVisited, System.nanoTime() - startedNanos));
         }
-        void stuck(int nodes) {
+        void stuck(String reason) {
             observe(); terminalTick = runtime.server().getTickCount();
             owner.actions().stop();
             NavigatorImpl.this.requestGeneration++;
@@ -1653,7 +1786,7 @@ final class NavigatorImpl implements Navigator {
             NavigatorImpl.this.rollbackPlacedActions();
             NavigatorImpl.this.runtime.releaseNavigationTickets(owner.id());
             cancelNavigationMining();
-            completion.complete(NavigationResult.stuck(nodesVisited, System.nanoTime() - startedNanos));
+            completion.complete(NavigationResult.stuck(reason, nodesVisited, System.nanoTime() - startedNanos));
         }
         void complete(NavigationResult result) {
             observe(); terminalTick = runtime.server().getTickCount();

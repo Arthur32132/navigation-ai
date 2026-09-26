@@ -527,7 +527,7 @@ final class CombatControllerImpl implements CombatController {
         private CombatStatus status = CombatStatus.RUNNING;
 
         @Override public CombatStatus status() { return status; }
-        @Override public CompletableFuture<CombatResult> completion() { return completion; }
+        @Override public CompletableFuture<CombatResult> completion() { return completion.copy(); }
         @Override public void cancel() {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == CombatStatus.RUNNING) {

@@ -1,0 +1,48 @@
+Navigation AI current review fixes - 2026-09-26
+Base commit: 4e843ae
+Final library SHA256: 5A0E2B7D7B5751AA84B4AE933071CFAD6C732A492156AB3D88869E3C90899581
+JDK 25: library test/build PASS, JUnit 60/60, consumer build PASS
+Core suites use the same fixed logic before adding the read-only pendingRollbackCount API.
+Core suite JAR SHA256: 82BBB3694155320647D0EBA78724281D914F6D9A5238CA72F051EC833008FA59
+Final API/integration/load checks use the final library SHA256 above.
+Disposable Fabric 26.2 server: 127.0.0.1:25580, fixes-world.
+LOAD maxTickMs/avgTickMs are cumulative BotRuntime metrics; use MEASURE for this run.
+[21:20:27] [Server thread/INFO]: REVIEW PASS passed=15 failed=0
+[21:21:20] [Server thread/INFO]: TRANSITIONS PASS passed=9 failed=0 dangling=0
+[21:24:18] [Server thread/INFO]: REGRESSION PASS passed=51 failed=0
+[21:25:46] [Server thread/INFO]: FIXES OK finite_inputs_atomic NaN and both infinities
+[21:25:46] [Server thread/INFO]: FIXES OK future_lifecycle_isolation cancel, complete, exception, timeout
+[21:25:48] [Server thread/INFO]: FIXES OK occupied_goal_0.75 NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=164, durationNanos=1244653100]
+[21:25:49] [Server thread/INFO]: FIXES OK occupied_goal_1.0 NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=164, durationNanos=1149026200]
+[21:25:51] [Server thread/INFO]: FIXES OK occupied_goal_1.5 NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=164, durationNanos=998953500]
+[21:25:51] [Server thread/INFO]: FIXES OK occupied_goal_0.1 NavigationResult[status=FAILED, reason=unreachable, nodesVisited=0, durationNanos=200180200]
+[21:25:54] [Server thread/INFO]: FIXES OK cancel_keeps_occupied_support (4098.324385285462, 200.0, 4136.5)
+[21:25:55] [Server thread/INFO]: FIXES OK rollback_keeps_other_entity_safe (4098.5, 200.0, 4136.5)
+[21:25:55] [Server thread/INFO]: FIXES OK inactive_pending_rollback_restored NBT round trip with occupied support
+[21:25:55] [Server thread/INFO]: FIXES OK rollback_refunds_after_release 16 minecraft:stone
+[21:25:58] [Server thread/INFO]: FIXES OK build_ten_supports NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=254, durationNanos=3034494800]
+[21:25:59] [Server thread/INFO]: FIXES OK mining_replacement_preserved MiningResult[status=FAILED, reason=block_changed, blockBroken=false, durationNanos=284791400]
+[21:26:13] [Server thread/INFO]: FIXES OK distant_goal_requires_initial_retreat NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=4932, durationNanos=13799324200] pos=(4128.147934401554, 200.0, 4256.499373992382)
+[21:26:13] [Server thread/INFO]: FIXES PASS passed=14 failed=0
+[21:27:06] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state
+[21:27:10] [Server thread/INFO]: TICKET REGRESSION PASS: overlapping routes released; player loading/simulation tickets preserved
+[21:29:04] [Server thread/INFO]: MEASURE START: per-run full server ticks and BotRuntime ticks
+[21:29:04] [Server thread/INFO]: LOAD START count=1 generation=false (run counts 1, 10, 25 and 50 separately)
+[21:29:07] [Server thread/INFO]: LOAD PASS count=1 completed=1/1 ticks=57 maxTickMs=26.926 avgTickMs=1.0391275362318841 searches=1 nodes=13 queued=0
+[21:29:07] [Server thread/INFO]: MEASURE DONE full={ticks=56, avgMs=5.496907142857142, p95Ms=19.6838, maxMs=31.9721} runtime={ticks=57, avgMs=2.4635263157894736, p95Ms=6.2041, maxMs=26.926}
+[21:29:34] [Server thread/INFO]: MEASURE START: per-run full server ticks and BotRuntime ticks
+[21:29:35] [Server thread/INFO]: LOAD START count=10 generation=false (run counts 1, 10, 25 and 50 separately)
+[21:29:39] [Server thread/INFO]: LOAD PASS count=10 completed=10/10 ticks=101 maxTickMs=26.926 avgTickMs=0.5397974715549937 searches=10 nodes=130 queued=0
+[21:29:40] [Server thread/INFO]: MEASURE DONE full={ticks=100, avgMs=4.311789, p95Ms=11.0608, maxMs=20.5045} runtime={ticks=101, avgMs=2.7295980198019802, p95Ms=5.9561, maxMs=16.2318}
+[21:30:01] [Server thread/INFO]: MEASURE START: per-run full server ticks and BotRuntime ticks
+[21:30:01] [Server thread/INFO]: LOAD START count=25 generation=false (run counts 1, 10, 25 and 50 separately)
+[21:30:10] [Server thread/INFO]: LOAD PASS count=25 completed=25/25 ticks=182 maxTickMs=26.926 avgTickMs=0.5251589541547278 searches=25 nodes=325 queued=0
+[21:30:10] [Server thread/INFO]: MEASURE DONE full={ticks=181, avgMs=3.021918232044199, p95Ms=7.4801, maxMs=26.7745} runtime={ticks=182, avgMs=1.656789010989011, p95Ms=5.1224, maxMs=8.8431}
+[21:31:07] [Server thread/INFO]: MEASURE START: per-run full server ticks and BotRuntime ticks
+[21:31:07] [Server thread/INFO]: LOAD START count=50 generation=false (run counts 1, 10, 25 and 50 separately)
+[21:31:23] [Server thread/INFO]: LOAD PASS count=50 completed=50/50 ticks=320 maxTickMs=26.926 avgTickMs=0.4221865007012623 searches=50 nodes=650 queued=0
+[21:31:23] [Server thread/INFO]: MEASURE DONE full={ticks=319, avgMs=2.782355799373041, p95Ms=4.0862, maxMs=19.2317} runtime={ticks=320, avgMs=1.437454375, p95Ms=2.4407, maxMs=11.3436}
+[21:31:47] [Server thread/INFO]: MEASURE START: per-run full server ticks and BotRuntime ticks
+[21:31:48] [Server thread/INFO]: LOAD START count=10 generation=true (run counts 1, 10, 25 and 50 separately)
+[21:31:52] [Server thread/INFO]: LOAD PASS count=10 completed=10/10 ticks=100 maxTickMs=38.8695 avgTickMs=0.3931458683676428 searches=10 nodes=130 queued=0
+[21:31:52] [Server thread/INFO]: MEASURE DONE full={ticks=99, avgMs=2.8414828282828286, p95Ms=3.3835, maxMs=39.9432} runtime={ticks=100, avgMs=1.476067, p95Ms=1.9484, maxMs=38.8695}

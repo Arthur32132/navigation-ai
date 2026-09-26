@@ -55,6 +55,7 @@ final class BotHandleImpl implements BotHandle {
         miner.cancel();
         combat.cancel();
         runtime.remove(this);
+        navigator.tickPendingRollbacks();
     }
     void prepareForShutdown() {
         runtime.ensureServerThread();
@@ -69,6 +70,7 @@ final class BotHandleImpl implements BotHandle {
     }
     void tick() {
         if (state == BotState.REMOVED) return;
+        navigator.tickPendingRollbacks();
         if (player.isDeadOrDying() || player.isRemoved()) {
             state = BotState.DEAD;
             navigator.cancel();

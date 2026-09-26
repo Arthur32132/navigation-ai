@@ -18,6 +18,9 @@ final class BotActionsImpl implements BotActions {
     }
     @Override public void setMovement(float sideways, float forward, boolean jump, boolean sprint, boolean sneak) {
         runtime.ensureServerThread();
+        if (!Float.isFinite(sideways) || !Float.isFinite(forward)) {
+            throw new IllegalArgumentException("Movement input must be finite");
+        }
         player.xxa = Math.max(-1, Math.min(1, sideways));
         player.zza = Math.max(-1, Math.min(1, forward));
         player.setJumping(jump);
@@ -26,8 +29,12 @@ final class BotActionsImpl implements BotActions {
     }
     @Override public void look(float yaw, float pitch) {
         runtime.ensureServerThread();
-        player.setYRot(yaw);
-        player.setYHeadRot(yaw);
+        if (!Float.isFinite(yaw) || !Float.isFinite(pitch)) {
+            throw new IllegalArgumentException("Rotation must be finite");
+        }
+        float normalizedYaw = net.minecraft.util.Mth.wrapDegrees(yaw);
+        player.setYRot(normalizedYaw);
+        player.setYHeadRot(normalizedYaw);
         player.setXRot(Math.max(-90, Math.min(90, pitch)));
     }
 }

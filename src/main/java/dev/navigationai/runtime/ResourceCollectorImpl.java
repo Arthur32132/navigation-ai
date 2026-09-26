@@ -41,24 +41,32 @@ final class ResourceCollectorImpl implements ResourceCollector {
 
     @Override
     public GatherTask gather(GatherRequest request, GatherPolicy policy) {
+        java.util.Objects.requireNonNull(policy, "policy");
+        return gather(request, policy, new NavigationPolicy(false, false, true, false, 10_000, 256,
+                Math.max(4, policy.radius()), 100));
+    }
+
+    @Override
+    public GatherTask gather(GatherRequest request, GatherPolicy policy, NavigationPolicy navigationPolicy) {
         runtime.ensureServerThread();
         owner.ensureActive();
         java.util.Objects.requireNonNull(request, "request");
         java.util.Objects.requireNonNull(policy, "policy");
+        java.util.Objects.requireNonNull(navigationPolicy, "navigationPolicy");
         long generation = ++startGeneration;
         cancel();
-        if (generation != startGeneration) return superseded(request, policy);
+        if (generation != startGeneration) return superseded(request, policy, navigationPolicy);
         owner.navigator().cancel();
-        if (generation != startGeneration) return superseded(request, policy);
+        if (generation != startGeneration) return superseded(request, policy, navigationPolicy);
         owner.minerImpl().cancel();
-        if (generation != startGeneration) return superseded(request, policy);
+        if (generation != startGeneration) return superseded(request, policy, navigationPolicy);
         owner.ensureActive();
-        task = new GatherTaskImpl(request, policy);
+        task = new GatherTaskImpl(request, policy, navigationPolicy);
         return task;
     }
 
-    private GatherTask superseded(GatherRequest request, GatherPolicy policy) {
-        GatherTaskImpl cancelled = new GatherTaskImpl(request, policy);
+    private GatherTask superseded(GatherRequest request, GatherPolicy policy, NavigationPolicy navigationPolicy) {
+        GatherTaskImpl cancelled = new GatherTaskImpl(request, policy, navigationPolicy);
         cancelled.cancel();
         return cancelled;
     }
@@ -125,7 +133,8 @@ final class ResourceCollectorImpl implements ResourceCollector {
         while (!current.candidates.isEmpty() && examined++ < 512 && System.nanoTime() < deadline) {
             BlockPos target = current.candidates.remove();
             if (!current.request.blocks().contains(level.getBlockState(target).getBlock())) continue;
-            List<BlockPos> standingPositions = findStandingPositions(level, target);
+            List<BlockPos> standingPositions = findStandingPositions(level, owner.player(), target,
+                    current.navigationPolicy);
             if (standingPositions.isEmpty()) continue;
             if (!runtime.reserveResource(level, target, current)) continue;
             current.target = target;
@@ -147,8 +156,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
         current.phase = GatherPhase.MOVING;
         current.navigation = owner.navigator().goTo(
                 new NavigationGoal.PositionGoal(Vec3.atCenterOf(stand), 1.0),
-                new NavigationPolicy(false, false, true, false, 10_000, 256,
-                        Math.max(4, current.policy.radius()), 0));
+                current.navigationPolicy);
     }
 
     private void clearTarget(GatherTaskImpl current) {
@@ -231,14 +239,22 @@ final class ResourceCollectorImpl implements ResourceCollector {
         return false;
     }
 
-    private static List<BlockPos> findStandingPositions(ServerLevel level, BlockPos target) {
+    private static List<BlockPos> findStandingPositions(ServerLevel level, ServerPlayer player, BlockPos target,
+                                                        NavigationPolicy policy) {
         List<BlockPos> positions = new ArrayList<>();
         for (BlockPos candidate : new BlockPos[] {
                 target.west(), target.east(), target.north(), target.south(), target.above() }) {
-            BlockState feet = level.getBlockState(candidate);
-            BlockState head = level.getBlockState(candidate.above());
             BlockState below = level.getBlockState(candidate.below());
-            if (feet.isAir() && head.isAir() && !below.isAir()) positions.add(candidate);
+            boolean supported = !below.getCollisionShape(level, candidate.below()).isEmpty()
+                    || policy.allowWater() && !level.getFluidState(candidate.below()).isEmpty();
+            if (!supported || NavigationSafety.dangerous(level, candidate)) continue;
+            double offset = NavigationGeometry.feetOffset(level, candidate);
+            var standing = player.getDimensions(net.minecraft.world.entity.Pose.STANDING);
+            var crouching = player.getDimensions(net.minecraft.world.entity.Pose.CROUCHING);
+            if (NavigationGeometry.bodyFits(level, candidate, offset, standing.width(), standing.height(), false)
+                    || NavigationGeometry.bodyFits(level, candidate, offset, crouching.width(), crouching.height(), false)) {
+                positions.add(candidate);
+            }
         }
         return List.copyOf(positions);
     }
@@ -246,6 +262,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
     private final class GatherTaskImpl implements GatherTask {
         private final GatherRequest request;
         private final GatherPolicy policy;
+        private final NavigationPolicy navigationPolicy;
         private final CompletableFuture<GatherResult> completion = new CompletableFuture<>();
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private BlockPos scanOrigin;
@@ -271,15 +288,16 @@ final class ResourceCollectorImpl implements ResourceCollector {
         private int brokenBlocks;
         private String lastFailureReason;
 
-        private GatherTaskImpl(GatherRequest request, GatherPolicy policy) {
+        private GatherTaskImpl(GatherRequest request, GatherPolicy policy, NavigationPolicy navigationPolicy) {
             this.request = request;
             this.policy = policy;
+            this.navigationPolicy = navigationPolicy;
             this.baseline = countItem(owner.player(), request.items());
         }
         @Override public GatherStatus status() { return status; }
         @Override public GatherPhase phase() { return phase; }
         @Override public int collectedItems() { return collected; }
-        @Override public CompletableFuture<GatherResult> completion() { return completion; }
+        @Override public CompletableFuture<GatherResult> completion() { return completion.copy(); }
         @Override public void cancel() {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == GatherStatus.RUNNING) {

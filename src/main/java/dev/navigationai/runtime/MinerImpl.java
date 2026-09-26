@@ -68,10 +68,14 @@ final class MinerImpl implements Miner {
         BlockPos position = current.position;
         BlockState state = level.getBlockState(position);
         if (state.isAir()) { current.fail("block_missing"); return; }
+        if (current.initialState != null && !state.equals(current.initialState)) {
+            current.fail("block_changed"); return;
+        }
         if (!player.mayInteract(level, position)) { current.fail("not_allowed"); return; }
         if (player.distanceToSqr(Vec3.atCenterOf(position)) > 36.0) { current.fail("out_of_range"); return; }
         lookAt(player, position);
         if (current.ticks == 1) {
+            current.initialState = state;
             int selected = selectTool(player, state);
             if (selected < 0) { current.fail("no_suitable_tool"); return; }
             current.originalSlot = player.getInventory().getSelectedSlot();
@@ -188,11 +192,12 @@ final class MinerImpl implements Miner {
         private boolean toolPrepared;
         private boolean toolRestored;
         private float progress;
+        private BlockState initialState;
         private final long started = System.nanoTime();
 
         private MiningTaskImpl(BlockPos position) { this.position = position; }
         @Override public MiningStatus status() { return status; }
-        @Override public CompletableFuture<MiningResult> completion() { return completion; }
+        @Override public CompletableFuture<MiningResult> completion() { return completion.copy(); }
         @Override public void cancel() {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == MiningStatus.RUNNING) {

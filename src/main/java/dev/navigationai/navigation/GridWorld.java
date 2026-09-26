@@ -3,6 +3,9 @@ package dev.navigationai.navigation;
 public interface GridWorld {
     boolean passable(GridPos pos);
 
+    /** Whether this node can lead beyond the world known to this search. */
+    default boolean isFrontier(GridPos pos) { return true; }
+
     default double supportHeight(GridPos pos) { return pos.y(); }
     default boolean isClimbable(GridPos pos) { return false; }
     default boolean requiresOpening(GridPos pos) { return false; }
