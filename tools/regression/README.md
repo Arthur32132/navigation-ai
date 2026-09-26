@@ -37,6 +37,7 @@ java -Xms1G -Xmx2G -jar fabric-server-mc.26.2-loader.0.19.5-launcher.1.1.2.jar n
 
 ```text
 navtest selftest
+navtest ticket-regression
 navtest regression
 ```
 
@@ -49,6 +50,14 @@ navtest regression
 Перед регрессией в отдельном мире задайте `difficulty peaceful`, чтобы
 естественно появившиеся мобы не перекрывали тестовые коридоры. Завершайте
 сервер командой `stop`.
+
+`NavigationTicketRegression.java` компилируется в пакет `dev.navigationai.runtime`
+тестового мода. Команда `navtest ticket-regression` проверяет на настоящем
+`TicketStorage` два пересекающихся маршрута: освобождение первого сохраняет
+билеты второго, освобождение последнего удаляет только `navigation_ai:navigation`,
+а исходные `PLAYER_LOADING` и `PLAYER_SIMULATION` остаются. Ожидаемый результат —
+`TICKET REGRESSION PASS`. Проверка не меняет блоки и восстанавливает временные
+билеты в `finally`.
 
 Для масштаба используйте `/navtest load 1`, `/navtest load 10`,
 `/navtest load 25` и `/navtest load 50` по очереди. Команда создаёт плоскую

@@ -1,6 +1,7 @@
 package dev.navigationai.runtime;
 
 import com.mojang.authlib.GameProfile;
+import dev.navigationai.NavigationAiMod;
 import dev.navigationai.api.BotCreateOptions;
 import dev.navigationai.api.BotHandle;
 import dev.navigationai.api.BotService;
@@ -168,7 +169,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
         if (references == 1) {
             ServerLevel level = server.getLevel(ticket.dimension());
             if (level != null) {
-                level.getChunkSource().addTicketWithRadius(net.minecraft.server.level.TicketType.PLAYER_LOADING,
+                level.getChunkSource().addTicketWithRadius(NavigationAiMod.NAVIGATION_TICKET,
                         ChunkPos.unpack(ticket.chunk()), 2);
             }
         }
@@ -190,7 +191,7 @@ public final class BotRuntime implements BotService, AutoCloseable {
         if (references == null) {
             ServerLevel level = server.getLevel(ticket.dimension());
             if (level != null) {
-                level.getChunkSource().removeTicketWithRadius(net.minecraft.server.level.TicketType.PLAYER_LOADING,
+                level.getChunkSource().removeTicketWithRadius(NavigationAiMod.NAVIGATION_TICKET,
                         ChunkPos.unpack(ticket.chunk()), 2);
             }
         }
