@@ -3,6 +3,12 @@ package dev.navigationai.navigation;
 public interface GridWorld {
     boolean passable(GridPos pos);
 
+    default double supportHeight(GridPos pos) { return pos.y(); }
+    default boolean isClimbable(GridPos pos) { return false; }
+    default boolean requiresOpening(GridPos pos) { return false; }
+    default boolean requiresBreaking(GridPos pos) { return false; }
+    default boolean crossesGap(GridPos from, GridPos to) { return true; }
+
     /** Returns whether the body can move directly between the two cells. */
     default boolean canTraverse(GridPos from, GridPos to) {
         if (!passable(to)) return false;

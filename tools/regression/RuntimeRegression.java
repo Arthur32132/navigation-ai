@@ -63,6 +63,7 @@ public final class RuntimeRegression {
 
     public static void register() {
         ReviewRegression.register();
+        TransitionRegression.register();
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (active != null) active.tick();
         });

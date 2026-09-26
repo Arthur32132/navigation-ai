@@ -88,4 +88,21 @@ class PathSearchSchedulerTest {
             throw new AssertionError(interrupted);
         }
     }
+
+    @Test void olderFollowSearchCannotBeStarvedByLaterDirectRequests() throws Exception {
+        try (PathSearchScheduler scheduler = new PathSearchScheduler(1, 16)) {
+            CountDownLatch started = new CountDownLatch(1), release = new CountDownLatch(1);
+            List<Integer> order = new ArrayList<>();
+            Future<?> running = scheduler.submit(0, () -> { started.countDown(); await(release); });
+            assertTrue(started.await(1, TimeUnit.SECONDS));
+            Future<?> follow = scheduler.submit(10, () -> order.add(-1));
+            List<Future<?>> direct = new ArrayList<>();
+            for (int i = 0; i < 8; i++) {
+                int index = i; direct.add(scheduler.submit(20, () -> order.add(index)));
+            }
+            release.countDown(); running.get(1, TimeUnit.SECONDS); follow.get(1, TimeUnit.SECONDS);
+            for (Future<?> future : direct) future.get(1, TimeUnit.SECONDS);
+            assertTrue(order.indexOf(-1) <= 2, order.toString());
+        }
+    }
 }

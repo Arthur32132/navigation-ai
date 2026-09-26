@@ -17,13 +17,20 @@ final class NavigationGeometry {
 
     static double feetOffset(VoxelShape feet, VoxelShape below) {
         if (!feet.isEmpty() && feet.max(Direction.Axis.Y) <= 0.5D) return feet.max(Direction.Axis.Y);
-        if (!below.isEmpty() && below.max(Direction.Axis.Y) > 1.0D) return below.max(Direction.Axis.Y) - 1.0D;
+        if (!below.isEmpty()) return below.max(Direction.Axis.Y) - 1.0D;
         return 0.0D;
     }
 
     static double feetOffset(ServerLevel level, BlockPos position) {
-        return feetOffset(level.getBlockState(position).getCollisionShape(level, position),
-                level.getBlockState(position.below()).getCollisionShape(level, position.below()));
+        var feet = level.getBlockState(position).getCollisionShape(level, position);
+        var below = level.getBlockState(position.below()).getCollisionShape(level, position.below());
+        var fluid = level.getFluidState(position.below());
+        if (feet.isEmpty() && below.isEmpty() && level.getFluidState(position).isEmpty()
+                && (fluid.getType() == net.minecraft.world.level.material.Fluids.WATER
+                || fluid.getType() == net.minecraft.world.level.material.Fluids.FLOWING_WATER)) {
+            return fluid.getHeight(level, position.below()) - 1.0;
+        }
+        return feetOffset(feet, below);
     }
 
     static AABB body(double x, double y, double z, double width, double height) {

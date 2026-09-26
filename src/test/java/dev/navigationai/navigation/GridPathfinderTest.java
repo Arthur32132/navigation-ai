@@ -208,7 +208,12 @@ class GridPathfinderTest {
     void supportsPureVerticalClimbMoves() {
         GridPos start = new GridPos(0, 0, 0);
         GridPos goal = new GridPos(0, 3, 0);
-        GridWorld world = pos -> pos.x() == 0 && pos.z() == 0 && pos.y() >= 0 && pos.y() <= 3;
+        GridWorld world = new GridWorld() {
+            @Override public boolean passable(GridPos pos) {
+                return pos.x() == 0 && pos.z() == 0 && pos.y() >= 0 && pos.y() <= 3;
+            }
+            @Override public boolean isClimbable(GridPos pos) { return passable(pos); }
+        };
 
         GridPath path = GridPathfinder.find(world, start, goal, policy(128));
 

@@ -6,4 +6,5 @@ public interface NavigationTask {
     NavigationStatus status();
     CompletableFuture<NavigationResult> completion();
     void cancel();
+    default NavigationDiagnostics diagnostics() { return NavigationDiagnostics.unavailable(); }
 }

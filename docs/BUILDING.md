@@ -55,12 +55,14 @@ run/eula.txt -> eula=true
 Для повторяемых игровых проверок добычи и боя используйте
 [серверную регрессию](../tools/regression/README.md). Она запускается командой
 `navtest regression` в отдельном тестовом мире и проверяет 51 сценарий.
-Проверка после ревью 26.09.2026: JUnit 39/39, основной серверный набор 51/51,
-`navreview` 15/15, `navtest selftest` 22 проверки и `navtest ticket-regression`.
+Проверка после внедрения контрактов движения 26.09.2026: JUnit 55/55,
+основной серверный набор 51/51, `navreview` 15/15, `navtransitions` 9/9
+без зависших задач, `navtest selftest` 22 проверки и `navtest ticket-regression`.
 Нагрузочные результаты и точные стадии проверки записаны в
 [журнале проверок](../tools/regression/last-run.txt).
 Описание исправлений и практические пределы — в
-[сводке ревью](REVIEW_FIXES_2026-09-26.md).
+[сводке ревью](REVIEW_FIXES_2026-09-26.md) и
+[описании переходов и измерений](NAVIGATION_TRANSITIONS_2026-09-26.md).
 
 1. `gradlew.bat clean build` на JDK 25.
 2. Запуск unit-тестов A* через `gradlew.bat test`.

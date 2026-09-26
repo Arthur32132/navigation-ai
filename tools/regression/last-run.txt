@@ -1,3 +1,61 @@
+2026-09-26 -- unified transitions, feedback movement and background replanning
+Previous review fixes committed as 0dd4960.
+Minecraft 26.2 / Fabric Loader 0.19.5 / Fabric API 0.161.0+26.2 / JDK 25
+Library SHA256: 294EC89417EA1736661EC9E79AB0B62EF3C9D97939586256DA0480DE0F1C9B69
+BUILD: library gradlew.bat test build PASS; consumer gradlew.bat build PASS
+JUnit: 55 tests, 0 failures, 0 errors (39 previous review + 16 added)
+Server: 51 main scenarios + 15 review scenarios + 9 transition combinations PASS
+Selftest: 22 checks PASS; ticket ownership regression PASS
+Load: 1/10/25/50 bots PASS; loadgen 10 PASS; no unfinished transition tasks
+Disposable server: build/review-probes/server, review-world, 127.0.0.1:25576
+LOAD maxTickMs and avgTickMs are cumulative BotRuntime.tick measurements, not per-run full server TPS.
+Cumulative runtime peak for the full session: 239.5084 ms; load-50 completion: 320 ticks.
+Each transition prints ticks to first movement, replans, health loss, reused cells, maximum pause and completion.
+Impossible low ceiling and sprint-dependent gap must fail safely. Follow is cancelled by the test after the condition holds.
+Server stopped after verification. Production server/world was not used.
+
+[17:08:55] [Server thread/INFO]: TRANSITIONS OK door_then_consecutive_jumps result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=9, durationNanos=3670988800] diagnostics=NavigationDiagnostics[ticksElapsed=75, ticksToFirstMovement=29, replans=0, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=1] maxPaused=1 changed=false pos=(3084.076316405717, 200.0, 3072.5)
+[17:08:57] [Server thread/INFO]: TRANSITIONS OK slab_under_low_ceiling result=NavigationResult[status=FAILED, reason=unreachable, nodesVisited=3321, durationNanos=2746011300] diagnostics=NavigationDiagnostics[ticksElapsed=55, ticksToFirstMovement=8, replans=2, damageTaken=0.0, reusedSnapshotCells=17391, completed=true, ticksWithoutMovement=38] maxPaused=39 changed=false pos=(3075.206578317897, 200.0, 3072.5)
+[17:09:00] [Server thread/INFO]: TRANSITIONS OK sprint_lost_after_door result=NavigationResult[status=FAILED, reason=unreachable, nodesVisited=1207, durationNanos=2297140400] diagnostics=NavigationDiagnostics[ticksElapsed=46, ticksToFirstMovement=13, replans=3, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=26] maxPaused=27 changed=true pos=(3074.156587287983, 200.0, 3072.5)
+[17:09:14] [Server thread/INFO]: TRANSITIONS OK flowing_water result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=746, durationNanos=14570769000] diagnostics=NavigationDiagnostics[ticksElapsed=292, ticksToFirstMovement=14, replans=1, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=1] maxPaused=1 changed=false pos=(3084.2189361518663, 200.04634827728586, 3072.5)
+[17:09:17] [Server thread/INFO]: TRANSITIONS OK knockback_during_jump result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=9, durationNanos=2617371200] diagnostics=NavigationDiagnostics[ticksElapsed=53, ticksToFirstMovement=16, replans=0, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=1] maxPaused=1 changed=true pos=(3082.1712835893554, 200.0, 3072.500021124086)
+[17:09:21] [Server thread/INFO]: TRANSITIONS OK landing_changed_in_flight result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=16, durationNanos=3528004800] diagnostics=NavigationDiagnostics[ticksElapsed=71, ticksToFirstMovement=16, replans=1, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=1] maxPaused=8 changed=true pos=(3082.199917152516, 200.0, 3072.5)
+[17:09:27] [Server thread/INFO]: TRANSITIONS OK future_obstacle_replan_in_motion result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=1056, durationNanos=6183479400] diagnostics=NavigationDiagnostics[ticksElapsed=124, ticksToFirstMovement=27, replans=1, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=1] maxPaused=1 changed=true pos=(3096.4723367322376, 200.0, 3072.482959500344)
+[17:09:31] [Server thread/INFO]: TRANSITIONS OK follow_snapshot_reuse result=NavigationResult[status=CANCELLED, reason=cancelled, nodesVisited=1662, durationNanos=4218521500] diagnostics=NavigationDiagnostics[ticksElapsed=85, ticksToFirstMovement=18, replans=2, damageTaken=0.0, reusedSnapshotCells=9273, completed=true, ticksWithoutMovement=0] maxPaused=8 changed=false pos=(3087.3770609867197, 200.79673560066868, 3072.5)
+[17:09:33] [Server thread/INFO]: TRANSITIONS OK follow_arrival_during_gap_jump result=NavigationResult[status=CANCELLED, reason=cancelled, nodesVisited=812, durationNanos=1536715400] diagnostics=NavigationDiagnostics[ticksElapsed=32, ticksToFirstMovement=11, replans=0, damageTaken=0.0, reusedSnapshotCells=0, completed=true, ticksWithoutMovement=0] maxPaused=0 changed=false pos=(3078.3641119806143, 200.0, 3072.5)
+[17:09:33] [Server thread/INFO]: TRANSITIONS PASS passed=9 failed=0 dangling=0
+[17:09:49] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state
+[17:09:49] [Server thread/INFO]: TICKET REGRESSION PASS: overlapping routes released; player loading/simulation tickets preserved
+[17:12:17] [Server thread/INFO]: REGRESSION PASS passed=51 failed=0
+[17:12:50] [Server thread/INFO]: REVIEW OK slab_headroom: contract=true
+[17:12:52] [Server thread/INFO]: REVIEW OK block_goal_all_approaches: NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=4, durationNanos=1479380800]
+[17:13:04] [Server thread/INFO]: REVIEW OK moving_follow: movement=18.977403005538868 status=RUNNING
+[17:13:04] [Server thread/INFO]: REVIEW OK miner_reentrant_start: contract=true
+[17:13:04] [Server thread/INFO]: REVIEW OK collector_reentrant_start: contract=true
+[17:13:04] [Server thread/INFO]: REVIEW OK combat_reentrant_start: contract=true
+[17:13:05] [Server thread/INFO]: REVIEW OK final_approach_new_hazard: status=STUCK pos=(1024.5494570788944, 200.0, 1024.5) health=20.0
+[17:13:05] [Server thread/INFO]: REVIEW OK unsafe_building_material: NavigationResult[status=FAILED, reason=unreachable, nodesVisited=1, durationNanos=169186200]
+[17:13:06] [Server thread/INFO]: REVIEW OK insufficient_bridge_material: NavigationResult[status=FAILED, reason=unreachable, nodesVisited=4, durationNanos=164849700]
+[17:13:09] [Server thread/INFO]: REVIEW OK request_metrics_across_segments: result=NavigationResult[status=SUCCESS, reason=reached_goal, nodesVisited=440, durationNanos=3566082400] elapsed=3566848700 runtimeNodes=440
+[17:13:09] [Server thread/INFO]: REVIEW OK incremental_resource_scan: scanned=1024 phase=DONE
+[17:13:09] [Server thread/INFO]: REVIEW OK resource_reservation: contract=true
+[17:13:10] [Server thread/INFO]: REVIEW OK new_obstacle_inside_jump: status=FAILED pos=(1024.5445900027937, 200.0, 1024.5)
+[17:13:12] [Server thread/INFO]: REVIEW OK new_powder_snow_on_route: status=SUCCESS enteredHazard=false health=20.0
+[17:13:13] [Server thread/INFO]: REVIEW OK fair_resource_scan_budget: minCells=5120 maxCells=5120
+[17:13:13] [Server thread/INFO]: REVIEW PASS passed=15 failed=0
+[17:13:33] [Server thread/INFO]: LOAD START count=1 generation=false (run counts 1, 10, 25 and 50 separately)
+[17:13:36] [Server thread/INFO]: LOAD PASS count=1 completed=1/1 ticks=55 maxTickMs=239.5084 avgTickMs=0.5058051594103531 searches=1 nodes=13 queued=0
+[17:13:58] [Server thread/INFO]: LOAD START count=10 generation=false (run counts 1, 10, 25 and 50 separately)
+[17:14:03] [Server thread/INFO]: LOAD PASS count=10 completed=10/10 ticks=100 maxTickMs=239.5084 avgTickMs=0.4850916745061148 searches=10 nodes=130 queued=0
+[17:14:24] [Server thread/INFO]: LOAD START count=25 generation=false (run counts 1, 10, 25 and 50 separately)
+[17:14:33] [Server thread/INFO]: LOAD PASS count=25 completed=25/25 ticks=182 maxTickMs=239.5084 avgTickMs=0.4937937679083095 searches=25 nodes=325 queued=0
+[17:15:00] [Server thread/INFO]: LOAD START count=50 generation=false (run counts 1, 10, 25 and 50 separately)
+[17:15:16] [Server thread/INFO]: LOAD PASS count=50 completed=50/50 ticks=320 maxTickMs=239.5084 avgTickMs=0.5416965028717294 searches=50 nodes=650 queued=0
+[17:15:41] [Server thread/INFO]: LOAD START count=10 generation=true (run counts 1, 10, 25 and 50 separately)
+[17:15:46] [Server thread/INFO]: LOAD PASS count=10 completed=10/10 ticks=101 maxTickMs=239.5084 avgTickMs=0.5176606157489639 searches=10 nodes=130 queued=0
+
+----- Previous review-fix validation -----
+
 2026-09-26 — fixes after deep review
 Minecraft 26.2 / Fabric Loader 0.19.5 / Fabric API 0.161.0+26.2 / JDK 25
 Library SHA256: 66449EFD27BF0E830BDC72AC0F48393F8D1DE26641381D068A103ABBEF5AEA45

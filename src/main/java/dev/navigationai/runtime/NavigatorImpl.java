@@ -11,6 +11,9 @@ import dev.navigationai.api.Navigator;
 import dev.navigationai.navigation.GridPath;
 import dev.navigationai.navigation.GridPathfinder;
 import dev.navigationai.navigation.GridPos;
+import dev.navigationai.navigation.GridTransition;
+import dev.navigationai.navigation.TransitionRules;
+import dev.navigationai.api.NavigationDiagnostics;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -56,6 +59,11 @@ final class NavigatorImpl implements Navigator {
     private NavigationPolicy policy = NavigationPolicy.safeDefaults();
     private NavigationTaskImpl task;
     private List<BlockPos> path = List.of();
+    private List<GridTransition> transitions = List.of();
+    private final MovementController movement = new MovementController();
+    private WorldSnapshot liveTransitionView;
+    private GridTransition validatedTransition;
+    private boolean recoverAfterLanding;
     private int pathIndex;
     private long requestGeneration;
     private double lastTargetDistance = Double.POSITIVE_INFINITY;
@@ -83,6 +91,7 @@ final class NavigatorImpl implements Navigator {
     private boolean waitingForLanding;
     private boolean backgroundPlanning;
     private int lastFollowPathTick;
+    private int planningRequestedTick;
 
     private static final int MAX_BUDGET_DEFERRALS = 3;
     private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
@@ -167,6 +176,8 @@ final class NavigatorImpl implements Navigator {
         nextHazardRepathNanos = 0L;
         waitingForLanding = false;
         backgroundPlanning = false;
+        recoverAfterLanding = false;
+        transitions = List.of(); movement.reset(); liveTransitionView = null; validatedTransition = null;
     }
     /** Stops server-side inputs and workers while retaining resumable navigation state for shutdown persistence. */
     void shutdown() {
@@ -395,6 +406,12 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        task.observe();
+        if (recoverAfterLanding && stableForArrival(owner.player())) {
+            recoverAfterLanding = false;
+            requestPath();
+            return;
+        }
         if (waitingForLanding) {
             if (!stableForArrival(owner.player())) return;
             waitingForLanding = false;
@@ -443,7 +460,8 @@ final class NavigatorImpl implements Navigator {
                 owner.actions().stop();
                 return;
             }
-            if (owner.player().distanceToSqr(follow.target()) <= follow.distance() * follow.distance()) {
+            if (owner.player().distanceToSqr(follow.target()) <= follow.distance() * follow.distance()
+                    && (stableForArrival(owner.player()) || activeTransition() == null)) {
                 owner.actions().stop();
                 path = List.of();
                 pathIndex = 0;
@@ -454,11 +472,22 @@ final class NavigatorImpl implements Navigator {
                     || (runtime.server().getTickCount() - lastFollowPathTick >= 20 && shouldRepathFollow(follow)))) {
                 requestPath(!path.isEmpty() && pathIndex < path.size());
             }
-        } else if (reachedGoal()) {
+        } else if (reachedGoal() && (stableForArrival(owner.player()) || activeTransition() == null)) {
             finishSuccess();
             return;
         }
         if (task.status() != NavigationStatus.RUNNING || path.isEmpty()) return;
+        if (!isPlanning()) {
+            for (int i = pathIndex + 1; i < Math.min(path.size(), pathIndex + 7); i++) {
+                if (hasNewStaticHazard(path.get(i)) || hasChangedObstacle(path.get(i))) {
+                    requestPath(true);
+                    break;
+                }
+            }
+        }
+        // Plan the next local segment early, while the remaining validated route is still executable.
+        if (!finalPlanningSegment && !isPlanning() && pathIndex < path.size()
+                && path.size() - pathIndex <= 8 && stableForArrival(owner.player())) requestPath(true);
         if (pathIndex >= path.size()) {
             if (goal instanceof NavigationGoal.FollowGoal) {
                 requestNextFollowPath();
@@ -474,7 +503,7 @@ final class NavigatorImpl implements Navigator {
                     owner.actions().stop();
                     finishStuck("segment_end", null);
                 } else {
-                    requestPath();
+                    requestNextFollowPath();
                 }
             }
             return;
@@ -484,22 +513,26 @@ final class NavigatorImpl implements Navigator {
             requestHazardRepath();
             return;
         }
+        GridTransition transition = activeTransition();
+        if (transition == null || !validateTransition(transition)) {
+            requestHazardRepath();
+            return;
+        }
         if (!prepareTransition(next)) return;
-        Vec3 target = Vec3.atCenterOf(next);
+        if (!readyAfterActions(transition)) { requestHazardRepath(); return; }
+        Vec3 target = transitionTarget(transition);
         double dx = target.x - owner.player().getX();
         double dz = target.z - owner.player().getZ();
-        BlockPos plannedFrom = pathIndex > 0 ? path.get(pathIndex - 1) : owner.player().blockPosition();
-        boolean landingFromJump = isJumpTransition(plannedFrom, next)
-                && crossesUnsupportedGap((ServerLevel) owner.player().level(), plannedFrom, next);
-        if (dx * dx + dz * dz < 0.14 && Math.abs(target.y - owner.player().getY()) < 1.1
-                && (!landingFromJump || owner.player().onGround())) {
+        if (dx * dx + dz * dz < transition.landing().horizontalTolerance() * transition.landing().horizontalTolerance()
+                && Math.abs(target.y - owner.player().getY()) < transition.landing().verticalTolerance()
+                && (!transition.landing().stable() || stableForArrival(owner.player()))) {
             pathIndex++;
             lastTargetDistance = Double.POSITIVE_INFINITY;
             if (pathIndex >= path.size()) {
                 if (goal instanceof NavigationGoal.FollowGoal) requestNextFollowPath();
                 else if (reachedGoal()) finishSuccess();
                 else if (finalPlanningSegment) tickFinalApproach();
-                else requestPath();
+                else requestNextFollowPath();
                 return;
             }
             next = path.get(pathIndex);
@@ -507,59 +540,24 @@ final class NavigatorImpl implements Navigator {
                 requestHazardRepath();
                 return;
             }
+            transition = activeTransition();
+            if (transition == null || !validateTransition(transition)) { requestHazardRepath(); return; }
             if (!prepareTransition(next)) return;
-            target = Vec3.atCenterOf(next);
+            if (!readyAfterActions(transition)) { requestHazardRepath(); return; }
+            target = transitionTarget(transition);
             dx = target.x - owner.player().getX(); dz = target.z - owner.player().getZ();
         }
         float yaw = (float)(Math.atan2(-dx, dz) * 180.0 / Math.PI);
         owner.actions().look(yaw, 0);
-        BlockPos currentBlock = owner.player().blockPosition();
-        ServerLevel level = (ServerLevel) owner.player().level();
-        boolean climbing = isClimbable(level, next) || isClimbable(level, currentBlock);
-        BlockPos edgeStart = pathIndex > 0 ? path.get(pathIndex - 1) : currentBlock;
-        boolean jumpGap = isJumpTransition(edgeStart, next);
-        boolean unsupportedGap = jumpGap && crossesUnsupportedGap(level, edgeStart, next);
-        double jumpDistance = Math.hypot(next.getX() - edgeStart.getX(), next.getZ() - edgeStart.getZ());
-        Vec3 takeoffCenter = Vec3.atCenterOf(edgeStart);
-        double takeoffProgress = unsupportedGap
-                ? ((owner.player().getX() - takeoffCenter.x) * (next.getX() - edgeStart.getX())
-                    + (owner.player().getZ() - takeoffCenter.z) * (next.getZ() - edgeStart.getZ()))
-                    / jumpDistance
-                : 0.0D;
-        boolean sneak = requiresSneak(currentBlock) || requiresSneak(next)
-                || (climbing && next.getY() < currentBlock.getY());
-        boolean stepUp = !climbing && next.getY() == currentBlock.getY() + 1
-                && Math.abs(next.getX() - currentBlock.getX()) + Math.abs(next.getZ() - currentBlock.getZ()) == 1;
-        // The snapshot normally rejects this transition. Recheck the takeoff
-        // and landing headroom against the live world too: a stale route must
-        // never make the fake player repeatedly jump into a low ceiling.
-        if ((jumpGap && (sneak || !hasJumpHeadroom(level, edgeStart) || !hasJumpHeadroom(level, next)
-                || !hasLiveJumpClearance(level, edgeStart, next)))
-                || (stepUp && (sneak || !hasJumpHeadroom(level, currentBlock) || !hasJumpHeadroom(level, next)))) {
-            requestHazardRepath();
-            return;
-        }
-        boolean swimming = policy.allowWater()
-                && (isWater(level, next) || isWater(level, currentBlock) || isWater(level, next.below()));
-        // Fake players do not receive the client packet that normally toggles
-        // swimming. Keep the pose explicit while a planned transition enters,
-        // crosses, or exits water so vanilla travel applies water movement.
-        owner.player().setSwimming(swimming);
-        // Starting a long jump as soon as the takeoff cell is entered leaves
-        // too little range for a three-block gap, particularly after a door
-        // slows entry. Move toward its front edge while still on solid ground.
-        // A jump edge remains active until its landing waypoint is reached.
-        // Once the player has landed in that cell, walk to its centre instead
-        // of launching the same jump again from a corner of a small platform.
-        boolean settlingJumpLanding = jumpGap && owner.player().onGround()
-                && currentBlock.equals(next);
-        boolean jump = jumpGap ? !settlingJumpLanding && owner.player().onGround()
-                && (!unsupportedGap || takeoffProgress >= 0.25D)
-                : climbing ? next.getY() > currentBlock.getY()
-                : next.getY() > currentBlock.getY() && owner.player().onGround();
-        if (swimming && next.getY() > currentBlock.getY()) jump = true;
-        owner.actions().setMovement(0, 1, jump, !climbing && !sneak && !settlingJumpLanding, sneak);
-        Vec3 current = owner.player().position();
+        ServerPlayer player = owner.player();
+        Vec3 velocity = player.getDeltaMovement();
+        boolean swim = transition.type() == GridTransition.Type.SWIM;
+        player.setSwimming(swim);
+        boolean straight = continuesStraight(transition);
+        MovementController.Input input = movement.update(transition,
+                new MovementController.State(player.getX(), player.getY(), player.getZ(), velocity.x, velocity.y,
+                        velocity.z, player.onGround(), player.getFoodData().getFoodLevel() > 6), straight);
+        owner.actions().setMovement(input.strafe(), input.forward(), input.jump(), input.sprint(), input.sneak());
         boolean progressed = progressedToward(target);
         if (progressed) {
             ticksWithoutProgress = 0;
@@ -582,6 +580,42 @@ final class NavigatorImpl implements Navigator {
         return pendingCapture != null || searchFuture != null || planningDeferred;
     }
 
+    private GridTransition activeTransition() {
+        return pathIndex > 0 && pathIndex - 1 < transitions.size() ? transitions.get(pathIndex - 1) : null;
+    }
+
+    private Vec3 transitionTarget(GridTransition transition) {
+        return new Vec3(transition.to().x() + .5, transition.toSupportHeight(), transition.to().z() + .5);
+    }
+
+    private boolean continuesStraight(GridTransition transition) {
+        if (pathIndex >= transitions.size()) return false;
+        GridTransition following = transitions.get(pathIndex);
+        if (following.type() != GridTransition.Type.STEP || !following.actions().isEmpty()) return false;
+        double ax = transition.to().x() - transition.from().x(), az = transition.to().z() - transition.from().z();
+        double bx = following.to().x() - following.from().x(), bz = following.to().z() - following.from().z();
+        return ax * bx + az * bz > 0 && Math.abs(ax * bz - az * bx) < .01;
+    }
+
+    private boolean validateTransition(GridTransition transition) {
+        ServerLevel level = (ServerLevel) owner.player().level();
+        if (!transition.equals(validatedTransition) || liveTransitionView == null
+                || liveTransitionView.sprintAvailable() != (owner.player().getFoodData().getFoodLevel() > 6)
+                || !liveTransitionView.geometryCurrent(level)) {
+            liveTransitionView = WorldSnapshot.transitionView(level, owner.player(), transition.from(), transition.to(),
+                    policy.allowWater(), policy.allowBreaking(), policy.allowPlacing());
+            validatedTransition = transition;
+        }
+        return TransitionRules.valid(liveTransitionView, transition, policy);
+    }
+
+    private boolean readyAfterActions(GridTransition transition) {
+        return !transition.gapJump() || hasLiveJumpClearance((ServerLevel) owner.player().level(),
+                blockPos(transition.from()), blockPos(transition.to()));
+    }
+
+    private static BlockPos blockPos(GridPos pos) { return new BlockPos(pos.x(), pos.y(), pos.z()); }
+
     private void requestNextFollowPath() {
         if (isPlanning()) {
             task.status = NavigationStatus.COMPUTING;
@@ -602,8 +636,9 @@ final class NavigatorImpl implements Navigator {
 
     private void requestPath(boolean keepFollowingPath) {
         if (task == null || task.cancelled.get() || isTerminal(task.status())) return;
+        if (!planningDeferred) planningRequestedTick = runtime.server().getTickCount();
         boolean replan = !planningDeferred && (plannedSnapshot != null || !path.isEmpty());
-        if (replan) runtime.recordReplan();
+        if (replan) { runtime.recordReplan(); task.replans++; }
         long generation = ++requestGeneration;
         cancelSearchFuture();
         pendingCapture = null;
@@ -612,10 +647,9 @@ final class NavigatorImpl implements Navigator {
         if (!backgroundPlanning) {
             task.status = NavigationStatus.COMPUTING;
             path = List.of(); pathIndex = 0;
+            transitions = List.of(); movement.reset(); validatedTransition = null;
             owner.actions().stop();
-        // A frontier path can end beside a gap. Input stops immediately, but
-        // sprint momentum otherwise carries the player off that ledge while
-        // the next snapshot is being captured over several ticks.
+            // Stop residual momentum at an exhausted or unsafe segment boundary.
             brakeHorizontal();
             holdPositionWhilePlanning();
         }
@@ -661,12 +695,17 @@ final class NavigatorImpl implements Navigator {
         }
         if (goal instanceof NavigationGoal.FollowGoal follow) followPlanPosition = follow.target().position();
         GridPos startPos = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(), player.blockPosition().getZ());
+        if (backgroundPlanning && !finalPlanningSegment && !path.isEmpty()) {
+            // Extend the captured area from the frontier instead of searching the same old boundary again.
+            BlockPos frontier = path.getLast();
+            startPos = new GridPos(frontier.getX(), frontier.getY(), frontier.getZ());
+        }
         BlockPos requestedTarget = targetBlock();
         GridPos desired = new GridPos(requestedTarget.getX(), requestedTarget.getY(), requestedTarget.getZ());
         // Search towards the real goal.  WorldSnapshot bounds the amount of
         // world read around the bot, while GridPathfinder can return a useful
         // frontier path when the goal is beyond that snapshot.
-        finalPlanningSegment = false;
+        if (!backgroundPlanning) finalPlanningSegment = false;
         // Start with a small local capture. If a visible goal is unreachable
         // inside it, retry with more of the policy's search area so an access
         // route beginning behind the bot can be found.
@@ -682,13 +721,22 @@ final class NavigatorImpl implements Navigator {
         } else {
             runtime.releaseNavigationTickets(owner.id());
         }
-        pendingCapture = WorldSnapshot.beginCapture(level, player, startPos, desired, radius,
-                policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing(),
-                runtime::tryAcquireChunkGeneration);
         captureStart = startPos;
         captureGoal = desired;
         captureGeneration = generation;
         captureNanos = 0;
+        WorldSnapshot reused = plannedSnapshot == null ? null : plannedSnapshot.reuseIfCurrent(level, player,
+                startPos, desired, policy.allowWater(), policy.allowBreaking(), policy.allowPlacing());
+        if (reused != null && expandedSnapshotRadius == 0 && (!backgroundPlanning || finalPlanningSegment)
+                && (reused.passable(desired) || distance > radius)) {
+            task.reusedSnapshotCells += reused.reusedCells();
+            runtime.recordSnapshot(0);
+            submitSearch(reused);
+            return;
+        }
+        pendingCapture = WorldSnapshot.beginCapture(level, player, startPos, desired, radius,
+                policy.allowWater(), policy.allowChunkGeneration(), policy.allowBreaking(), policy.allowPlacing(),
+                runtime::tryAcquireChunkGeneration, plannedSnapshot);
         advanceCapture();
     }
 
@@ -721,11 +769,29 @@ final class NavigatorImpl implements Navigator {
         WorldSnapshot snapshot = pendingCapture.result();
         pendingCapture = null;
         runtime.recordSnapshot(captureNanos);
+        task.reusedSnapshotCells += snapshot.reusedCells();
+        submitSearch(snapshot);
+    }
+
+    private void submitSearch(WorldSnapshot snapshot) {
         if (task == null || task.cancelled.get() || isTerminal(task.status())
                 || captureGeneration != requestGeneration) return;
         ServerPlayer player = owner.player();
         GridPos current = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(),
                 player.blockPosition().getZ());
+        if (backgroundPlanning && pathIndex < path.size()) {
+            // A future node is a stable search anchor even while the player is crossing air.
+            int anchorIndex = -1;
+            for (int i = pathIndex; i <= Math.min(pathIndex + 3, path.size() - 1); i++) {
+                if (!safeRetainedNode(i)) break;
+                anchorIndex = i;
+            }
+            if (anchorIndex >= 0) {
+                BlockPos anchor = path.get(anchorIndex);
+                GridPos anchorGrid = new GridPos(anchor.getX(), anchor.getY(), anchor.getZ());
+                if (snapshot.passable(anchorGrid)) current = anchorGrid;
+            }
+        }
         if (!current.equals(captureStart) && !snapshot.passable(current)) {
             requestPath(backgroundPlanning);
             return;
@@ -756,7 +822,20 @@ final class NavigatorImpl implements Navigator {
     }
 
     private int searchPriority() {
-        return goal instanceof NavigationGoal.FollowGoal ? 10 : 20;
+        int base = goal instanceof NavigationGoal.FollowGoal ? 10 : 20;
+        return base + Math.min(20, Math.max(0, runtime.server().getTickCount() - planningRequestedTick) / 20);
+    }
+
+    private boolean safeRetainedNode(int index) {
+        BlockPos node = path.get(index);
+        if (hasNewStaticHazard(node) || hasChangedObstacle(node) || hasDynamicObstacle(node)) return false;
+        if (index > 0 && index - 1 < transitions.size()) {
+            GridTransition edge = transitions.get(index - 1);
+            ServerLevel level = (ServerLevel) owner.player().level();
+            if (Math.abs(node.getY() + NavigationGeometry.feetOffset(level, node) - edge.toSupportHeight()) > .05) return false;
+            if (edge.gapJump() && !hasLiveJumpClearance(level, blockPos(edge.from()), node)) return false;
+        }
+        return true;
     }
 
     /**
@@ -768,6 +847,22 @@ final class NavigatorImpl implements Navigator {
      * advance toward it and make this decision later.
      */
     private Set<GridPos> selectSearchGoals(WorldSnapshot snapshot, GridPos desired) {
+        if (goal instanceof NavigationGoal.PositionGoal position) {
+            // Search the arrival region, including safe neighbours of an occupied destination.
+            // Otherwise A* can pick a long jump directly onto the caller and the live executor refuses it forever.
+            Set<GridPos> endpoints = new HashSet<>();
+            int radius = (int) Math.min(4, Math.ceil(position.tolerance()));
+            for (int dx = -radius; dx <= radius; dx++) for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    GridPos candidate = desired.add(dx, dy, dz);
+                    Vec3 point = new Vec3(candidate.x() + .5, snapshot.supportHeight(candidate), candidate.z() + .5);
+                    if (snapshot.passable(candidate) && point.distanceTo(position.position()) <= position.tolerance()) {
+                        endpoints.add(candidate);
+                    }
+                }
+            }
+            if (!endpoints.isEmpty()) return Set.copyOf(endpoints);
+        }
         if (!(goal instanceof NavigationGoal.BlockGoal) || snapshot.passable(desired)) return Set.of(desired);
         List<GridPos> candidates = List.of(
                 desired.add(0, 1, 0), desired.add(0, -1, 0),
@@ -809,19 +904,6 @@ final class NavigatorImpl implements Navigator {
         if (isLava(level, next) || (!policy.allowWater() && isWater(level, next))) {
             requestHazardRepath();
             return false;
-        }
-        if (current.getY() - next.getY() >= 2) {
-            // During a planned drop the player is briefly airborne and may
-            // already have crossed into the landing column. Validate against
-            // the path's ledge node while falling instead of treating that
-            // transient air cell as a changed obstacle.
-            BlockPos plannedFrom = pathIndex > 0 ? path.get(pathIndex - 1) : current;
-            GridPos fromGrid = new GridPos(plannedFrom.getX(), plannedFrom.getY(), plannedFrom.getZ());
-            GridPos toGrid = new GridPos(next.getX(), next.getY(), next.getZ());
-            if (plannedSnapshot == null || !plannedSnapshot.canDrop(fromGrid, toGrid)) {
-                requestHazardRepath();
-                return false;
-            }
         }
         BlockState state = level.getBlockState(next);
         // A closed trapdoor can be part of a deliberate crawl-height tunnel.
@@ -913,28 +995,6 @@ final class NavigatorImpl implements Navigator {
 
     private boolean isClimbable(ServerLevel level, BlockPos position) {
         return level.getBlockState(position).is(BlockTags.CLIMBABLE);
-    }
-
-    private boolean isJumpTransition(BlockPos from, BlockPos to) {
-        if (from.getY() != to.getY()) return false;
-        int dx = Math.abs(to.getX() - from.getX());
-        int dz = Math.abs(to.getZ() - from.getZ());
-        double distance = Math.hypot(dx, dz);
-        return distance >= 2.0D && distance <= 4.0D;
-    }
-
-    private boolean crossesUnsupportedGap(ServerLevel level, BlockPos from, BlockPos to) {
-        int dx = to.getX() - from.getX();
-        int dz = to.getZ() - from.getZ();
-        int steps = Math.max(Math.abs(dx), Math.abs(dz));
-        for (int step = 1; step < steps; step++) {
-            BlockPos support = new BlockPos(
-                    Math.round(from.getX() + dx * step / (float) steps),
-                    from.getY() - 1,
-                    Math.round(from.getZ() + dz * step / (float) steps));
-            if (level.getBlockState(support).getCollisionShape(level, support).isEmpty()) return true;
-        }
-        return false;
     }
 
     private boolean hasJumpHeadroom(ServerLevel level, BlockPos position) {
@@ -1100,6 +1160,19 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean requestHazardRepath() {
+        if (!stableForArrival(owner.player())) {
+            // Replanning from a transient air cell can erase the landing contract.
+            // Keep steering at the landing and repair the route once it is stable.
+            recoverAfterLanding = true;
+            GridTransition transition = activeTransition();
+            if (transition != null) {
+                Vec3 target = transitionTarget(transition);
+                Vec3 current = owner.player().position();
+                owner.actions().look((float) (Math.atan2(current.x - target.x, target.z - current.z) * 180 / Math.PI), 0);
+                owner.actions().setMovement(0, .2f, false, false, false);
+            }
+            return false;
+        }
         owner.actions().stop();
         brakeHorizontal();
         long now = System.nanoTime();
@@ -1353,10 +1426,26 @@ final class NavigatorImpl implements Navigator {
         ArrayList<BlockPos> converted = new ArrayList<>(result.nodes().size());
         for (GridPos pos : result.nodes()) converted.add(new BlockPos(pos.x(), pos.y(), pos.z()));
         int joinIndex = converted.indexOf(owner.player().blockPosition());
-        // Never redirect a bot in mid-flight to a fresh plan whose start it has passed.
-        if (keepOldPath && (!stableForArrival(owner.player()) || joinIndex < 0)) return;
+        if (keepOldPath && (joinIndex < 0 || !stableForArrival(owner.player()))) {
+            // Preserve the active edge (including a jump in flight) and splice at a common future node.
+            int oldJoin = -1, newJoin = -1;
+            for (int i = pathIndex; i < path.size(); i++) {
+                int candidate = converted.indexOf(path.get(i));
+                if (candidate >= 0) { oldJoin = i; newJoin = candidate; break; }
+            }
+            if (oldJoin < 0) return;
+            for (int i = pathIndex; i <= oldJoin; i++) if (!safeRetainedNode(i)) return;
+            ArrayList<BlockPos> joined = new ArrayList<>(path.subList(0, oldJoin + 1));
+            joined.addAll(converted.subList(newJoin + 1, converted.size()));
+            ArrayList<GridTransition> joinedTransitions = new ArrayList<>(transitions.subList(0, oldJoin));
+            joinedTransitions.addAll(result.transitions().subList(newJoin, result.transitions().size()));
+            path = List.copyOf(joined); transitions = List.copyOf(joinedTransitions);
+            plannedSnapshot = snapshot; finalPlanningSegment = result.goalReached();
+            return;
+        }
         plannedSnapshot = snapshot;
         path = List.copyOf(converted);
+        transitions = result.transitions();
         pathIndex = joinIndex >= 0 ? Math.min(joinIndex + 1, path.size()) : Math.min(1, path.size());
         finalPlanningSegment = result.goalReached();
         lastTargetDistance = Double.POSITIVE_INFINITY; ticksWithoutProgress = 0;
@@ -1377,6 +1466,8 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void finishSuccess() {
+        // The arrival sphere may extend over the gap. Finish the active landing before stopping momentum.
+        if (!stableForArrival(owner.player()) && activeTransition() != null) return;
         if (goal instanceof NavigationGoal.LookAtGoal) lookAt(goalPoint());
         owner.actions().stop();
         // A position tolerance can be met in mid-jump. Completing then lets
@@ -1486,12 +1577,36 @@ final class NavigatorImpl implements Navigator {
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private final long startedNanos = System.nanoTime();
         private int nodesVisited;
+        private final int startedTick = runtime.server().getTickCount();
+        private final Vec3 initialPosition = owner.player().position();
+        private Vec3 previousPosition = initialPosition;
+        private float previousHealth = owner.player().getHealth();
+        private float damageTaken;
+        private int firstMovementTick = -1, terminalTick = -1, replans;
+        private long reusedSnapshotCells, ticksWithoutMovement;
+        void observe() {
+            Vec3 position = owner.player().position();
+            if (firstMovementTick < 0 && position.distanceToSqr(initialPosition) >= .0025) {
+                firstMovementTick = runtime.server().getTickCount() - startedTick;
+            }
+            if (position.distanceToSqr(previousPosition) < .0001) ticksWithoutMovement++;
+            else ticksWithoutMovement = 0;
+            previousPosition = position;
+            float health = owner.player().getHealth();
+            damageTaken += Math.max(0, previousHealth - health);
+            previousHealth = health;
+        }
+        @Override public NavigationDiagnostics diagnostics() {
+            return new NavigationDiagnostics((terminalTick >= 0 ? terminalTick : runtime.server().getTickCount()) - startedTick,
+                    firstMovementTick, replans, damageTaken, reusedSnapshotCells, completion.isDone(), ticksWithoutMovement);
+        }
         @Override public NavigationStatus status() { return status; }
         @Override public CompletableFuture<NavigationResult> completion() { return completion; }
         @Override public void cancel() {
             NavigatorImpl.this.runtime.ensureServerThread();
             if (completion.isDone()) return;
             if (cancelled.compareAndSet(false, true)) {
+                observe(); terminalTick = runtime.server().getTickCount();
                 status = NavigationStatus.CANCELLED;
                 if (NavigatorImpl.this.task == this) {
                     owner.actions().stop();
@@ -1513,6 +1628,7 @@ final class NavigatorImpl implements Navigator {
             }
         }
         void fail(String reason, int nodes) {
+            observe(); terminalTick = runtime.server().getTickCount();
             owner.actions().stop();
             NavigatorImpl.this.requestGeneration++;
             NavigatorImpl.this.cancelSearchFuture();
@@ -1526,6 +1642,7 @@ final class NavigatorImpl implements Navigator {
             completion.complete(NavigationResult.failure(reason, nodesVisited, System.nanoTime() - startedNanos));
         }
         void stuck(int nodes) {
+            observe(); terminalTick = runtime.server().getTickCount();
             owner.actions().stop();
             NavigatorImpl.this.requestGeneration++;
             NavigatorImpl.this.cancelSearchFuture();
@@ -1538,6 +1655,9 @@ final class NavigatorImpl implements Navigator {
             cancelNavigationMining();
             completion.complete(NavigationResult.stuck(nodesVisited, System.nanoTime() - startedNanos));
         }
-        void complete(NavigationResult result) { status = result.status(); completion.complete(result); }
+        void complete(NavigationResult result) {
+            observe(); terminalTick = runtime.server().getTickCount();
+            status = result.status(); completion.complete(result);
+        }
     }
 }

@@ -8,6 +8,7 @@
   "license": "MIT",
   "environment": "server",
   "accessWidener": "navigation_ai.accesswidener",
+  "mixins": ["navigation_ai.mixins.json"],
   "entrypoints": {
     "main": ["dev.navigationai.NavigationAiMod"]
   },

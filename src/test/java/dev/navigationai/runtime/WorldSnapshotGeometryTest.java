@@ -73,6 +73,9 @@ class WorldSnapshotGeometryTest {
         AABB body=NavigationGeometry.body(0.5,offset,0.5,0.6,1.5);
         assertTrue(body.intersects(new AABB(0,1.8125,0,1,2,1)));
     }
+    @Test void supportHeightIncludesAPartialBlockBelowTheCell() {
+        assertEquals(-.5, NavigationGeometry.feetOffset(Shapes.empty(),Shapes.box(0,0,0,1,.5,1)));
+    }
 
     @Test void includesRaisedShapesFromTheBlockBelow() {
         GridPos start=new GridPos(0,0,0), end=new GridPos(2,0,0);
@@ -84,5 +87,12 @@ class WorldSnapshotGeometryTest {
         GridPos start=new GridPos(0,0,0), end=new GridPos(0,0,3);
         Map<GridPos,List<AABB>> panel=Map.of(start,List.of(new AABB(0.8125,0,0,1,2,1)));
         assertTrue(world(Set.of(start,end),Set.of(),Set.of(),panel).canJump(start,end));
+    }
+    @Test void checksOpenDoorPanelAcrossWalkingExitFace() {
+        GridPos start=new GridPos(0,0,0), end=new GridPos(1,0,0);
+        Map<GridPos,List<AABB>> panel=Map.of(start,List.of(new AABB(.8125,0,0,1,2,1)));
+        WorldSnapshot snapshot=world(Set.of(start,end),Set.of(),Set.of(),panel);
+        assertTrue(snapshot.passable(start));
+        assertFalse(snapshot.canTraverse(start,end));
     }
 }

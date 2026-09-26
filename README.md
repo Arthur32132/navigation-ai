@@ -47,6 +47,7 @@ NavigationTask task = guard.navigator().goTo(
 - [Архитектура и потоки](docs/ARCHITECTURE.md)
 - [Сборка и проверка](docs/BUILDING.md)
 - [Текущие ограничения и план развития](docs/LIMITATIONS.md)
+- [Контракты переходов, контроллер движения и перестроение пути](docs/NAVIGATION_TRANSITIONS_2026-09-26.md)
 
 ## Что работает сейчас
 

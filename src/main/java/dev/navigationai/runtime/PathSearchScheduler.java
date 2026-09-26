@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Bounded priority executor for immutable path searches.
- * Higher priorities run first; requests with the same priority remain FIFO.
+ * Priorities can overtake a bounded number of older jobs; equal priorities remain FIFO.
  */
 final class PathSearchScheduler implements AutoCloseable {
     private final ThreadPoolExecutor executor;
@@ -70,6 +70,11 @@ final class PathSearchScheduler implements AutoCloseable {
 
         @Override public int compareTo(Runnable other) {
             if (!(other instanceof PrioritizedTask task)) return 0;
+            // Fixed keys remain valid in a heap and prevent starvation of older follow jobs.
+            long order = sequence - Math.max(0, Math.min(40, priority)) / 5;
+            long otherOrder = task.sequence - Math.max(0, Math.min(40, task.priority)) / 5;
+            int ageOrder = Long.compare(order, otherOrder);
+            if (ageOrder != 0) return ageOrder;
             int priorityOrder = Integer.compare(task.priority, priority);
             return priorityOrder != 0
                     ? priorityOrder

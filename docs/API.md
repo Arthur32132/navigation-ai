@@ -49,6 +49,28 @@ int queuedSearches = metrics.queuedSearches();
 Метрики предназначены для логирования и собственного backpressure интегратора;
 они не изменяют политики навигации.
 
+Для отдельного запроса доступны измерения всех его сегментов:
+
+```java
+NavigationDiagnostics diagnostics = task.diagnostics(); // server thread
+long firstMovementTicks = diagnostics.ticksToFirstMovement(); // -1, пока движения не было
+int replans = diagnostics.replans();
+float damage = diagnostics.damageTaken();
+long reusedCells = diagnostics.reusedSnapshotCells();
+boolean completed = diagnostics.completed();
+```
+
+`ticksElapsed` и `ticksToFirstMovement` измеряются в серверных тиках;
+`ticksWithoutMovement` — текущая серия тиков без заметного перемещения.
+`damageTaken` суммирует наблюдаемое снижение здоровья. В интерфейсе
+`NavigationTask` метод имеет default-реализацию для совместимости сторонних задач.
+
+В чистом модуле `GridPath.transitions()` хранит `GridTransition` для каждого ребра,
+построенного `GridPathfinder`: тип движения, позу, высоты опоры, отрыв, посадку
+и действия с блоками. Старые конструкторы `GridPath` сохранены; у вручную
+созданного ими пути переходы пусты. Java record patterns для `GridPath` требуют
+добавить новый компонент `transitions`.
+
 ## Создание бота
 
 ```java
