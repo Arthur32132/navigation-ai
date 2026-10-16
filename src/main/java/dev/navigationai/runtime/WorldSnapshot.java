@@ -7,9 +7,10 @@ import java.util.Map;
 import java.util.HashMap;
 import java.util.Set;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.function.BooleanSupplier;
 import net.minecraft.core.BlockPos;
-import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.LivingEntity;
@@ -50,6 +51,7 @@ final class WorldSnapshot implements GridWorld {
     private final boolean hasUnloadedChunks;
     private Set<GridPos> openableCells = Set.of(), breakingCells = Set.of();
     private Set<GridPos> entityBlocked = Set.of(), entityDanger = Set.of(), entityOccupied = Set.of();
+    private List<AABB> entityCollisions = List.of();
     private Map<Long, ChunkGeometryStamp> chunkStamps = Map.of();
     private ServerLevel capturedLevel;
     private boolean capturedWater, capturedBreaking, capturedPlacing;
@@ -87,7 +89,7 @@ final class WorldSnapshot implements GridWorld {
         this.hasUnloadedChunks = hasUnloadedChunks;
     }
 
-    static WorldSnapshot capture(ServerLevel level, ServerPlayer observer, GridPos start, int radius, boolean allowWater,
+    static WorldSnapshot capture(ServerLevel level, LivingEntity observer, GridPos start, int radius, boolean allowWater,
                                  boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
                                  BooleanSupplier generationBudget) {
         Capture capture = beginCapture(level, observer, start, radius, allowWater,
@@ -96,21 +98,21 @@ final class WorldSnapshot implements GridWorld {
         return capture.result();
     }
 
-    static Capture beginCapture(ServerLevel level, ServerPlayer observer, GridPos start, int radius,
+    static Capture beginCapture(ServerLevel level, LivingEntity observer, GridPos start, int radius,
                                 boolean allowWater, boolean allowChunkGeneration, boolean allowBreaking,
                                 boolean allowPlacing, BooleanSupplier generationBudget) {
         return beginCapture(level, observer, start, null, radius, allowWater,
                 allowChunkGeneration, allowBreaking, allowPlacing, generationBudget);
     }
 
-    static Capture beginCapture(ServerLevel level, ServerPlayer observer, GridPos start, GridPos destination,
+    static Capture beginCapture(ServerLevel level, LivingEntity observer, GridPos start, GridPos destination,
                                 int radius, boolean allowWater, boolean allowChunkGeneration,
                                 boolean allowBreaking, boolean allowPlacing, BooleanSupplier generationBudget) {
         return new Capture(level, observer, start, radius, allowWater,
                 allowChunkGeneration, allowBreaking, allowPlacing, generationBudget, destination);
     }
 
-    static Capture beginCapture(ServerLevel level, ServerPlayer observer, GridPos start, GridPos destination,
+    static Capture beginCapture(ServerLevel level, LivingEntity observer, GridPos start, GridPos destination,
                                 int radius, boolean allowWater, boolean allowChunkGeneration,
                                 boolean allowBreaking, boolean allowPlacing, BooleanSupplier generationBudget,
                                 WorldSnapshot previous) {
@@ -122,7 +124,7 @@ final class WorldSnapshot implements GridWorld {
         return capture;
     }
 
-    private boolean reusable(ServerLevel level, ServerPlayer observer, boolean water, boolean breaking, boolean placing) {
+    private boolean reusable(ServerLevel level, LivingEntity observer, boolean water, boolean breaking, boolean placing) {
         // Tool/inventory and protection changes are checked by fresh captures for transactional routes.
         return capturedLevel == level && capturedWater == water && !breaking && !placing
                 && !capturedBreaking && !capturedPlacing
@@ -131,7 +133,7 @@ final class WorldSnapshot implements GridWorld {
                 && crouchingHeight == observer.getDimensions(Pose.CROUCHING).height();
     }
 
-    WorldSnapshot reuseIfCurrent(ServerLevel level, ServerPlayer observer, GridPos start, GridPos destination,
+    WorldSnapshot reuseIfCurrent(ServerLevel level, LivingEntity observer, GridPos start, GridPos destination,
                                  boolean water, boolean breaking, boolean placing) {
         if (!reusable(level, observer, water, breaking, placing)
                 || start.x() < minX + 4 || start.x() > maxX - 4 || start.z() < minZ + 4 || start.z() > maxZ - 4
@@ -140,7 +142,7 @@ final class WorldSnapshot implements GridWorld {
                 actionCosts, surfaceOffsets, collisions, knownCells, bodyWidth, standingHeight, placementCells,
                 availablePlacements, minX, maxX, minY, maxY, minZ, maxZ, hasUnloadedChunks);
         copy.openableCells = openableCells; copy.breakingCells = breakingCells; copy.chunkStamps = chunkStamps;
-        if (sprintAvailable != (observer.getFoodData().getFoodLevel() > 6)) return null;
+        if (sprintAvailable != (ActorSupport.canSprint(observer))) return null;
         copy.capturedLevel = level; copy.capturedWater = water; copy.reusedCells = knownCells.size();
         copy.sprintAvailable = sprintAvailable; copy.capturedStart = start; copy.groundedOnlyCells = groundedOnlyCells;
         copy.crouchingHeight = crouchingHeight;
@@ -157,19 +159,39 @@ final class WorldSnapshot implements GridWorld {
     }
 
     long reusedCells() { return reusedCells; }
+    record RouteRevision(ServerLevel level, Map<Long, ChunkGeometryStamp> chunks) {
+        boolean current() {
+            return chunks.entrySet().stream().allMatch(entry -> entry.getValue().current(level,
+                    (int)(entry.getKey() >> 32), (int)(long)entry.getKey()));
+        }
+    }
+    RouteRevision routeRevision() { return new RouteRevision(capturedLevel, chunkStamps); }
     boolean sprintAvailable() { return sprintAvailable; }
     boolean occupiedByEntity(GridPos pos) { return entityOccupied.contains(pos); }
+    boolean known(GridPos pos) { return knownCells.contains(pos); }
     private static long chunkKey(int x, int z) { return ((long) x << 32) ^ (z & 0xffffffffL); }
 
+    static boolean loadedGeometryAt(ServerLevel level, int blockX, int blockZ) {
+        // hasChunk confirms a requested ticket level, including pending FULL
+        // futures. Collision shapes can also read neighbouring blocks.
+        var source = level.getChunkSource();
+        for (int cx = (blockX - 1) >> 4; cx <= (blockX + 1) >> 4; cx++) {
+            for (int cz = (blockZ - 1) >> 4; cz <= (blockZ + 1) >> 4; cz++) {
+                if (source.getChunkNow(cx, cz) == null) return false;
+            }
+        }
+        return true;
+    }
+
     /** Small live view uses exactly the same classification and geometry rules as the planner. */
-    static WorldSnapshot transitionView(ServerLevel level, ServerPlayer observer, GridPos from, GridPos to,
+    static WorldSnapshot transitionView(ServerLevel level, LivingEntity observer, GridPos from, GridPos to,
                                          boolean water, boolean breaking, boolean placing) {
         Capture capture = beginTransitionView(level, observer, from, to, water, breaking, placing);
         while (!capture.step(Integer.MAX_VALUE)) { }
         return finishTransitionView(capture);
     }
 
-    static Capture beginTransitionView(ServerLevel level, ServerPlayer observer, GridPos from, GridPos to,
+    static Capture beginTransitionView(ServerLevel level, LivingEntity observer, GridPos from, GridPos to,
                                        boolean water, boolean breaking, boolean placing) {
         Capture capture = new Capture(level, observer, from, 1, water, false, breaking, placing, null, to);
         capture.minX = Math.min(from.x(), to.x()) - 1; capture.maxX = Math.max(from.x(), to.x()) + 1;
@@ -182,14 +204,17 @@ final class WorldSnapshot implements GridWorld {
     static WorldSnapshot finishTransitionView(Capture capture) {
         WorldSnapshot result = capture.result();
         result.entityBlocked = Set.of(); result.entityDanger = Set.of();
+        result.entityCollisions = List.of();
         return result;
     }
 
-    private void captureEntities(ServerLevel level, ServerPlayer observer, GridPos start, GridPos destination) {
+    private void captureEntities(ServerLevel level, LivingEntity observer, GridPos start, GridPos destination) {
         Set<GridPos> blocked = new HashSet<>(), hazards = new HashSet<>(), occupiedCells = new HashSet<>();
+        List<AABB> entityBodies = new ArrayList<>();
         AABB scan = new AABB(minX, minY, minZ, maxX + 1.0, maxY + 1.0, maxZ + 1.0);
         for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, scan)) {
             if (entity == observer || !entity.isAlive() || entity.isRemoved() || entity.isSpectator()) continue;
+            entityBodies.add(entity.getBoundingBox().inflate(.10));
             BlockPos pos = entity.blockPosition();
             GridPos occupied = new GridPos(pos.getX(), pos.getY(), pos.getZ());
             occupiedCells.add(occupied);
@@ -198,12 +223,13 @@ final class WorldSnapshot implements GridWorld {
         }
         entityBlocked = Set.copyOf(blocked); entityDanger = Set.copyOf(hazards);
         entityOccupied = Set.copyOf(occupiedCells);
+        entityCollisions = List.copyOf(entityBodies);
     }
 
     /** Scans a bounded number of cells per server tick before publishing an immutable snapshot. */
     static final class Capture {
         private final ServerLevel level;
-        private final ServerPlayer observer;
+        private final LivingEntity observer;
         private final GridPos start;
         private final GridPos destination;
         private final boolean allowWater, allowBreaking, allowPlacing;
@@ -230,7 +256,7 @@ final class WorldSnapshot implements GridWorld {
         private boolean hasUnloadedChunks;
         private WorldSnapshot result;
 
-        private Capture(ServerLevel level, ServerPlayer observer, GridPos start, int radius, boolean allowWater,
+        private Capture(ServerLevel level, LivingEntity observer, GridPos start, int radius, boolean allowWater,
                         boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
                         BooleanSupplier generationBudget, GridPos destination) {
             this.level = level;
@@ -281,7 +307,7 @@ final class WorldSnapshot implements GridWorld {
                     if (++this.z > maxZ) { this.z = minZ; this.x++; }
                 }
                 BlockPos pos = new BlockPos(x, y, z);
-                if (!level.hasChunkAt(pos)) {
+                if (!loadedGeometryAt(level, x, z)) {
                     // Navigation tickets request generation asynchronously. Never
                     // wait for chunk generation inside the server tick capture.
                     hasUnloadedChunks = true;
@@ -314,7 +340,7 @@ final class WorldSnapshot implements GridWorld {
                 if (waterSurface) offset = belowFluid.getHeight(level, pos.below()) - 1.0;
                 knownCells.add(gridPos);
                 if (offset != 0.0D) surfaceOffsets.put(gridPos, offset);
-                var planningState = NavigationGeometry.planningState(state, observer.mayInteract(level, pos));
+                var planningState = NavigationGeometry.planningState(state, ActorSupport.mayInteract(observer, level, pos));
                 var planningShape = planningState.getCollisionShape(level, pos);
                 if (!planningShape.isEmpty()) {
                     collisions.put(gridPos, planningShape.toAabbs().stream().map(box -> box.move(pos)).toList());
@@ -324,22 +350,22 @@ final class WorldSnapshot implements GridWorld {
                 boolean crouchingClearance = hasClearanceAbove(above, aboveShape, crouchingHeight, bodyWidth, offset);
                 if (offset != 0.0D) {
                     standingClearance = NavigationGeometry.bodyFits(level, pos, offset, bodyWidth,
-                            standingHeight + STANDING_CLEARANCE_MARGIN, false);
+                            standingHeight + NavigationGeometry.clearanceMargin(standingHeight,false), false);
                     crouchingClearance = NavigationGeometry.bodyFits(level, pos, offset, bodyWidth,
-                            crouchingHeight + CROUCHING_CLEARANCE_MARGIN, false);
+                            crouchingHeight + NavigationGeometry.clearanceMargin(crouchingHeight,true), false);
                 }
                 boolean standingBody = clearBody && standingClearance;
                 boolean crouchingBody = clearBody && crouchingClearance;
-                // A bottom slab, carpet or similar partial block is a valid cell
+                // Slabs, farmland, paths and other partial blocks are valid cells
                 // under the player's feet. Full-height stairs/fences remain solid.
-                boolean lowSurface = !stateShape.isEmpty() && stateShape.max(Direction.Axis.Y) <= 0.5D
+                boolean lowSurface = NavigationGeometry.partialSupport(stateShape)
                         && (standingClearance || crouchingClearance);
                 boolean climbable = state.is(BlockTags.CLIMBABLE)
                         && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
                 if (climbable) climbableCells.add(new GridPos(x, y, z));
                 boolean openable = (isClosedHandOpenableDoor(state) || isClosedHandOpenableTrapdoor(state)
                         || isClosedFenceGate(state))
-                        && observer.mayInteract(level, pos);
+                        && ActorSupport.mayInteract(observer, level, pos);
                 if (openable) openableCells.add(gridPos);
                 boolean openGate = state.getBlock() instanceof FenceGateBlock
                         && state.hasProperty(FenceGateBlock.OPEN) && state.getValue(FenceGateBlock.OPEN);
@@ -349,14 +375,25 @@ final class WorldSnapshot implements GridWorld {
                 boolean floor = below.getCollisionShape(level, pos.below()).isEmpty()
                         ? (allowWater && belowWater)
                         : true;
-                if (clearBody && (standingClearance || crouchingClearance)) freeBody.add(gridPos);
+                boolean jumpClearBody=clearBody,jumpClearance=standingClearance||crouchingClearance;
+                if(state.getBlock() instanceof DoorBlock||above.getBlock() instanceof DoorBlock){
+                    // The opening action clears BOTH halves before a raised doorway jump.
+                    // This is clearance only: the upper half is not a landing platform.
+                    var openedAbove=NavigationGeometry.planningState(above,ActorSupport.mayInteract(observer,level,pos.above()));
+                    var openedAboveShape=openedAbove.getCollisionShape(level,pos.above());
+                    jumpClearBody=clearsCenteredBody(planningState,planningShape,bodyWidth,1.0D);
+                    jumpClearance=hasClearanceAbove(openedAbove,openedAboveShape,standingHeight,bodyWidth,offset)
+                            ||hasClearanceAbove(openedAbove,openedAboveShape,crouchingHeight,bodyWidth,offset);
+                }
+                if (jumpClearBody && jumpClearance) freeBody.add(gridPos);
                 boolean breakableBody = allowBreaking && !clearBody && hasUsableTool(observer, state)
-                        && isBreakable(level, pos, state)
+                        && isBreakable(level, pos, state)&&ActorSupport.mayBreak(observer,level,pos)
                         && (above.getCollisionShape(level, pos.above()).isEmpty()
-                            || (hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)))
+                            || (hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)&&ActorSupport.mayBreak(observer,level,pos.above())))
                         && !below.getCollisionShape(level, pos.below()).isEmpty();
                 boolean breakableAbove = allowBreaking && clearBody && !standingClearance && !crouchingClearance
                         && hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)
+                        &&ActorSupport.mayBreak(observer,level,pos.above())
                         && !below.getCollisionShape(level, pos.below()).isEmpty();
                 if (breakableBody || breakableAbove) breakingCells.add(gridPos);
                 // A previous route step may place the neighbour that supports this block.
@@ -394,15 +431,18 @@ final class WorldSnapshot implements GridWorld {
                 }
                 if ((clearBody || lowSurface) && !standingClearance && crouchingClearance) crouchOnly.add(gridPos);
                 if (waterCell || waterSurface) waterCells.add(gridPos);
-                boolean dangerousSupport = below.is(Blocks.FIRE) || below.is(Blocks.SOUL_FIRE)
-                        || below.is(Blocks.CAMPFIRE) || below.is(Blocks.SOUL_CAMPFIRE)
-                        || below.is(Blocks.MAGMA_BLOCK) || below.is(Blocks.CACTUS)
-                        || below.is(Blocks.POWDER_SNOW) || belowFluid.getType() == Fluids.LAVA
+                // Prefer a breathable surface or a longer bank route to a submerged tunnel.
+                // Diving remains possible when the destination actually requires it.
+                if(waterCell){
+                    var headFluid=above.getFluidState();
+                    double eyeAboveHeadFloor=observer.getEyeHeight()+offset-1;
+                    if((headFluid.getType()==Fluids.WATER||headFluid.getType()==Fluids.FLOWING_WATER)
+                            &&headFluid.getHeight(level,pos.above())>eyeAboveHeadFloor)
+                        actionCosts.merge(gridPos,20.0D,Double::sum);
+                }
+                boolean dangerousSupport = NavigationSafety.dangerous(below) || belowFluid.getType() == Fluids.LAVA
                         || belowFluid.getType() == Fluids.FLOWING_LAVA;
-                if (state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE) || state.is(Blocks.CAMPFIRE)
-                        || state.is(Blocks.SOUL_CAMPFIRE) || state.is(Blocks.MAGMA_BLOCK)
-                        || state.is(Blocks.CACTUS) || state.is(Blocks.POWDER_SNOW)
-                        || lavaCell || dangerousSupport) {
+                if (NavigationSafety.dangerous(state) || lavaCell || dangerousSupport) {
                     dangerous.add(gridPos);
                 }
             }
@@ -415,7 +455,7 @@ final class WorldSnapshot implements GridWorld {
             result.chunkStamps = Map.copyOf(chunkStamps); result.capturedLevel = level;
             result.capturedWater = allowWater; result.capturedBreaking = allowBreaking; result.capturedPlacing = allowPlacing;
             result.reusedCells = reusedCells;
-            result.sprintAvailable = observer.getFoodData().getFoodLevel() > 6;
+            result.sprintAvailable = ActorSupport.canSprint(observer);
             result.capturedStart = start; result.groundedOnlyCells = groundedOnlyCells;
             result.crouchingHeight = crouchingHeight;
             result.captureEntities(level, observer, start, destination);
@@ -447,7 +487,7 @@ final class WorldSnapshot implements GridWorld {
 
     private static boolean hasClearanceAbove(BlockState above, VoxelShape aboveShape, double height, double width,
                                             double surfaceOffset) {
-        double margin = height <= 1.6D ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        double margin = NavigationGeometry.clearanceMargin(height,height<=1.6);
         double needed = height + surfaceOffset + margin - 1.0D;
         return needed <= 0.0D || aboveShape.isEmpty()
                 || clearsCenteredBody(above, aboveShape, width, needed)
@@ -497,23 +537,23 @@ final class WorldSnapshot implements GridWorld {
         return !state.isAir() && !state.is(Blocks.BEDROCK) && state.getDestroySpeed(level, pos) >= 0.0f;
     }
 
-    private static boolean hasUsableTool(ServerPlayer player, net.minecraft.world.level.block.state.BlockState state) {
+    private static boolean hasUsableTool(LivingEntity player, net.minecraft.world.level.block.state.BlockState state) {
         if (!state.requiresCorrectToolForDrops()) return true;
-        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
-            var stack = player.getInventory().getItem(slot);
+        for (int slot = 0; slot < ActorSupport.context(player).getInventory().getContainerSize(); slot++) {
+            var stack = ActorSupport.context(player).getInventory().getItem(slot);
             if (stack.isEmpty() || !stack.isCorrectToolForDrops(state) || stack.nextDamageWillBreak()) continue;
             if (effectiveDestroySpeed(stack, state) > 0.0f) return true;
         }
         return false;
     }
 
-    private static double breakCost(ServerPlayer player, ServerLevel level, BlockPos pos,
+    private static double breakCost(LivingEntity player, ServerLevel level, BlockPos pos,
                                     net.minecraft.world.level.block.state.BlockState state) {
         float hardness = state.getDestroySpeed(level, pos);
         if (hardness < 0.0f) return Double.POSITIVE_INFINITY;
         float bestSpeed = 1.0f;
-        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
-            var stack = player.getInventory().getItem(slot);
+        for (int slot = 0; slot < ActorSupport.context(player).getInventory().getContainerSize(); slot++) {
+            var stack = ActorSupport.context(player).getInventory().getItem(slot);
             if (stack.isEmpty() || stack.nextDamageWillBreak()) continue;
             if (state.requiresCorrectToolForDrops() && !stack.isCorrectToolForDrops(state)) continue;
             bestSpeed = Math.max(bestSpeed, effectiveDestroySpeed(stack, state));
@@ -556,18 +596,33 @@ final class WorldSnapshot implements GridWorld {
         // needs the same standing-height arc clearance as a gap jump; a
         // crouch-only cell is walkable but cannot be jumped through.
         if (supportHeight(to) - supportHeight(from) > .6 && dx + dz == 1) {
-            return !requiresSneak(from) && !requiresSneak(to)
-                    && freeBody.contains(from.add(0, 1, 0))
-                    && freeBody.contains(to.add(0, 1, 0));
+            if(requiresSneak(from)||requiresSneak(to))return false;
+            // A one-block step needs the body just above its landing height.
+            // Checking a full standing body one block ABOVE the landing wrongly
+            // rejects ordinary two-block doorways where vanilla safely clips the jump apex.
+            double feet=supportHeight(to)+.02;
+            double height=standingHeight+NavigationGeometry.clearanceMargin(standingHeight,false);
+            var startBody=NavigationGeometry.body(from.x()+.5,feet,from.z()+.5,bodyWidth,height);
+            var endBody=NavigationGeometry.body(to.x()+.5,feet,to.z()+.5,bodyWidth,height);
+            return collisionFree(startBody.minmax(endBody));
         }
-        if (to.y() == from.y() && dx + dz > 0 && !requiresBreaking(from) && !requiresBreaking(to)
+        if (to.y() <= from.y() && dx + dz > 0 && !requiresBreaking(from) && !requiresBreaking(to)
                 && !requiresPlacement(from) && !requiresPlacement(to)) {
             // A door can clear the cell centre while its panel blocks an entry or exit face.
             double height = requiresSneak(from) || requiresSneak(to) ? crouchingHeight : standingHeight;
             double feet = Math.max(supportHeight(from), supportHeight(to));
             AABB startBody = NavigationGeometry.body(from.x() + .5, feet, from.z() + .5, bodyWidth, height);
             AABB endBody = NavigationGeometry.body(to.x() + .5, feet, to.z() + .5, bodyWidth, height);
-            if (!collisionFree(startBody.minmax(endBody))) return false;
+            AABB sweep = startBody.minmax(endBody);
+            if (!collisionFree(sweep)) return false;
+            // Safe endpoints do not make a diagonal safe: the body can touch a
+            // berry bush or cactus in a corner cell that the feet never enter.
+            if (!dangerous(from) && !dangerous(to) && dx > 0 && dz > 0) {
+                for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(sweep.minX, sweep.minY, sweep.minZ),
+                        BlockPos.containing(sweep.maxX - 1.0E-6, sweep.maxY - 1.0E-6, sweep.maxZ - 1.0E-6))) {
+                    if (dangerous(new GridPos(pos.getX(), pos.getY(), pos.getZ()))) return false;
+                }
+            }
         }
         return true;
     }
@@ -605,6 +660,7 @@ final class WorldSnapshot implements GridWorld {
     }
 
     private boolean collisionFree(AABB box) {
+        for(AABB entity : entityCollisions) if(entity.intersects(box)) return false;
         for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY - 1, box.minZ),
                 BlockPos.containing(box.maxX - 1.0E-6D, box.maxY - 1.0E-6D, box.maxZ - 1.0E-6D))) {
             GridPos cell = new GridPos(pos.getX(), pos.getY(), pos.getZ());

@@ -11,6 +11,8 @@ import dev.navigationai.api.MiningTask;
 import dev.navigationai.api.Navigator;
 import dev.navigationai.navigation.GridPath;
 import dev.navigationai.navigation.GridPathfinder;
+import dev.navigationai.navigation.GridExploration;
+import dev.navigationai.navigation.RegionRouteGraph;
 import dev.navigationai.navigation.GridPos;
 import dev.navigationai.navigation.GridTransition;
 import dev.navigationai.navigation.TransitionRules;
@@ -99,6 +101,7 @@ final class NavigatorImpl implements Navigator {
     private boolean backgroundPlanning;
     private int lastFollowPathTick;
     private int planningRequestedTick;
+    private GridPos explorationGuide;
 
     private static final int MAX_BUDGET_DEFERRALS = 3;
     private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
@@ -108,11 +111,28 @@ final class NavigatorImpl implements Navigator {
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
 
+    int ledgeDropDistance() {
+        return task != null && !task.completion().isDone() ? policy.maxFallDistance() : 2;
+    }
+
     @Override public NavigationTask goTo(NavigationGoal goal, NavigationPolicy policy) {
         runtime.ensureServerThread();
         owner.ensureActive();
         if (goal == null || policy == null) throw new NullPointerException("goal and policy");
+        long claim = owner.control().claim(BotControl.Kind.NAVIGATION);
+        if (claim < 0) return supersededRequest();
         return startNavigation(goal, policy, 0);
+    }
+
+    NavigationTask goToAsChild(NavigationGoal goal, NavigationPolicy policy) {
+        runtime.ensureServerThread(); owner.ensureActive();
+        return startNavigation(goal, policy, 0);
+    }
+
+    private NavigationTask supersededRequest() {
+        NavigationTaskImpl superseded = new NavigationTaskImpl();
+        superseded.cancel();
+        return superseded;
     }
 
     /** Starts a request at a particular flattened sequence element. */
@@ -124,11 +144,13 @@ final class NavigatorImpl implements Navigator {
     private NavigationTask startNavigation(NavigationGoal requestedGoal, NavigationPolicy selectedPolicy,
                                            int initialSequenceIndex, List<PlacedAction> restoredActions) {
         NavigationTaskImpl previousTask = task;
+        long controlRequest = owner.control().generation();
         cancel();
         // Completing the old cancellation can synchronously start a newer
         // request. That newer request wins; report this call as cancelled
         // without replacing its unfinished task or returning the wrong goal.
-        if (task != previousTask && task != null && !isTerminal(task.status())) {
+        if (!owner.control().current(controlRequest)
+                || task != previousTask && task != null && !isTerminal(task.status())) {
             NavigationTaskImpl superseded = new NavigationTaskImpl();
             superseded.cancel();
             return superseded;
@@ -144,6 +166,7 @@ final class NavigatorImpl implements Navigator {
         this.goal = sequence.get(initialSequenceIndex);
         this.policy = selectedPolicy;
         this.task = new NavigationTaskImpl();
+        this.explorationGuide = null;
         placedActions.addAll(restoredActions);
         this.budgetDeferrals = 0;
         requestPath();
@@ -200,6 +223,16 @@ final class NavigatorImpl implements Navigator {
         planningDeferred = false;
         pendingCapture = null;
     }
+    /** Complete obsolete caller futures without rolling back the journal saved on the entity. */
+    void retireForUnload() {
+        shutdown();
+        if (task != null && !isTerminal(task.status)) {
+            task.observe(); task.terminalTick = runtime.server().getTickCount();
+            task.cancelled.set(true); task.status = NavigationStatus.CANCELLED;
+            task.completion.complete(new NavigationResult(NavigationStatus.CANCELLED, "entity_unloaded",
+                    task.nodesVisited, System.nanoTime() - task.startedNanos));
+        }
+    }
     @Override public NavigationStatus status() { return task == null ? NavigationStatus.IDLE : task.status(); }
     @Override public Optional<NavigationGoal> goal() { return Optional.ofNullable(goal); }
 
@@ -252,6 +285,11 @@ final class NavigatorImpl implements Navigator {
     }
 
     /** Restores an in-flight request and starts a fresh plan against the current world. */
+    void restoreDiscardedState(ValueInput input) {
+        pendingRollbacks.addAll(readPlacements(input, "pendingRollbacks"));
+        pendingRollbacks.addAll(readPlacements(input, "placements"));
+    }
+
     boolean restoreState(ValueInput input) {
         List<PlacedAction> restoredPending;
         try {
@@ -293,7 +331,7 @@ final class NavigatorImpl implements Navigator {
             BlockState placed = placement.read("placedState", BlockState.CODEC).orElseThrow();
             int slot = placement.getInt("slot").orElseThrow();
             ItemStack returned = placement.read("returnedStack", ItemStack.CODEC).orElseThrow();
-            if (slot < 0 || slot >= owner.player().getInventory().getContainerSize()
+            if (slot < 0 || slot >= ActorSupport.context(owner.entity()).getInventory().getContainerSize()
                     || returned.isEmpty() || returned.getCount() != 1) {
                 throw new IllegalArgumentException("Invalid persisted placement");
             }
@@ -301,7 +339,7 @@ final class NavigatorImpl implements Navigator {
         }).toList();
     }
 
-    private void saveGoal(ValueOutput output, NavigationGoal value) {
+    void saveGoal(ValueOutput output, NavigationGoal value) {
         if (value instanceof NavigationGoal.BlockGoal block) {
             output.putString("type", "block");
             output.putInt("x", block.position().getX()); output.putInt("y", block.position().getY()); output.putInt("z", block.position().getZ());
@@ -319,6 +357,10 @@ final class NavigatorImpl implements Navigator {
             saveFollow(output, "follow", follow.target(), follow.distance(), follow.repathDistance());
         } else if (value instanceof NavigationGoal.EscortGoal escort) {
             saveFollow(output, "escort", escort.target(), escort.distance(), escort.repathDistance());
+        } else if (value instanceof NavigationGoal.EntityFollowGoal follow) {
+            saveFollow(output, "entity_follow", follow.target(), follow.distance(), follow.repathDistance());
+        } else if (value instanceof NavigationGoal.EntityEscortGoal escort) {
+            saveFollow(output, "entity_escort", escort.target(), escort.distance(), escort.repathDistance());
         } else if (value instanceof NavigationGoal.PatrolGoal patrol) {
             output.putString("type", "patrol"); output.putBoolean("loop", patrol.loop()); output.putDouble("tolerance", patrol.tolerance());
             ValueOutput.ValueOutputList points = output.childrenList("points");
@@ -337,13 +379,13 @@ final class NavigatorImpl implements Navigator {
         output.putDouble("z", position.z()); output.putDouble("tolerance", tolerance);
     }
 
-    private static void saveFollow(ValueOutput output, String type, ServerPlayer target, double distance, double repath) {
+    private static void saveFollow(ValueOutput output, String type, LivingEntity target, double distance, double repath) {
         output.putString("type", type); output.putString("targetUuid", target.getUUID().toString());
-        output.putString("targetName", target.getGameProfile().name()); output.putDouble("distance", distance);
+        output.putString("targetName", target.getName().getString()); output.putDouble("distance", distance);
         output.putDouble("repathDistance", repath);
     }
 
-    private NavigationGoal readGoal(ValueInput input) {
+    NavigationGoal readGoal(ValueInput input) {
         String type = input.getStringOr("type", "");
         return switch (type) {
             case "block" -> new NavigationGoal.BlockGoal(new BlockPos(input.getIntOr("x", 0), input.getIntOr("y", 0), input.getIntOr("z", 0)), input.getDoubleOr("tolerance", 1.0));
@@ -354,6 +396,7 @@ final class NavigatorImpl implements Navigator {
                     ResourceKey.create(Registries.DIMENSION, Identifier.parse(input.getStringOr("dimension", Level.OVERWORLD.identifier().toString()))),
                     readPosition(input), input.getDoubleOr("tolerance", 0.75));
             case "follow" -> restoreFollowGoal(input);
+            case "entity_follow", "entity_escort" -> restoreEntityFollowGoal(input);
             case "escort" -> {
                 NavigationGoal.FollowGoal follow = restoreFollowGoal(input);
                 yield follow == null ? null : new NavigationGoal.EscortGoal(follow.target(), follow.distance(), follow.repathDistance());
@@ -374,6 +417,21 @@ final class NavigatorImpl implements Navigator {
         return new Vec3(input.getDoubleOr("x", 0.0), input.getDoubleOr("y", 0.0), input.getDoubleOr("z", 0.0));
     }
 
+    private NavigationGoal restoreEntityFollowGoal(ValueInput input) {
+        try {
+            java.util.UUID id = java.util.UUID.fromString(input.getStringOr("targetUuid", ""));
+            for (ServerLevel level : runtime.server().getAllLevels()) {
+                if (level.getEntity(id) instanceof LivingEntity target && target.isAlive()) {
+                    double distance = input.getDoubleOr("distance", 2), repath = input.getDoubleOr("repathDistance", 4);
+                    return input.getStringOr("type", "").equals("entity_escort")
+                            ? new NavigationGoal.EntityEscortGoal(target, distance, repath)
+                            : new NavigationGoal.EntityFollowGoal(target, distance, repath);
+                }
+            }
+        } catch (IllegalArgumentException invalid) { return null; }
+        return null;
+    }
+
     private NavigationGoal.FollowGoal restoreFollowGoal(ValueInput input) {
         String uuidText = input.getStringOr("targetUuid", "");
         if (uuidText.isBlank()) return null;
@@ -388,7 +446,7 @@ final class NavigatorImpl implements Navigator {
             if (!targetName.isBlank()) target = runtime.server().getPlayerList().getPlayer(targetName);
         }
         if (target == null || target.isRemoved() || target.isDeadOrDying()
-                || target.level() != owner.player().level()) return null;
+                || target.level() != owner.entity().level()) return null;
         double distance = input.getDoubleOr("distance", 2.0);
         double repath = input.getDoubleOr("repathDistance", 4.0);
         try {
@@ -399,6 +457,10 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void savePolicy(ValueOutput output) {
+        writePolicy(output, policy);
+    }
+
+    static void writePolicy(ValueOutput output, NavigationPolicy policy) {
         output.putBoolean("allowBreaking", policy.allowBreaking());
         output.putBoolean("allowPlacing", policy.allowPlacing());
         output.putBoolean("allowWater", policy.allowWater());
@@ -410,7 +472,7 @@ final class NavigatorImpl implements Navigator {
         output.putInt("maxFallDistance", policy.maxFallDistance());
     }
 
-    private NavigationPolicy restorePolicy(ValueInput input) {
+    static NavigationPolicy restorePolicy(ValueInput input) {
         try {
             return new NavigationPolicy(
                     input.getBooleanOr("allowBreaking", false),
@@ -431,13 +493,13 @@ final class NavigatorImpl implements Navigator {
         if (task == null || goal == null || isTerminal(task.status())) return;
         validationDeferred = false;
         task.observe();
-        if (recoverAfterLanding && stableForArrival(owner.player())) {
+        if (recoverAfterLanding && stableForArrival(owner.entity())) {
             recoverAfterLanding = false;
             requestPath();
             return;
         }
         if (waitingForLanding) {
-            if (!stableForArrival(owner.player())) return;
+            if (!stableForArrival(owner.entity())) return;
             waitingForLanding = false;
             if (reachedGoal()) finishSuccess();
             else requestPath();
@@ -449,7 +511,7 @@ final class NavigatorImpl implements Navigator {
             stallAnchor = null;
             ticksNearStallAnchor = 0;
         } else if (task.status() == NavigationStatus.RUNNING
-                && !(goal instanceof NavigationGoal.FollowGoal) && checkSpatialStall()) return;
+                && !(goal instanceof NavigationGoal.FollowingGoal) && checkSpatialStall()) return;
         if (task.status() == NavigationStatus.COMPUTING) holdPositionWhilePlanning();
         if (pendingCapture != null) {
             advanceCapture();
@@ -469,7 +531,7 @@ final class NavigatorImpl implements Navigator {
         if (navigationMining != null) {
             if (navigationMining.status() == MiningStatus.RUNNING) return;
             if (navigationMining.status() == MiningStatus.FAILED || navigationMining.status() == MiningStatus.CANCELLED) {
-                task.fail("navigation_break_failed", resultNodesVisited());
+                task.fail("navigation_break_failed:" + navigationMining.completion().join().reason(), resultNodesVisited());
                 return;
             }
             navigationMining = null;
@@ -477,18 +539,27 @@ final class NavigatorImpl implements Navigator {
             requestPath();
             return;
         }
-        if (goal instanceof NavigationGoal.FollowGoal follow) {
+        if (goal instanceof NavigationGoal.FollowingGoal follow) {
             if (follow.target().isRemoved() || follow.target().isDeadOrDying()
-                    || follow.target().level() != owner.player().level()) {
+                    || follow.target().level() != owner.entity().level()) {
                 task.fail("follow_target_unavailable", 0);
                 owner.actions().stop();
                 return;
             }
-            if (owner.player().distanceToSqr(follow.target()) <= follow.distance() * follow.distance()
-                    && (stableForArrival(owner.player()) || activeTransition() == null)) {
+            if (owner.entity().distanceToSqr(follow.target()) <= follow.distance() * follow.distance()
+                    && (stableForArrival(owner.entity()) || activeTransition() == null)) {
                 owner.actions().stop();
                 path = List.of();
                 pathIndex = 0;
+                return;
+            }
+            // A grid endpoint can be inside the follow sphere while the body is
+            // still a fraction of a block outside it. Finish that short approach
+            // physically instead of repeatedly searching the same one-node path.
+            if (!isPlanning() && stableForArrival(owner.entity())
+                    && Math.abs(owner.entity().getY() - follow.target().getY()) < .5
+                    && owner.entity().distanceTo(follow.target()) <= follow.distance() + .7) {
+                tickFinalApproach();
                 return;
             }
             if (task.status() == NavigationStatus.RUNNING
@@ -496,7 +567,7 @@ final class NavigatorImpl implements Navigator {
                     || (runtime.server().getTickCount() - lastFollowPathTick >= 20 && shouldRepathFollow(follow)))) {
                 requestPath(!path.isEmpty() && pathIndex < path.size());
             }
-        } else if (reachedGoal() && (stableForArrival(owner.player()) || activeTransition() == null)) {
+        } else if (reachedGoal() && (stableForArrival(owner.entity()) || activeTransition() == null)) {
             finishSuccess();
             return;
         }
@@ -511,9 +582,9 @@ final class NavigatorImpl implements Navigator {
         }
         // Plan the next local segment early, while the remaining validated route is still executable.
         if (!finalPlanningSegment && !isPlanning() && pathIndex < path.size()
-                && path.size() - pathIndex <= 8 && stableForArrival(owner.player())) requestPath(true);
+                && path.size() - pathIndex <= 8 && stableForArrival(owner.entity())) requestPath(true);
         if (pathIndex >= path.size()) {
-            if (goal instanceof NavigationGoal.FollowGoal) {
+            if (goal instanceof NavigationGoal.FollowingGoal) {
                 requestNextFollowPath();
             } else if (reachedGoal()) {
                 finishSuccess();
@@ -546,15 +617,19 @@ final class NavigatorImpl implements Navigator {
         if (!prepareTransition(next)) return;
         if (!readyAfterActions(transition)) { requestHazardRepath(); return; }
         Vec3 target = transitionTarget(transition);
-        double dx = target.x - owner.player().getX();
-        double dz = target.z - owner.player().getZ();
-        if (dx * dx + dz * dz < transition.landing().horizontalTolerance() * transition.landing().horizontalTolerance()
-                && Math.abs(target.y - owner.player().getY()) < transition.landing().verticalTolerance()
-                && (!transition.landing().stable() || stableForArrival(owner.player()))) {
+        double dx = target.x - owner.entity().getX();
+        double dz = target.z - owner.entity().getZ();
+        // A .37-block arrival radius leaves a .6-wide body across the previous face.
+        // Centre it before changing direction in a narrow corridor or beside a ledge.
+        double nodeTolerance = continuesStraight(transition) ? transition.landing().horizontalTolerance()
+                : Math.min(.15, transition.landing().horizontalTolerance());
+        if (dx * dx + dz * dz < nodeTolerance * nodeTolerance
+                && Math.abs(target.y - owner.entity().getY()) < transition.landing().verticalTolerance()
+                && (!transition.landing().stable() || stableForArrival(owner.entity()))) {
             pathIndex++;
             lastTargetDistance = Double.POSITIVE_INFINITY;
             if (pathIndex >= path.size()) {
-                if (goal instanceof NavigationGoal.FollowGoal) requestNextFollowPath();
+                if (goal instanceof NavigationGoal.FollowingGoal) requestNextFollowPath();
                 else if (reachedGoal()) finishSuccess();
                 else if (finalPlanningSegment) tickFinalApproach();
                 else requestNextFollowPath();
@@ -574,18 +649,18 @@ final class NavigatorImpl implements Navigator {
             if (!prepareTransition(next)) return;
             if (!readyAfterActions(transition)) { requestHazardRepath(); return; }
             target = transitionTarget(transition);
-            dx = target.x - owner.player().getX(); dz = target.z - owner.player().getZ();
+            dx = target.x - owner.entity().getX(); dz = target.z - owner.entity().getZ();
         }
         float yaw = (float)(Math.atan2(-dx, dz) * 180.0 / Math.PI);
         owner.actions().look(yaw, 0);
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         Vec3 velocity = player.getDeltaMovement();
         boolean swim = transition.type() == GridTransition.Type.SWIM;
         player.setSwimming(swim);
         boolean straight = continuesStraight(transition);
         MovementController.Input input = movement.update(transition,
                 new MovementController.State(player.getX(), player.getY(), player.getZ(), velocity.x, velocity.y,
-                        velocity.z, player.onGround(), player.getFoodData().getFoodLevel() > 6), straight);
+                        velocity.z, player.onGround(), ActorSupport.canSprint(player)), straight);
         owner.actions().setMovement(input.strafe(), input.forward(), input.jump(), input.sprint(), input.sneak());
         boolean progressed = progressedToward(target);
         if (progressed) {
@@ -637,11 +712,11 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean validateTransitionGeometry(GridTransition transition) {
-        ServerLevel level = (ServerLevel) owner.player().level();
+        ServerLevel level = (ServerLevel) owner.entity().level();
         if (!transition.equals(validatedTransition) || liveTransitionView == null
-                || liveTransitionView.sprintAvailable() != (owner.player().getFoodData().getFoodLevel() > 6)
+                || liveTransitionView.sprintAvailable() != (ActorSupport.canSprint(owner.entity()))
                 || !liveTransitionView.geometryCurrent(level)) {
-            boolean sprint = owner.player().getFoodData().getFoodLevel() > 6;
+            boolean sprint = ActorSupport.canSprint(owner.entity());
             if (plannedSnapshot != null && plannedSnapshot.sprintAvailable() == sprint
                     && plannedSnapshot.geometryCurrent(level) && plannedSnapshot.passable(transition.from())
                     && plannedSnapshot.passable(transition.to())) {
@@ -650,7 +725,7 @@ final class NavigatorImpl implements Navigator {
                 pendingValidationEdge = null;
             } else {
                 if (pendingTransitionValidation == null || !transition.equals(pendingValidationEdge)) {
-                    pendingTransitionValidation = WorldSnapshot.beginTransitionView(level, owner.player(),
+                    pendingTransitionValidation = WorldSnapshot.beginTransitionView(level, owner.entity(),
                             transition.from(), transition.to(), policy.allowWater(), policy.allowBreaking(),
                             policy.allowPlacing());
                     pendingValidationEdge = transition;
@@ -675,7 +750,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void holdForTransitionValidation() {
-        if (!stableForArrival(owner.player())) {
+        if (!stableForArrival(owner.entity())) {
             requestHazardRepath();
             return;
         }
@@ -684,7 +759,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean readyAfterActions(GridTransition transition) {
-        return !transition.gapJump() || hasLiveJumpClearance((ServerLevel) owner.player().level(),
+        return !transition.gapJump() || hasLiveJumpClearance((ServerLevel) owner.entity().level(),
                 blockPos(transition.from()), blockPos(transition.to()));
     }
 
@@ -700,9 +775,9 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void brakeHorizontal() {
-        if (owner.player().onGround() || owner.player().isInWater()) {
-            Vec3 motion = owner.player().getDeltaMovement();
-            owner.player().setDeltaMovement(0.0D, motion.y, 0.0D);
+        if (owner.entity().onGround() || owner.entity().isInWater()) {
+            Vec3 motion = owner.entity().getDeltaMovement();
+            owner.entity().setDeltaMovement(0.0D, motion.y, 0.0D);
         }
     }
 
@@ -738,7 +813,7 @@ final class NavigatorImpl implements Navigator {
             return;
         }
         planningDeferred = false;
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         // Looking at a point is an immediate orientation goal.  It must not
         // be treated as a request to walk into the target block (which may be
         // above the bot or otherwise non-walkable).
@@ -755,20 +830,19 @@ final class NavigatorImpl implements Navigator {
                 return;
             }
             runtime.releaseNavigationTickets(owner.id());
-            boolean moved = player.teleportTo(targetLevel, dimension.position().x(), dimension.position().y(),
-                    dimension.position().z(), Set.of(), player.getYRot(), player.getXRot(), false);
+            boolean moved = runtime.teleportBot(owner, targetLevel, dimension.position());
             if (!moved) {
                 task.fail("dimension_change_rejected", 0);
                 return;
             }
         }
-        player = owner.player();
+        player = owner.entity();
         ServerLevel level = (ServerLevel)player.level();
-        if (!(goal instanceof NavigationGoal.FollowGoal) && reachedGoal()) {
+        if (!(goal instanceof NavigationGoal.FollowingGoal) && reachedGoal()) {
             finishSuccess();
             return;
         }
-        if (goal instanceof NavigationGoal.FollowGoal follow) followPlanPosition = follow.target().position();
+        if (goal instanceof NavigationGoal.FollowingGoal follow) followPlanPosition = follow.target().position();
         GridPos startPos = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(), player.blockPosition().getZ());
         if (backgroundPlanning && !finalPlanningSegment && !path.isEmpty()) {
             // Extend the captured area from the frontier instead of searching the same old boundary again.
@@ -777,6 +851,9 @@ final class NavigatorImpl implements Navigator {
         }
         BlockPos requestedTarget = targetBlock();
         GridPos desired = new GridPos(requestedTarget.getX(), requestedTarget.getY(), requestedTarget.getZ());
+        if (explorationGuide != null && owner.entity().blockPosition().equals(blockPos(explorationGuide))
+                && stableForArrival(owner.entity())) explorationGuide = null;
+        if (explorationGuide != null) desired = explorationGuide;
         // Search towards the real goal.  WorldSnapshot bounds the amount of
         // world read around the bot, while GridPathfinder can return a useful
         // frontier path when the goal is beyond that snapshot.
@@ -817,7 +894,7 @@ final class NavigatorImpl implements Navigator {
 
     private void holdPositionWhilePlanning() {
         if (!policy.allowWater()) return;
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         ServerLevel level = (ServerLevel) player.level();
         BlockPos feet = player.blockPosition();
         boolean inWater = player.isInWater() || isWater(level, feet) || isWater(level, feet.below());
@@ -851,7 +928,7 @@ final class NavigatorImpl implements Navigator {
     private void submitSearch(WorldSnapshot snapshot) {
         if (task == null || task.cancelled.get() || isTerminal(task.status())
                 || captureGeneration != requestGeneration) return;
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         GridPos current = new GridPos(player.blockPosition().getX(), player.blockPosition().getY(),
                 player.blockPosition().getZ());
         if (backgroundPlanning && pathIndex < path.size()) {
@@ -877,8 +954,8 @@ final class NavigatorImpl implements Navigator {
         GridPos startPos = current;
         GridPos desired = captureGoal;
         long generation = captureGeneration;
-        Set<GridPos> searchGoals = selectSearchGoals(snapshot, desired);
-        Set<GridPos> exploredFrontiers = Set.copyOf(task.exploredFrontierCells);
+        Set<GridPos> searchGoals = explorationGuide == null ? selectSearchGoals(snapshot, desired) : Set.of(desired);
+        Set<GridPos> exploredFrontiers = explorationGuide == null ? Set.copyOf(task.exploredFrontierCells) : Set.of();
         if (searchGoals.isEmpty()) {
             if (!backgroundPlanning) task.fail("unreachable", resultNodesVisited());
             backgroundPlanning = false;
@@ -888,10 +965,16 @@ final class NavigatorImpl implements Navigator {
         try {
             searchFuture = runtime.pathScheduler().submit(searchPriority(), () -> {
                 long searchStarted = System.nanoTime();
-                GridPath result = GridPathfinder.findToAny(snapshot, startPos, searchGoals, desired, searchPolicy,
-                        runtime.pathNodeBudget()::tryConsume, true, exploredFrontiers);
+                GridExploration exploration = GridPathfinder.explore(snapshot, startPos, searchGoals, desired, searchPolicy,
+                        runtime.pathNodeBudget()::tryConsume, exploredFrontiers);
+                GridPath result = exploration.path();
                 runtime.recordPathSearch(result.nodesVisited(), System.nanoTime() - searchStarted);
-                runtime.server().execute(() -> applyPath(result, snapshot, generation));
+                runtime.server().execute(() -> {
+                    if (task != null && generation == requestGeneration && !isTerminal(task.status())) {
+                        task.routeGraph.observe(exploration.portals(), snapshot.routeRevision());
+                    }
+                    applyPath(result, snapshot, generation);
+                });
             });
             runtime.recordPathSearchSubmitted();
         } catch (RejectedExecutionException rejected) {
@@ -903,7 +986,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private int searchPriority() {
-        int base = goal instanceof NavigationGoal.FollowGoal ? 10 : 20;
+        int base = goal instanceof NavigationGoal.FollowingGoal ? 10 : 20;
         return base + Math.min(20, Math.max(0, runtime.server().getTickCount() - planningRequestedTick) / 20);
     }
 
@@ -912,7 +995,7 @@ final class NavigatorImpl implements Navigator {
         if (hasNewStaticHazard(node) || hasChangedObstacle(node) || hasDynamicObstacle(node)) return false;
         if (index > 0 && index - 1 < transitions.size()) {
             GridTransition edge = transitions.get(index - 1);
-            ServerLevel level = (ServerLevel) owner.player().level();
+            ServerLevel level = (ServerLevel) owner.entity().level();
             if (Math.abs(node.getY() + NavigationGeometry.feetOffset(level, node) - edge.toSupportHeight()) > .05) return false;
             if (edge.gapJump() && !hasLiveJumpClearance(level, blockPos(edge.from()), node)) return false;
         }
@@ -928,6 +1011,29 @@ final class NavigatorImpl implements Navigator {
      * advance toward it and make this decision later.
      */
     private Set<GridPos> selectSearchGoals(WorldSnapshot snapshot, GridPos desired) {
+        if (goal instanceof NavigationGoal.FollowingGoal follow) {
+            Set<GridPos> endpoints = new HashSet<>();
+            Vec3 target = follow.target().position();
+            int radius = (int)Math.min(4, Math.ceil(follow.distance()));
+            for(int dx=-radius;dx<=radius;dx++) for(int dy=-radius;dy<=radius;dy++) for(int dz=-radius;dz<=radius;dz++) {
+                GridPos candidate=desired.add(dx,dy,dz);
+                Vec3 feet=new Vec3(candidate.x()+.5,snapshot.supportHeight(candidate),candidate.z()+.5);
+                if(snapshot.passable(candidate) && !snapshot.occupiedByEntity(candidate)
+                        && feet.distanceToSqr(target)<=follow.distance()*follow.distance()) endpoints.add(candidate);
+            }
+            // A followed player occupies the target cell. Search a safe arrival
+            // region inside the requested distance, never a path through its body.
+            if(!endpoints.isEmpty()) {
+                // Prefer the followed player's floor. A cheap drop can otherwise
+                // end directly below it, inside the distance sphere but behind
+                // a solid floor, instead of executing the intended gap crossing.
+                double closestHeight=endpoints.stream().mapToDouble(cell -> Math.abs(snapshot.supportHeight(cell)-target.y)).min().orElseThrow();
+                endpoints.removeIf(cell -> Math.abs(snapshot.supportHeight(cell)-target.y)>closestHeight+.05);
+                return Set.copyOf(endpoints);
+            }
+            if(snapshot.occupiedByEntity(desired)) return Set.of();
+            return Set.of(desired);
+        }
         if (goal instanceof NavigationGoal.PositionGoal position) {
             if (snapshot.passable(desired) && !snapshot.occupiedByEntity(desired)) {
                 Vec3 point = new Vec3(position.position().x(), snapshot.supportHeight(desired),
@@ -972,8 +1078,8 @@ final class NavigatorImpl implements Navigator {
         }
     }
 
-    private boolean shouldRepathFollow(NavigationGoal.FollowGoal follow) {
-        if (follow.target().level() != owner.player().level()) return true;
+    private boolean shouldRepathFollow(NavigationGoal.FollowingGoal follow) {
+        if (follow.target().level() != owner.entity().level()) return true;
         if (followPlanPosition == null) return true;
         return follow.target().position().distanceToSqr(followPlanPosition)
                 > follow.repathDistance() * follow.repathDistance();
@@ -985,12 +1091,45 @@ final class NavigatorImpl implements Navigator {
         if (goal instanceof NavigationGoal.LookAtGoal lookAt) return BlockPos.containing(lookAt.position());
         if (goal instanceof NavigationGoal.ReturnGoal returnGoal) return BlockPos.containing(returnGoal.position());
         if (goal instanceof NavigationGoal.DimensionGoal dimension) return BlockPos.containing(dimension.position());
-        NavigationGoal.FollowGoal follow = (NavigationGoal.FollowGoal)goal;
+        NavigationGoal.FollowingGoal follow = (NavigationGoal.FollowingGoal)goal;
         return follow.target().blockPosition();
     }
 
+    private BlockPos visibleTransitionObstacle(ServerLevel level, LivingEntity actor, BlockPos next, BlockPos obstacle) {
+        Vec3 eye=actor.getEyePosition();
+        double reach=ActorSupport.context(actor).getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.BLOCK_INTERACTION_RANGE);
+        Vec3 aim=MiningAim.visiblePoint(obstacle,eye,reach,point->{
+            var hit=level.clip(new net.minecraft.world.level.ClipContext(eye,point,net.minecraft.world.level.ClipContext.Block.OUTLINE,net.minecraft.world.level.ClipContext.Fluid.NONE,actor));
+            return hit.getType()==net.minecraft.world.phys.HitResult.Type.BLOCK&&hit.getBlockPos().equals(obstacle);
+        });
+        if(aim!=null)return obstacle;
+        // A rising step can hide its lower face behind the head block or the current tunnel ceiling.
+        // Clear only that immediate clearance blocker, never an arbitrary block farther along the ray.
+        var hit=level.clip(new net.minecraft.world.level.ClipContext(eye,Vec3.atCenterOf(obstacle),net.minecraft.world.level.ClipContext.Block.OUTLINE,net.minecraft.world.level.ClipContext.Fluid.NONE,actor));
+        BlockPos first=hit.getBlockPos();
+        boolean clearance=first.equals(next.above())||next.getY()>actor.blockPosition().getY()&&first.equals(actor.blockPosition().above(2));
+        if(hit.getType()==net.minecraft.world.phys.HitResult.Type.BLOCK&&clearance&&ActorSupport.mayBreak(actor,level,first)
+                &&!MiningSafety.supportsPlayer(actor,first))return first;
+        return obstacle;
+    }
+
+    private void mineTransition(BlockPos obstacle) {
+        LivingEntity actor=owner.entity();
+        owner.actions().stop();
+        if(!actor.onGround())return;
+        if(MiningSafety.supportsPlayer(actor,obstacle)){
+            // The feet may still overlap the descending face at the edge of the previous step.
+            // Back onto solid support before mining it, keeping the ordinary floor safety check.
+            double dx=actor.getX()-(obstacle.getX()+.5),dz=actor.getZ()-(obstacle.getZ()+.5);
+            owner.actions().look((float)(Math.atan2(-dx,dz)*180/Math.PI),0);
+            owner.actions().setMovement(0,.35f,false,false,true);return;
+        }
+        if(actor.getDeltaMovement().horizontalDistanceSqr()>.0004)return;
+        navigationMining=owner.minerImpl().breakBlockWithoutCancellingNavigation(obstacle);
+    }
+
     private boolean prepareTransition(BlockPos next) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         ServerLevel level = (ServerLevel) player.level();
         BlockPos current = player.blockPosition();
         if (isLava(level, next) || (!policy.allowWater() && isWater(level, next))) {
@@ -1006,7 +1145,7 @@ final class NavigatorImpl implements Navigator {
         if (state.is(BlockTags.CLIMBABLE)) return true;
         if (isOpenDoorOrTrapdoor(state)) return true;
         var stateShape = state.getCollisionShape(level, next);
-        if (!stateShape.isEmpty() && stateShape.max(net.minecraft.core.Direction.Axis.Y) <= 0.5D
+        if (NavigationGeometry.partialSupport(stateShape)
                 && (hasBodyClearance(level, next, Pose.STANDING)
                 || hasBodyClearance(level, next, Pose.CROUCHING))) return true;
         if (!stateShape.isEmpty()) {
@@ -1014,7 +1153,7 @@ final class NavigatorImpl implements Navigator {
                 task.fail("obstacle_requires_breaking", resultNodesVisited());
                 return false;
             }
-            navigationMining = owner.minerImpl().breakBlockWithoutCancellingNavigation(next);
+            mineTransition(visibleTransitionObstacle(level, player, next, next));
             return false;
         }
         var above = level.getBlockState(next.above());
@@ -1026,7 +1165,7 @@ final class NavigatorImpl implements Navigator {
                 task.fail("obstacle_requires_breaking", resultNodesVisited());
                 return false;
             }
-            navigationMining = owner.minerImpl().breakBlockWithoutCancellingNavigation(next.above());
+            mineTransition(visibleTransitionObstacle(level, player, next, next.above()));
             return false;
         }
         BlockPos support = next.below();
@@ -1048,7 +1187,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean openDoorOrTrapdoor(ServerLevel level, BlockPos position, BlockState state) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         if (state.getBlock() instanceof DoorBlock door
                 && door.type().canOpenByHand()
                 && state.hasProperty(DoorBlock.OPEN) && !state.getValue(DoorBlock.OPEN)) {
@@ -1059,7 +1198,7 @@ final class NavigatorImpl implements Navigator {
             if (lowerState.getBlock() instanceof DoorBlock lowerDoor
                     && lowerDoor.type().canOpenByHand()
                     && lowerState.hasProperty(DoorBlock.OPEN) && !lowerState.getValue(DoorBlock.OPEN)) {
-                if (!player.mayInteract(level, lower)) return false;
+                if (!ActorSupport.mayInteract(player, level, lower)) return false;
                 lowerDoor.setOpen(player, level, lowerState, lower, true);
                 // Keep both halves synchronized even on server versions where
                 // DoorBlock#setOpen only mutates the clicked half immediately.
@@ -1072,13 +1211,13 @@ final class NavigatorImpl implements Navigator {
         }
         if (PassageBlocks.handOpenableTrapdoor(state)
                 && state.hasProperty(TrapDoorBlock.OPEN) && !state.getValue(TrapDoorBlock.OPEN)) {
-            if (!player.mayInteract(level, position)) return false;
+            if (!ActorSupport.mayInteract(player, level, position)) return false;
             level.setBlock(position, state.setValue(TrapDoorBlock.OPEN, true), 3);
             return true;
         }
         if (state.getBlock() instanceof FenceGateBlock gate
                 && state.hasProperty(FenceGateBlock.OPEN) && !state.getValue(FenceGateBlock.OPEN)) {
-            if (!player.mayInteract(level, position)) return false;
+            if (!ActorSupport.mayInteract(player, level, position)) return false;
             level.setBlock(position, state.setValue(FenceGateBlock.OPEN, true), 3);
             return true;
         }
@@ -1101,7 +1240,7 @@ final class NavigatorImpl implements Navigator {
                 state = level.getBlockState(head);
             }
             if (!state.getValue(DoorBlock.OPEN)) return false;
-            double halfWidth = owner.player().getDimensions(Pose.STANDING).width() / 2.0D;
+            double halfWidth = owner.entity().getDimensions(Pose.STANDING).width() / 2.0D;
             AABB jumpColumn = new AABB(0.5D - halfWidth, 0.0D, 0.5D - halfWidth,
                     0.5D + halfWidth, 1.0D, 0.5D + halfWidth);
             if (state.getCollisionShape(level, head).toAabbs().stream().anyMatch(jumpColumn::intersects)) {
@@ -1114,30 +1253,30 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean hasLiveJumpClearance(ServerLevel level, BlockPos from, BlockPos to) {
-        var dimensions = owner.player().getDimensions(Pose.STANDING);
+        var dimensions = owner.entity().getDimensions(Pose.STANDING);
         Vec3 start = new Vec3(from.getX() + 0.5D, from.getY() + NavigationGeometry.feetOffset(level, from),
                 from.getZ() + 0.5D);
         Vec3 end = new Vec3(to.getX() + 0.5D, to.getY() + NavigationGeometry.feetOffset(level, to),
                 to.getZ() + 0.5D);
         return NavigationGeometry.clearJump(start, end, dimensions.width(), dimensions.height(), box -> {
-            if (!level.noBlockCollision(owner.player(), box)) return false;
+            if (!level.noBlockCollision(owner.entity(), box)) return false;
             for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, box)) {
-                if (entity != owner.player() && entity.isAlive() && !entity.isSpectator()
-                        && !(goal instanceof NavigationGoal.FollowGoal follow && entity == follow.target())) return false;
+                if (entity != owner.entity() && entity.isAlive() && !entity.isSpectator()
+                        && !(goal instanceof NavigationGoal.FollowingGoal follow && entity == follow.target())) return false;
             }
             return true;
         }, pos -> NavigationSafety.dangerous(level, pos) || isWater(level, pos));
     }
 
     private boolean requiresSneak(BlockPos position) {
-        ServerLevel level = (ServerLevel) owner.player().level();
+        ServerLevel level = (ServerLevel) owner.entity().level();
         return !hasBodyClearance(level, position, Pose.STANDING)
                 && hasBodyClearance(level, position, Pose.CROUCHING);
     }
 
     private boolean hasBodyClearance(ServerLevel level, BlockPos position, Pose pose) {
-        var dimensions = owner.player().getDimensions(pose);
-        double margin = pose == Pose.CROUCHING ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        var dimensions = owner.entity().getDimensions(pose);
+        double margin = NavigationGeometry.clearanceMargin(dimensions.height(),pose==Pose.CROUCHING);
         return NavigationGeometry.bodyFits(level, position, NavigationGeometry.feetOffset(level, position),
                 dimensions.width(), dimensions.height() + margin, false);
     }
@@ -1145,8 +1284,8 @@ final class NavigatorImpl implements Navigator {
     private boolean hasClearanceAbove(ServerLevel level, BlockPos position, Pose pose) {
         BlockState above = level.getBlockState(position.above());
         var aboveShape = above.getCollisionShape(level, position.above());
-        double height = owner.player().getDimensions(pose).height();
-        double margin = pose == Pose.CROUCHING ? CROUCHING_CLEARANCE_MARGIN : STANDING_CLEARANCE_MARGIN;
+        double height = owner.entity().getDimensions(pose).height();
+        double margin = NavigationGeometry.clearanceMargin(height,pose==Pose.CROUCHING);
         double offset = NavigationGeometry.feetOffset(level, position);
         return aboveShape.isEmpty()
                 || hasCenteredOpenPassage(above, aboveShape, height + offset + margin - 1.0D)
@@ -1158,7 +1297,7 @@ final class NavigatorImpl implements Navigator {
                                            net.minecraft.world.phys.shapes.VoxelShape shape, double height) {
         if (!(state.getBlock() instanceof DoorBlock || state.getBlock() instanceof TrapDoorBlock)
                 || !state.hasProperty(DoorBlock.OPEN) || !state.getValue(DoorBlock.OPEN)) return false;
-        double halfWidth = owner.player().getDimensions(Pose.STANDING).width() / 2.0D;
+        double halfWidth = owner.entity().getDimensions(Pose.STANDING).width() / 2.0D;
         AABB body = new AABB(0.5D - halfWidth, 0.0D, 0.5D - halfWidth,
                 0.5D + halfWidth, height, 0.5D + halfWidth);
         for (AABB part : shape.toAabbs()) if (part.intersects(body)) return false;
@@ -1166,12 +1305,12 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean hasDynamicObstacle(BlockPos position) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         ServerLevel level = (ServerLevel) player.level();
         AABB cell = new AABB(position).inflate(0.12D);
         for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, cell)) {
             if (entity == player || !entity.isAlive() || entity.isRemoved() || entity.isSpectator()) continue;
-            if (goal instanceof NavigationGoal.FollowGoal follow && entity == follow.target()) continue;
+            if (goal instanceof NavigationGoal.FollowingGoal follow && entity == follow.target()) continue;
             return true;
         }
         return false;
@@ -1179,13 +1318,13 @@ final class NavigatorImpl implements Navigator {
 
     private boolean hasNewStaticHazard(BlockPos position) {
         if (plannedSnapshot == null || policy.dangerCost() <= 0.0) return false;
-        ServerLevel level = (ServerLevel) owner.player().level();
+        ServerLevel level = (ServerLevel) owner.entity().level();
         return NavigationSafety.dangerous(level, position) && !plannedSnapshot.dangerous(new GridPos(position.getX(), position.getY(), position.getZ()));
     }
 
     private boolean hasChangedObstacle(BlockPos position) {
         if (plannedSnapshot == null) return false;
-        ServerLevel level = (ServerLevel) owner.player().level();
+        ServerLevel level = (ServerLevel) owner.entity().level();
         if (isLava(level, position) || (!policy.allowWater() && isWater(level, position))) return true;
         GridPos grid = new GridPos(position.getX(), position.getY(), position.getZ());
         if (!plannedSnapshot.passable(grid)) return false;
@@ -1224,8 +1363,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean isLowSurface(ServerLevel level, BlockPos position, BlockState state) {
-        return !state.getCollisionShape(level, position).isEmpty()
-                && state.getCollisionShape(level, position).max(net.minecraft.core.Direction.Axis.Y) <= 0.5D
+        return NavigationGeometry.partialSupport(state.getCollisionShape(level, position))
                 && (hasBodyClearance(level, position, Pose.STANDING)
                 || hasBodyClearance(level, position, Pose.CROUCHING));
     }
@@ -1252,14 +1390,14 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean requestHazardRepath() {
-        if (!stableForArrival(owner.player())) {
+        if (!stableForArrival(owner.entity())) {
             // Replanning from a transient air cell can erase the landing contract.
             // Keep steering at the landing and repair the route once it is stable.
             recoverAfterLanding = true;
             GridTransition transition = activeTransition();
             if (transition != null) {
                 Vec3 target = transitionTarget(transition);
-                Vec3 current = owner.player().position();
+                Vec3 current = owner.entity().position();
                 owner.actions().look((float) (Math.atan2(current.x - target.x, target.z - current.z) * 180 / Math.PI), 0);
                 owner.actions().setMovement(0, .2f, false, false, false);
             }
@@ -1281,7 +1419,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void finishStuck(String reason, BlockPos next) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         GridTransition edge = activeTransition();
         task.failureContext = new NavigationFailureContext(reason, player.blockPosition().immutable(),
                 next == null ? null : next.immutable(), edge == null ? List.of()
@@ -1293,7 +1431,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private void tickFinalApproach() {
-        if (!stableForArrival(owner.player())) {
+        if (!stableForArrival(owner.entity())) {
             // The last drop node can be passed horizontally before landing.
             // Its airborne cell needs no bridge; let vanilla finish the fall.
             owner.actions().stop();
@@ -1301,10 +1439,10 @@ final class NavigatorImpl implements Navigator {
             return;
         }
         Vec3 target = goalPoint();
-        Vec3 current = owner.player().position();
+        Vec3 current = owner.entity().position();
         double dx = target.x - current.x;
         double dz = target.z - current.z;
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         ServerLevel level = (ServerLevel) player.level();
         double horizontal = Math.hypot(dx, dz);
         double step = Math.min(0.2D, horizontal);
@@ -1361,13 +1499,17 @@ final class NavigatorImpl implements Navigator {
     }
 
     private Vec3 goalPoint() {
+        if (goal instanceof NavigationGoal.FollowingGoal follow) {
+            Vec3 target = follow.target().position(), offset = owner.entity().position().subtract(target);
+            return target.add(offset.normalize().scale(Math.max(.1, follow.distance() - .05)));
+        }
         if (goal instanceof NavigationGoal.PositionGoal position) return position.position();
         if (goal instanceof NavigationGoal.LookAtGoal lookAt) return lookAt.position();
         if (goal instanceof NavigationGoal.ReturnGoal returnGoal) return returnGoal.position();
         if (goal instanceof NavigationGoal.DimensionGoal dimension) return dimension.position();
         if (goal instanceof NavigationGoal.BlockGoal block) {
             Vec3 center = Vec3.atCenterOf(block.position());
-            Vec3 current = owner.player().position();
+            Vec3 current = owner.entity().position();
             double horizontal = Math.hypot(center.x - current.x, center.z - current.z);
             double vertical = center.y - current.y;
             if (horizontal > 1.0E-6D && Math.abs(vertical) <= block.tolerance()) {
@@ -1380,12 +1522,12 @@ final class NavigatorImpl implements Navigator {
             }
             return center;
         }
-        return owner.player().position();
+        return owner.entity().position();
     }
 
     /** Counts progress only when the active waypoint gets measurably closer. */
     private boolean progressedToward(Vec3 target) {
-        double distance = owner.player().position().distanceToSqr(target);
+        double distance = owner.entity().position().distanceToSqr(target);
         if (!Double.isFinite(lastTargetDistance)) {
             // Establish the baseline without counting the first observation
             // after a plan/replan as movement. Otherwise a motionless bot
@@ -1399,7 +1541,7 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean checkSpatialStall() {
-        Vec3 position = owner.player().position();
+        Vec3 position = owner.entity().position();
         if (stallAnchor == null || Math.hypot(position.x - stallAnchor.x, position.z - stallAnchor.z) >= 1.5D
                 || Math.abs(position.y - stallAnchor.y) >= 2.0D) {
             stallAnchor = position;
@@ -1413,13 +1555,13 @@ final class NavigatorImpl implements Navigator {
     }
 
     private boolean placeSupport(ServerLevel level, BlockPos position) {
-        ServerPlayer player = owner.player();
-        if (!player.mayInteract(level, position)) return false;
+        LivingEntity player = owner.entity();
+        if (!ActorSupport.mayInteract(player, level, position)) return false;
         if (!hasSolidNeighbour(level, position)) return false;
         BlockState existing = level.getBlockState(position);
         if (!existing.canBeReplaced() || !level.getFluidState(position).isEmpty()) return false;
-        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
-            ItemStack stack = player.getInventory().getItem(slot);
+        for (int slot = 0; slot < ActorSupport.context(player).getInventory().getContainerSize(); slot++) {
+            ItemStack stack = ActorSupport.context(player).getInventory().getItem(slot);
             if (!NavigationSafety.buildingMaterial(stack, level, position)) continue;
             BlockItem blockItem = (BlockItem) stack.getItem();
             Block block = blockItem.getBlock();
@@ -1446,20 +1588,20 @@ final class NavigatorImpl implements Navigator {
 
     private boolean reachedGoal() {
         if (goal instanceof NavigationGoal.PositionGoal position) {
-            return owner.player().position().distanceTo(position.position()) <= position.tolerance();
+            return owner.entity().position().distanceTo(position.position()) <= position.tolerance();
         }
         if (goal instanceof NavigationGoal.LookAtGoal lookAt) {
-            return owner.player().position().distanceTo(lookAt.position()) <= lookAt.tolerance();
+            return owner.entity().position().distanceTo(lookAt.position()) <= lookAt.tolerance();
         }
         if (goal instanceof NavigationGoal.ReturnGoal returnGoal) {
-            return owner.player().position().distanceTo(returnGoal.position()) <= returnGoal.tolerance();
+            return owner.entity().position().distanceTo(returnGoal.position()) <= returnGoal.tolerance();
         }
         if (goal instanceof NavigationGoal.DimensionGoal dimension) {
-            return owner.player().level().dimension().equals(dimension.dimension())
-                    && owner.player().position().distanceTo(dimension.position()) <= dimension.tolerance();
+            return owner.entity().level().dimension().equals(dimension.dimension())
+                    && owner.entity().position().distanceTo(dimension.position()) <= dimension.tolerance();
         }
         if (goal instanceof NavigationGoal.BlockGoal block) {
-            return owner.player().position().distanceTo(Vec3.atCenterOf(block.position())) <= block.tolerance();
+            return owner.entity().position().distanceTo(Vec3.atCenterOf(block.position())) <= block.tolerance();
         }
         return false;
     }
@@ -1496,6 +1638,10 @@ final class NavigatorImpl implements Navigator {
         }
         budgetDeferrals = 0;
         if (result.nodes().isEmpty()) {
+            if (explorationGuide != null && !snapshot.hasUnloadedChunks()) {
+                task.routeGraph.reject(explorationGuide);
+                explorationGuide = null;
+            }
             // The fake player may reach the edge of its loaded area before
             // the server finishes loading the next chunk. Retrying on later
             // ticks lets normal player-driven chunk loading catch up instead
@@ -1510,6 +1656,7 @@ final class NavigatorImpl implements Navigator {
                 requestPath();
                 return;
             }
+            if (!(goal instanceof NavigationGoal.FollowingGoal) && tryGraphBacktrack(snapshot)) return;
             task.fail("unreachable", resultNodesVisited());
             return;
         }
@@ -1521,8 +1668,8 @@ final class NavigatorImpl implements Navigator {
         }
         ArrayList<BlockPos> converted = new ArrayList<>(result.nodes().size());
         for (GridPos pos : result.nodes()) converted.add(new BlockPos(pos.x(), pos.y(), pos.z()));
-        int joinIndex = converted.indexOf(owner.player().blockPosition());
-        if (keepOldPath && (joinIndex < 0 || !stableForArrival(owner.player()))) {
+        int joinIndex = converted.indexOf(owner.entity().blockPosition());
+        if (keepOldPath && (joinIndex < 0 || !stableForArrival(owner.entity()))) {
             // Preserve the active edge (including a jump in flight) and splice at a common future node.
             int oldJoin = -1, newJoin = -1;
             for (int i = pathIndex; i < path.size(); i++) {
@@ -1536,7 +1683,7 @@ final class NavigatorImpl implements Navigator {
             ArrayList<GridTransition> joinedTransitions = new ArrayList<>(transitions.subList(0, oldJoin));
             joinedTransitions.addAll(result.transitions().subList(newJoin, result.transitions().size()));
             path = List.copyOf(joined); transitions = List.copyOf(joinedTransitions);
-            plannedSnapshot = snapshot; finalPlanningSegment = result.goalReached();
+            plannedSnapshot = snapshot; finalPlanningSegment = result.goalReached() && explorationGuide == null;
             rememberFrontier(result);
             return;
         }
@@ -1544,7 +1691,7 @@ final class NavigatorImpl implements Navigator {
         path = List.copyOf(converted);
         transitions = result.transitions();
         pathIndex = joinIndex >= 0 ? Math.min(joinIndex + 1, path.size()) : Math.min(1, path.size());
-        finalPlanningSegment = result.goalReached();
+        finalPlanningSegment = result.goalReached() && explorationGuide == null;
         rememberFrontier(result);
         lastTargetDistance = Double.POSITIVE_INFINITY; ticksWithoutProgress = 0;
         task.status = NavigationStatus.RUNNING;
@@ -1556,6 +1703,23 @@ final class NavigatorImpl implements Navigator {
         while (task.exploredFrontierCells.size() > 8192) {
             task.exploredFrontierCells.remove(task.exploredFrontierCells.iterator().next());
         }
+    }
+
+    private boolean tryGraphBacktrack(WorldSnapshot snapshot) {
+        if (task.graphBacktracks >= 64) return false;
+        BlockPos position = owner.entity().blockPosition(), target = targetBlock();
+        // A visible local goal that was exhaustively searched is unreachable
+        // under the current policy. Do not replace that failure with distant
+        // exploration (e.g. dropping into a pit after losing sprint).
+        if(snapshot.known(new GridPos(target.getX(),target.getY(),target.getZ()))) return false;
+        var next = task.routeGraph.waypoint(new GridPos(position.getX(), position.getY(), position.getZ()),
+                new GridPos(target.getX(), target.getY(), target.getZ()), task.exploredFrontierCells,
+                revision -> ((WorldSnapshot.RouteRevision)revision).current());
+        if (next.isEmpty()) return false;
+        explorationGuide = next.get(); task.graphBacktracks++;
+        expandedSnapshotRadius = 0;
+        requestPath();
+        return true;
     }
 
     /** Waits for ordinary chunk loading; this never requests world generation. */
@@ -1573,13 +1737,13 @@ final class NavigatorImpl implements Navigator {
 
     private void finishSuccess() {
         // The arrival sphere may extend over the gap. Finish the active landing before stopping momentum.
-        if (!stableForArrival(owner.player()) && activeTransition() != null) return;
+        if (!stableForArrival(owner.entity()) && activeTransition() != null) return;
         if (goal instanceof NavigationGoal.LookAtGoal) lookAt(goalPoint());
         owner.actions().stop();
         // A position tolerance can be met in mid-jump. Completing then lets
         // the next request plan from an airborne cell while sprint momentum
         // carries the bot off a narrow landing. Wait for a stable arrival.
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         if (!(goal instanceof NavigationGoal.LookAtGoal) && !stableForArrival(player)) {
             Vec3 motion = player.getDeltaMovement();
             player.setDeltaMovement(0.0D, motion.y, 0.0D);
@@ -1602,13 +1766,13 @@ final class NavigatorImpl implements Navigator {
         task.complete(NavigationResult.success(nodes, duration));
     }
 
-    private boolean stableForArrival(ServerPlayer player) {
+    private boolean stableForArrival(LivingEntity player) {
         return player.onGround() || player.isInWater()
                 || isClimbable((ServerLevel) player.level(), player.blockPosition());
     }
 
     private void lookAt(Vec3 target) {
-        Vec3 from = owner.player().getEyePosition();
+        Vec3 from = owner.entity().getEyePosition();
         double dx = target.x - from.x;
         double dy = target.y - from.y;
         double dz = target.z - from.z;
@@ -1627,6 +1791,7 @@ final class NavigatorImpl implements Navigator {
         }
         goal = sequence.get(sequenceIndex);
         task.exploredFrontierCells.clear();
+        task.routeGraph.clear(); explorationGuide = null;
         path = List.of();
         pathIndex = 0;
         plannedSnapshot = null;
@@ -1658,7 +1823,7 @@ final class NavigatorImpl implements Navigator {
 
     void tickPendingRollbacks() {
         if (pendingRollbacks.isEmpty()) return;
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         int remaining = Math.min(16, pendingRollbacks.size());
         while (remaining-- > 0 && !pendingRollbacks.isEmpty()) {
             int index = Math.floorMod(pendingRollbackCursor++, pendingRollbacks.size());
@@ -1677,11 +1842,11 @@ final class NavigatorImpl implements Navigator {
             if (level.setBlock(action.position(), action.previousState(), 3)
                     && level.getBlockState(action.position()).equals(action.previousState())) {
                 ItemStack returned = action.returnedStack().copy();
-                ItemStack current = player.getInventory().getItem(action.slot());
+                ItemStack current = ActorSupport.context(player).getInventory().getItem(action.slot());
                 if (current.isEmpty()) {
-                    player.getInventory().setItem(action.slot(), returned);
-                } else if (!player.getInventory().add(returned.copy())) {
-                    player.drop(returned.copy(), false);
+                    ActorSupport.context(player).getInventory().setItem(action.slot(), returned);
+                } else if (!ActorSupport.context(player).getInventory().add(returned.copy())) {
+                    ActorSupport.context(player).drop(returned.copy(), false);
                 }
                 pendingRollbacks.remove(index);
                 pendingRollbackCursor--;
@@ -1706,23 +1871,25 @@ final class NavigatorImpl implements Navigator {
         private final long startedNanos = System.nanoTime();
         private int nodesVisited;
         private final int startedTick = runtime.server().getTickCount();
-        private final Vec3 initialPosition = owner.player().position();
+        private final Vec3 initialPosition = owner.entity().position();
         private Vec3 previousPosition = initialPosition;
-        private float previousHealth = owner.player().getHealth();
+        private float previousHealth = owner.entity().getHealth();
         private float damageTaken;
         private int firstMovementTick = -1, terminalTick = -1, replans;
         private long reusedSnapshotCells, ticksWithoutMovement;
         private final Set<GridPos> exploredFrontierCells = new LinkedHashSet<>();
+        private final RegionRouteGraph routeGraph = new RegionRouteGraph();
+        private int graphBacktracks;
         private NavigationFailureContext failureContext;
         void observe() {
-            Vec3 position = owner.player().position();
+            Vec3 position = owner.entity().position();
             if (firstMovementTick < 0 && position.distanceToSqr(initialPosition) >= .0025) {
                 firstMovementTick = runtime.server().getTickCount() - startedTick;
             }
             if (position.distanceToSqr(previousPosition) < .0001) ticksWithoutMovement++;
             else ticksWithoutMovement = 0;
             previousPosition = position;
-            float health = owner.player().getHealth();
+            float health = owner.entity().getHealth();
             damageTaken += Math.max(0, previousHealth - health);
             previousHealth = health;
         }

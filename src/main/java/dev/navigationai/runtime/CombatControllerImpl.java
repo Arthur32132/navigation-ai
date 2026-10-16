@@ -6,7 +6,11 @@ import dev.navigationai.api.CombatResult;
 import dev.navigationai.api.CombatSkill;
 import dev.navigationai.api.CombatStatus;
 import dev.navigationai.api.CombatTask;
-import dev.navigationai.api.CombatWeaponMode;
+import dev.navigationai.api.CombatWeapon;
+import dev.navigationai.api.CombatPhase;
+import dev.navigationai.api.CombatDiagnostics;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.core.component.DataComponents;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -37,17 +41,15 @@ import net.minecraft.world.level.ClipContext;
  * target is visible.
  */
 final class CombatControllerImpl implements CombatController {
-    private enum Weapon { NONE, SWORD, AXE, BOW }
-
     private final BotRuntime runtime;
     private final BotHandleImpl owner;
     private CombatTaskImpl task;
     private LivingEntity target;
     private CombatPolicy policy;
-    private Weapon weapon = Weapon.NONE;
-    private int weaponSlot = -1;
+    private CombatWeapon weapon = CombatWeapon.NONE;
     private int originalSlot = -1;
     private int swappedSlot = -1;
+    private int swappedSelectedSlot = -1;
     private int reactionTicks;
     private int ticks;
     private int bowTicks;
@@ -58,6 +60,14 @@ final class CombatControllerImpl implements CombatController {
     private double nearbyRadius;
     private int nearbyEmptyTicks;
     private long startGeneration;
+    private int unseenTicks;
+    private int weaponSwitches;
+    private int lastWeaponSwitch;
+    private int blockedMovementTicks;
+    private boolean shieldUsing;
+    private boolean visible;
+    private double targetDistance = Double.NaN;
+    private CombatPhase phase = CombatPhase.IDLE;
 
     CombatControllerImpl(BotRuntime runtime, BotHandleImpl owner) {
         this.runtime = runtime;
@@ -65,28 +75,40 @@ final class CombatControllerImpl implements CombatController {
     }
 
     @Override public CombatTask fight(LivingEntity target, CombatPolicy policy) {
+        return startFight(target, policy, true);
+    }
+
+    CombatTask fightAsChild(LivingEntity target, CombatPolicy policy) {
+        return startFight(target, policy, false);
+    }
+
+    private CombatTask startFight(LivingEntity target, CombatPolicy policy, boolean root) {
         runtime.ensureServerThread();
         owner.ensureActive();
         if (target == null) throw new IllegalArgumentException("target is required");
         if (policy == null) throw new IllegalArgumentException("policy is required");
         if (!isAllowedTarget(target, policy)) throw new IllegalArgumentException("target type is not allowed by policy");
+        if (root && owner.control().claim(BotControl.Kind.COMBAT) < 0) return superseded();
         long generation = ++startGeneration;
+        long controlRequest = owner.control().generation();
         cancel();
-        if (!cancelOtherControllers(generation)) return superseded();
+        if (!cancelOtherControllers(generation) || !owner.control().current(controlRequest)) return superseded();
         owner.ensureActive();
         this.target = target;
         this.nearbyMode = false;
         this.nearbyRadius = 0.0;
         this.nearbyEmptyTicks = 0;
         this.policy = policy;
-        this.originalSlot = owner.player().getInventory().getSelectedSlot();
+        this.originalSlot = ActorSupport.context(owner.entity()).getInventory().getSelectedSlot();
         this.reactionTicks = policy.skill().reactionTicks();
         this.ticks = 0;
         this.attacks = 0;
         this.shots = 0;
         this.bowTicks = 0;
         this.bowUsing = false;
+        resetTactics();
         this.task = new CombatTaskImpl();
+        updateDiagnostics("running");
         return task;
     }
 
@@ -97,24 +119,39 @@ final class CombatControllerImpl implements CombatController {
         if (!(radius > 0.0 && radius <= policy.maxFollowDistance())) {
             throw new IllegalArgumentException("radius must be in (0, maxFollowDistance]");
         }
+        if (owner.control().claim(BotControl.Kind.COMBAT) < 0) return superseded();
         long generation = ++startGeneration;
+        long controlRequest = owner.control().generation();
         cancel();
-        if (!cancelOtherControllers(generation)) return superseded();
+        if (!cancelOtherControllers(generation) || !owner.control().current(controlRequest)) return superseded();
         owner.ensureActive();
         this.target = null;
         this.nearbyMode = true;
         this.nearbyRadius = radius;
         this.nearbyEmptyTicks = 0;
         this.policy = policy;
-        this.originalSlot = owner.player().getInventory().getSelectedSlot();
+        this.originalSlot = ActorSupport.context(owner.entity()).getInventory().getSelectedSlot();
         this.reactionTicks = policy.skill().reactionTicks();
         this.ticks = 0;
         this.attacks = 0;
         this.shots = 0;
         this.bowTicks = 0;
         this.bowUsing = false;
+        resetTactics();
         this.task = new CombatTaskImpl();
+        updateDiagnostics("running");
         return task;
+    }
+
+    private void resetTactics() {
+        unseenTicks = 0;
+        weaponSwitches = 0;
+        lastWeaponSwitch = -policy.tactics().weaponSwitchCooldownTicks();
+        blockedMovementTicks = 0;
+        shieldUsing = false;
+        visible = false;
+        targetDistance = Double.NaN;
+        phase = CombatPhase.ACQUIRING;
     }
 
     private boolean cancelOtherControllers(long generation) {
@@ -148,8 +185,7 @@ final class CombatControllerImpl implements CombatController {
         owner.actions().stop();
         restoreWeapon();
         target = null;
-        weapon = Weapon.NONE;
-        weaponSlot = -1;
+        weapon = CombatWeapon.NONE;
         nearbyMode = false;
         nearbyRadius = 0.0;
         nearbyEmptyTicks = 0;
@@ -159,17 +195,26 @@ final class CombatControllerImpl implements CombatController {
     @Override public CombatTask task() { return task; }
     @Override public LivingEntity target() { return target; }
     boolean isActive() { return task != null && task.status == CombatStatus.RUNNING; }
+    int simulationRadius() {
+        return isActive() && policy.allowsBow() ? Math.min(6, 2 + (int)Math.ceil(policy.bowRange() / 16)) : 2;
+    }
 
     void tick() {
         if (!isActive()) return;
         ticks++;
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
+        String stopReason = CombatDecision.stopReason(policy, ticks, 0, player.getHealth());
+        if (stopReason != null) {
+            finish(CombatResult.failure(stopReason, attacks, shots));
+            return;
+        }
         if (nearbyMode && (!isAllowedNearbyTarget(target) || !target.isAlive())) {
             clearCurrentTarget();
             target = findNearbyTarget();
             if (target == null) {
                 nearbyEmptyTicks++;
                 if (nearbyEmptyTicks > 100) finish(CombatResult.success(attacks, shots));
+                else { phase = CombatPhase.ACQUIRING; updateDiagnostics("running"); }
                 return;
             }
             nearbyEmptyTicks = 0;
@@ -192,14 +237,24 @@ final class CombatControllerImpl implements CombatController {
                 }
                 nearbyEmptyTicks++;
                 if (nearbyEmptyTicks > 100) finish(CombatResult.success(attacks, shots));
+                else { phase = CombatPhase.ACQUIRING; updateDiagnostics("running"); }
                 return;
             }
             finish(CombatResult.failure("target_out_of_range", attacks, shots));
             return;
         }
 
-        Weapon desired = chooseWeapon(distance);
-        if (desired == Weapon.NONE) {
+        targetDistance = distance;
+        visible = hasLineOfSight(target.getBoundingBox().getCenter());
+        unseenTicks = visible ? 0 : unseenTicks + 1;
+        stopReason = CombatDecision.stopReason(policy, ticks, unseenTicks, player.getHealth());
+        if (stopReason != null) {
+            finish(CombatResult.failure(stopReason, attacks, shots));
+            return;
+        }
+
+        CombatWeapon desired = chooseWeapon(distance);
+        if (desired == CombatWeapon.NONE) {
             finish(CombatResult.failure("no_combat_weapon", attacks, shots));
             return;
         }
@@ -208,47 +263,57 @@ final class CombatControllerImpl implements CombatController {
             return;
         }
 
-        boolean ranged = weapon == Weapon.BOW;
+        boolean ranged = weapon == CombatWeapon.BOW;
         // Movement has a 0.55-block dead zone; keep its far edge inside reach.
-        double desiredDistance = ranged ? Math.min(policy.bowRange() - 2.0, 14.0) : policy.meleeRange() - 0.75;
-        moveAroundTarget(distance, desiredDistance);
+        double desiredDistance = ranged ? Math.max(1.0, Math.min(policy.bowRange() - 1.0, 14.0))
+                : Math.min(policy.meleeRange(), ActorSupport.context(player).entityInteractionRange()) - 0.75;
         Vec3 aim = aimPoint(ranged);
         lookSmoothlyAt(aim, policy.skill());
-        boolean visible = hasLineOfSight(aim);
+        moveAroundTarget(distance, desiredDistance);
+        if (!visible) phase = CombatPhase.SEARCHING;
         boolean aimed = aimError(aim) <= policy.skill().aimTolerance();
         if (reactionTicks > 0) reactionTicks--;
 
-        if (weapon == Weapon.BOW) {
-            tickBow(visible && aimed && distance <= policy.bowRange());
-        } else if (visible && aimed && rayHitsTarget() && reactionTicks == 0 && distance <= policy.meleeRange()
-                && player.getAttackStrengthScale(0.0f) >= 1.0f) {
-            player.attack(target);
-            attacks++;
+        if (weapon == CombatWeapon.BOW) {
+            stopShield();
+            CombatTaskImpl current = task;
+            tickBow(visible && hasLineOfSight(aim) && clearShot() && aimed && distance <= policy.bowRange());
+            if (task != current || !isActive()) return;
+            if (bowUsing) phase = CombatPhase.DRAWING;
+        } else {
+            tickShield(distance, visible && aimed);
+            if (visible && aimed && rayHitsTarget() && reactionTicks == 0
+                    && ActorSupport.context(player).getAttackStrengthScale(0.0f) >= 1.0f) {
+                stopShield();
+                // ServerPlayer.swing resets the attack-strength ticker in
+                // 26.2. Apply the charged vanilla attack before its animation,
+                // matching the normal attack-packet/hand-animation order.
+                ActorSupport.attack(player, target);
+                player.swing(InteractionHand.MAIN_HAND);
+                attacks++;
+                phase = CombatPhase.ATTACKING;
+            } else if (shieldUsing) phase = CombatPhase.BLOCKING;
         }
+        updateDiagnostics("running");
     }
 
-    private Weapon chooseWeapon(double distance) {
-        Inventory inventory = owner.player().getInventory();
-        // A sword is always preferred in AUTO, including when the target is far
-        // away. This makes an empty hand pick up a sword and also replaces a
-        // weaker/broken sword as soon as a better usable one is available.
-        if (policy.allowsSword() && findBestSlot(inventory, Weapon.SWORD) >= 0) return Weapon.SWORD;
-        if (policy.allowsBow() && hasUsableBow(inventory)) return Weapon.BOW;
-        // Preserve the old axe fallback only for AUTO when no sword or bow is
-        // available. SWORD and BOW modes are strict restrictions.
-        if (policy.weaponMode() == CombatWeaponMode.AUTO
-                && findBestSlot(inventory, Weapon.AXE) >= 0) return Weapon.AXE;
-        return Weapon.NONE;
+    private CombatWeapon chooseWeapon(double distance) {
+        Inventory inventory = ActorSupport.context(owner.entity()).getInventory();
+        return CombatDecision.weapon(policy, weapon, distance,
+                findBestSlot(inventory, CombatWeapon.SWORD) >= 0,
+                findBestSlot(inventory, CombatWeapon.AXE) >= 0,
+                hasUsableBow(inventory), target.isBlocking(), ticks - lastWeaponSwitch);
     }
 
     private boolean hasUsableBow(Inventory inventory) {
-        return findBestSlot(inventory, Weapon.BOW) >= 0;
+        return findBestSlot(inventory, CombatWeapon.BOW) >= 0;
     }
 
-    private boolean equip(Weapon desired) {
-        if (findBestSlot(owner.player().getInventory(), desired) < 0) return false;
+    private boolean equip(CombatWeapon desired) {
+        if (findBestSlot(ActorSupport.context(owner.entity()).getInventory(), desired) < 0) return false;
+        stopBow();
         restoreWeapon();
-        Inventory inventory = owner.player().getInventory();
+        Inventory inventory = ActorSupport.context(owner.entity()).getInventory();
         int slot = findBestSlot(inventory, desired);
         if (slot < 0) return false;
         if (slot < Inventory.getSelectionSize()) {
@@ -260,34 +325,39 @@ final class CombatControllerImpl implements CombatController {
             inventory.setItem(selected, replacement);
             inventory.setItem(slot, held);
             swappedSlot = slot;
+            swappedSelectedSlot = selected;
         }
+        if (weapon != desired) { weaponSwitches++; lastWeaponSwitch = ticks; }
         weapon = desired;
-        weaponSlot = slot;
+        owner.refreshEquipment();
         return true;
     }
 
     private void restoreWeapon() {
         if (swappedSlot >= 0) {
-            Inventory inventory = owner.player().getInventory();
-            int selected = inventory.getSelectedSlot();
+            Inventory inventory = ActorSupport.context(owner.entity()).getInventory();
+            int selected = swappedSelectedSlot;
             ItemStack held = inventory.getItem(selected).copy();
             ItemStack old = inventory.getItem(swappedSlot).copy();
             inventory.setItem(selected, old);
             inventory.setItem(swappedSlot, held);
             swappedSlot = -1;
+            swappedSelectedSlot = -1;
         }
-        if (originalSlot >= 0) owner.player().getInventory().setSelectedSlot(originalSlot);
+        if (originalSlot >= 0) ActorSupport.context(owner.entity()).getInventory().setSelectedSlot(originalSlot);
+        owner.refreshEquipment();
     }
 
-    private int findBestSlot(Inventory inventory, Weapon wanted) {
+    private int findBestSlot(Inventory inventory, CombatWeapon wanted) {
         int bestSlot = -1;
         double bestScore = Double.NEGATIVE_INFINITY;
         for (int slot = 0; slot < usableInventorySize(inventory); slot++) {
             ItemStack stack = inventory.getItem(slot);
             if (classify(stack) != wanted) continue;
             if (stack.isBroken()) continue;
-            if (wanted == Weapon.BOW && !isUsableBow(stack)) continue;
-            double score = wanted == Weapon.SWORD ? swordScore(stack) : 0.0;
+            if (wanted == CombatWeapon.BOW && !isUsableBow(stack)) continue;
+            if (ActorSupport.context(owner.entity()).getCooldowns().isOnCooldown(stack)) continue;
+            double score = wanted == CombatWeapon.SWORD || wanted == CombatWeapon.AXE ? swordScore(stack) : 0.0;
             if (bestSlot < 0 || score > bestScore) {
                 bestSlot = slot;
                 bestScore = score;
@@ -302,7 +372,7 @@ final class CombatControllerImpl implements CombatController {
 
     private boolean isUsableBow(ItemStack stack) {
         if (!(stack.getItem() instanceof BowItem) || stack.isBroken()) return false;
-        return !owner.player().getProjectile(stack).isEmpty();
+        return !ActorSupport.context(owner.entity()).getProjectile(stack).isEmpty();
     }
 
     private double swordScore(ItemStack stack) {
@@ -319,31 +389,35 @@ final class CombatControllerImpl implements CombatController {
         return attackDamage * 1000.0 + durability;
     }
 
-    private boolean isDesiredWeaponEquipped(Weapon desired) {
-        ItemStack held = owner.player().getMainHandItem();
+    private boolean isDesiredWeaponEquipped(CombatWeapon desired) {
+        ItemStack held = owner.entity().getMainHandItem();
         if (classify(held) != desired) return false;
-        if (desired == Weapon.BOW) return isUsableBow(held);
-        if (desired != Weapon.SWORD) return !held.isBroken();
-        int bestSlot = findBestSlot(owner.player().getInventory(), Weapon.SWORD);
+        if (ActorSupport.context(owner.entity()).getCooldowns().isOnCooldown(held)) return false;
+        if (desired == CombatWeapon.BOW) return isUsableBow(held);
+        int bestSlot = findBestSlot(ActorSupport.context(owner.entity()).getInventory(), desired);
         return bestSlot >= 0 && !held.isBroken()
-            && swordScore(held) >= swordScore(owner.player().getInventory().getItem(bestSlot));
+            && swordScore(held) >= swordScore(ActorSupport.context(owner.entity()).getInventory().getItem(bestSlot));
     }
 
-    private Weapon classify(ItemStack stack) {
-        if (stack.isEmpty()) return Weapon.NONE;
-        if (stack.getItem() instanceof BowItem) return Weapon.BOW;
-        if (stack.getItem() instanceof AxeItem) return Weapon.AXE;
+    private CombatWeapon classify(ItemStack stack) {
+        if (stack.isEmpty()) return CombatWeapon.NONE;
+        if (stack.getItem() instanceof BowItem) return CombatWeapon.BOW;
+        if (stack.getItem() instanceof AxeItem) return CombatWeapon.AXE;
         String path = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
-        return path.endsWith("_sword") ? Weapon.SWORD : Weapon.NONE;
+        return path.endsWith("_sword") ? CombatWeapon.SWORD : CombatWeapon.NONE;
     }
 
     private void tickBow(boolean aimed) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
+        if (bowUsing && (!player.isUsingItem() || !(player.getUseItem().getItem() instanceof BowItem))) {
+            bowUsing = false;
+            bowTicks = 0;
+        }
         if (!bowUsing) {
             if (!aimed || reactionTicks > 0) return;
             ItemStack bow = player.getItemInHand(InteractionHand.MAIN_HAND);
             if (!(bow.getItem() instanceof BowItem)
-                    || player.getProjectile(bow).isEmpty()) {
+                    || ActorSupport.context(player).getProjectile(bow).isEmpty()) {
                 finish(CombatResult.failure("no_arrows", attacks, shots));
                 return;
             }
@@ -356,7 +430,7 @@ final class CombatControllerImpl implements CombatController {
         int maxDraw = player.getUseItem().getUseDuration(player) - 1;
         if (bowTicks >= policy.skill().bowDrawTicks() || bowTicks >= maxDraw) {
             if (aimed) {
-                player.releaseUsingItem();
+                ActorSupport.releaseBow(player);
                 shots++;
             } else {
                 player.stopUsingItem();
@@ -367,9 +441,28 @@ final class CombatControllerImpl implements CombatController {
     }
 
     private void stopBow() {
-        if (bowUsing || owner.player().isUsingItem()) owner.player().stopUsingItem();
+        if (bowUsing || owner.entity().isUsingItem()) owner.entity().stopUsingItem();
         bowUsing = false;
         bowTicks = 0;
+        shieldUsing = false;
+    }
+
+    private void tickShield(double distance, boolean facing) {
+        LivingEntity player = owner.entity();
+        ItemStack shield = player.getOffhandItem();
+        boolean shouldBlock = policy.tactics().useShield() && facing
+                && distance <= policy.meleeRange() + 1.5
+                && ActorSupport.context(player).getAttackStrengthScale(0.0f) < 1.0f
+                && !shield.isEmpty() && !shield.isBroken() && shield.has(DataComponents.BLOCKS_ATTACKS)
+                && !ActorSupport.context(player).getCooldowns().isOnCooldown(shield);
+        if (!shouldBlock) { stopShield(); return; }
+        if (!shieldUsing || !player.isUsingItem()) player.startUsingItem(InteractionHand.OFF_HAND);
+        shieldUsing = true;
+    }
+
+    private void stopShield() {
+        if (shieldUsing) owner.entity().stopUsingItem();
+        shieldUsing = false;
     }
 
     private void moveAroundTarget(double distance, double desiredDistance) {
@@ -379,12 +472,71 @@ final class CombatControllerImpl implements CombatController {
             sideways = ((ticks / policy.skill().strafePeriod()) & 1) == 0 ? 0.65 : -0.65;
         }
         boolean sprint = distance > desiredDistance + 4.0;
-        boolean jump = shouldJumpOverObstacle(distance, desiredDistance);
-        owner.actions().setMovement((float) sideways, (float) forward, jump, sprint, false);
+        boolean jump = forward > 0 && shouldJumpOverObstacle(distance, desiredDistance);
+        boolean blocked = false;
+        if (policy.tactics().safeMovement() && !safeMovement(sideways, forward, jump, sprint)) {
+            blocked = true;
+            // Test independent inputs: retreat must not be forced over a ledge
+            // merely because a safe lateral escape is available beside it.
+            if (forward != 0 && safeMovement(0, forward, jump, sprint)) sideways = 0;
+            else if (safeMovement(sideways, 0, false, false) && sideways != 0) {
+                forward = 0; jump = false; sprint = false;
+            } else if (sideways != 0 && safeMovement(-sideways, 0, false, false)) {
+                sideways = -sideways; forward = 0; jump = false; sprint = false;
+            } else {
+                sideways = 0; forward = 0; jump = false; sprint = false;
+            }
+        }
+        if (blocked) blockedMovementTicks++;
+        phase = forward < 0 ? CombatPhase.RETREATING : forward > 0 ? CombatPhase.APPROACHING
+                : sideways != 0 ? CombatPhase.STRAFING : CombatPhase.HOLDING;
+        owner.actions().setMovement((float) sideways, (float) forward, jump, sprint,
+                blocked && sideways == 0 && forward == 0);
+    }
+
+    private boolean safeMovement(double sideways, double forward, boolean jump, boolean sprint) {
+        if (sideways == 0 && forward == 0) return true;
+        LivingEntity player = owner.entity();
+        ServerLevel level = (ServerLevel) player.level();
+        double yaw = Math.toRadians(player.getYRot());
+        double dx = sideways * Math.cos(yaw) - forward * Math.sin(yaw);
+        double dz = forward * Math.cos(yaw) + sideways * Math.sin(yaw);
+        double length = Math.hypot(dx, dz);
+        // Probe beyond the next physics step, including residual horizontal
+        // velocity. This is a collision/terrain query, never a position change.
+        double reach = (sprint ? 1.0 : 0.7) + Math.min(0.6, player.getDeltaMovement().horizontalDistance());
+        dx = dx / length * reach;
+        dz = dz / length * reach;
+        for (int sample = 1; sample <= 3; sample++) {
+            AABB body = player.getBoundingBox().move(dx * sample / 3.0, 0, dz * sample / 3.0);
+            for (int x = (int) Math.floor(body.minX); x <= (int) Math.floor(body.maxX - 1.0E-6); x++) {
+                for (int z = (int) Math.floor(body.minZ); z <= (int) Math.floor(body.maxZ - 1.0E-6); z++) {
+                    for (int y = (int) Math.floor(body.minY) - 1; y <= (int) Math.floor(body.maxY); y++) {
+                        BlockPos cell = new BlockPos(x, y, z);
+                        if (!level.hasChunkAt(cell) || NavigationSafety.dangerous(level, cell)
+                                || !level.getFluidState(cell).isEmpty()) return false;
+                    }
+                }
+            }
+            if (!level.noBlockCollision(player, body)) {
+                if (!jump || !level.noBlockCollision(player, body.move(0, 1.01, 0))) return false;
+            }
+            // Every corner needs support, including partial blocks. A gap
+            // under one side of the footprint is unsafe for strafing/backing.
+            double drop = player.onGround() ? 0.6 : 1.5;
+            for (double x : new double[]{body.minX + 0.035, body.maxX - 0.035}) {
+                for (double z : new double[]{body.minZ + 0.035, body.maxZ - 0.035}) {
+                    AABB support = new AABB(x - 0.02, body.minY - drop, z - 0.02,
+                            x + 0.02, body.minY + 0.02, z + 0.02);
+                    if (level.noBlockCollision(player, support)) return false;
+                }
+            }
+        }
+        return true;
     }
 
     private boolean shouldJumpOverObstacle(double distance, double desiredDistance) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         if (!player.onGround()) return false;
 
         // Do not jump while backing away. When closing distance, probe the
@@ -397,7 +549,11 @@ final class CombatControllerImpl implements CombatController {
         double dz = target.getZ() - player.getZ();
         double horizontal = Math.sqrt(dx * dx + dz * dz);
         if (horizontal < 1.0E-4) return false;
-        double probeDistance = Math.max(0.35, player.getBbWidth() * 0.65);
+        // Match the movement safety horizon. Otherwise the safe-movement check
+        // stops short of the obstacle before this shorter jump probe ever
+        // touches it, and the bot cannot climb an ordinary one-block step.
+        double probeDistance = (distance > desiredDistance + 4.0 ? 1.0 : 0.7)
+                + Math.min(0.6, player.getDeltaMovement().horizontalDistance());
         dx = dx / horizontal * probeDistance;
         dz = dz / horizontal * probeDistance;
 
@@ -410,7 +566,7 @@ final class CombatControllerImpl implements CombatController {
         Vec3 point = target.getBoundingBox().getCenter();
         if (ranged) {
             double speed = 3.0 * BowItem.getPowerForTime(policy.skill().bowDrawTicks());
-            double flightTicks = owner.player().distanceTo(target) / Math.max(0.1, speed);
+            double flightTicks = owner.entity().distanceTo(target) / Math.max(0.1, speed);
             double leadTicks = Math.min(8.0, flightTicks);
             Vec3 velocity = target.getDeltaMovement();
             // Grounded entities retain downward gravity velocity even though
@@ -425,40 +581,59 @@ final class CombatControllerImpl implements CombatController {
     }
 
     private void lookSmoothlyAt(Vec3 point, CombatSkill skill) {
-        Vec3 from = owner.player().getEyePosition();
+        Vec3 from = owner.entity().getEyePosition();
         double dx = point.x - from.x;
         double dy = point.y - from.y;
         double dz = point.z - from.z;
         double horizontal = Math.sqrt(dx * dx + dz * dz);
         float wantedYaw = (float) (Math.atan2(-dx, dz) * 180.0 / Math.PI);
         float wantedPitch = (float) (Math.atan2(-dy, horizontal) * 180.0 / Math.PI);
-        float yaw = stepAngle(owner.player().getYRot(), wantedYaw, skill.yawStep());
-        float pitch = stepLinear(owner.player().getXRot(), wantedPitch, skill.pitchStep());
+        float yaw = stepAngle(owner.entity().getYRot(), wantedYaw, skill.yawStep());
+        float pitch = stepLinear(owner.entity().getXRot(), wantedPitch, skill.pitchStep());
         owner.actions().look(yaw, pitch);
     }
 
     private boolean hasLineOfSight(Vec3 point) {
-        ServerLevel level = (ServerLevel) owner.player().level();
-        Vec3 from = owner.player().getEyePosition();
-        HitResult hit = level.clip(new ClipContext(from, point, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, owner.player()));
-        return hit.getType() == HitResult.Type.MISS || hit.getLocation().distanceToSqr(from) + 0.25 >= point.distanceToSqr(from);
+        ServerLevel level = (ServerLevel) owner.entity().level();
+        Vec3 from = owner.entity().getEyePosition();
+        HitResult hit = level.clip(new ClipContext(from, point, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, owner.entity()));
+        return hit.getType() == HitResult.Type.MISS || hit.getLocation().distanceToSqr(from) + 1.0E-7 >= point.distanceToSqr(from);
     }
 
     private boolean rayHitsTarget() {
-        Vec3 from = owner.player().getEyePosition();
-        Vec3 end = from.add(owner.player().getViewVector(1.0f).scale(policy.meleeRange() + 1.0));
-        return target.getBoundingBox().inflate(0.12).clip(from, end).isPresent();
+        Vec3 from = owner.entity().getEyePosition();
+        double reach = Math.min(policy.meleeRange(), ActorSupport.context(owner.entity()).entityInteractionRange());
+        Vec3 end = from.add(owner.entity().getViewVector(1.0f).scale(reach));
+        return firstEntityOnSegment(from, end) == target
+                && ActorSupport.context(owner.entity()).isWithinAttackRange(owner.entity().getMainHandItem(), target.getBoundingBox(), 0);
+    }
+
+    private boolean clearShot() {
+        return firstEntityOnSegment(owner.entity().getEyePosition(), target.getBoundingBox().getCenter()) == target;
+    }
+
+    private Entity firstEntityOnSegment(Vec3 from, Vec3 end) {
+        LivingEntity player = owner.entity();
+        ServerLevel level = (ServerLevel) player.level();
+        HitResult block = level.clip(new ClipContext(from, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player));
+        double blockDistance = block.getType() == HitResult.Type.MISS ? Double.POSITIVE_INFINITY
+                : from.distanceToSqr(block.getLocation());
+        var hitboxes = level.getEntities(player, new AABB(from, end).inflate(1.0),
+                entity -> entity.isPickable() && !entity.isSpectator())
+                .stream().map(entity -> new CombatGeometry.Hitbox<>(entity,
+                        entity.getBoundingBox().inflate(entity.getPickRadius()))).toList();
+        return CombatGeometry.firstHit(from, end, blockDistance, hitboxes);
     }
 
     private double aimError(Vec3 point) {
-        Vec3 from = owner.player().getEyePosition();
+        Vec3 from = owner.entity().getEyePosition();
         double dx = point.x - from.x;
         double dy = point.y - from.y;
         double dz = point.z - from.z;
         double horizontal = Math.sqrt(dx * dx + dz * dz);
         float wantedYaw = (float) (Math.atan2(-dx, dz) * 180.0 / Math.PI);
         float wantedPitch = (float) (Math.atan2(-dy, horizontal) * 180.0 / Math.PI);
-        return Math.max(Math.abs(angleDelta(owner.player().getYRot(), wantedYaw)), Math.abs(owner.player().getXRot() - wantedPitch));
+        return Math.max(Math.abs(angleDelta(owner.entity().getYRot(), wantedYaw)), Math.abs(owner.entity().getXRot() - wantedPitch));
     }
 
     private static float stepAngle(float current, float wanted, float step) {
@@ -481,8 +656,10 @@ final class CombatControllerImpl implements CombatController {
     }
 
     private boolean isAllowedTarget(LivingEntity candidate, CombatPolicy policy) {
-        if (candidate == null || candidate == owner.player()) return false;
-        if (candidate instanceof Player) return policy.allowPlayers();
+        if (candidate == null || candidate == owner.entity() || candidate.isRemoved()
+                || owner.entity().isAlliedTo(candidate)) return false;
+        if (candidate instanceof Player player) return policy.allowPlayers()
+                && !player.isCreative() && !player.isSpectator() && ActorSupport.context(owner.entity()).canHarmPlayer(player);
         return candidate instanceof Mob && policy.allowMobs();
     }
 
@@ -492,7 +669,7 @@ final class CombatControllerImpl implements CombatController {
     }
 
     private LivingEntity findNearbyTarget() {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         AABB area = player.getBoundingBox().inflate(nearbyRadius);
         return player.level().getEntities(player, area, entity -> entity instanceof LivingEntity living
                 && living.isAlive()
@@ -500,7 +677,8 @@ final class CombatControllerImpl implements CombatController {
                 && player.distanceToSqr(living) <= nearbyRadius * nearbyRadius)
             .stream()
             .map(entity -> (LivingEntity) entity)
-            .min(Comparator.comparingDouble(player::distanceToSqr))
+            .min(Comparator.<LivingEntity, Boolean>comparing(entity -> !hasLineOfSight(entity.getBoundingBox().getCenter()))
+                    .thenComparingDouble(player::distanceToSqr))
             .orElse(null);
     }
 
@@ -508,32 +686,58 @@ final class CombatControllerImpl implements CombatController {
         stopBow();
         owner.actions().stop();
         restoreWeapon();
-        weapon = Weapon.NONE;
-        weaponSlot = -1;
+        target = null;
+        weapon = CombatWeapon.NONE;
+        unseenTicks = 0;
+        visible = false;
+        targetDistance = Double.NaN;
         reactionTicks = policy.skill().reactionTicks();
     }
 
     private void finish(CombatResult result) {
+        CombatTaskImpl finishedTask = task;
+        if (finishedTask != null) finishedTask.snapshot = snapshot(result.status(), CombatPhase.FINISHED, result.reason());
         clearCombatState();
         // Clear controller state before completing the future. CompletableFuture
         // invokes callbacks synchronously when already complete; a callback may
         // start another fight and must not be overwritten by this cleanup.
-        if (task != null) task.complete(result);
+        if (finishedTask != null) finishedTask.complete(result);
+    }
+
+    private void updateDiagnostics(String reason) {
+        if (task != null && task.status == CombatStatus.RUNNING) task.snapshot = snapshot(task.status, phase, reason);
+    }
+
+    private CombatDiagnostics snapshot(CombatStatus status, CombatPhase phase, String reason) {
+        return new CombatDiagnostics(status, phase, target == null ? null : target.getUUID(), weapon,
+                ticks, unseenTicks, weaponSwitches, attacks, shots, blockedMovementTicks,
+                targetDistance, visible, status == CombatStatus.RUNNING && shieldUsing, reason);
     }
 
     private final class CombatTaskImpl implements CombatTask {
         private final CompletableFuture<CombatResult> completion = new CompletableFuture<>();
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private CombatStatus status = CombatStatus.RUNNING;
+        private CombatDiagnostics snapshot = new CombatDiagnostics(CombatStatus.RUNNING, CombatPhase.ACQUIRING,
+                null, CombatWeapon.NONE, 0, 0, 0, 0, 0, 0, Double.NaN, false, false, "running");
 
         @Override public CombatStatus status() { return status; }
         @Override public CompletableFuture<CombatResult> completion() { return completion.copy(); }
+        @Override public CombatDiagnostics diagnostics() { return snapshot; }
         @Override public void cancel() {
             runtime.ensureServerThread();
             if (cancelled.compareAndSet(false, true) && status == CombatStatus.RUNNING) {
                 status = CombatStatus.CANCELLED;
-                if (CombatControllerImpl.this.task == this) clearCombatState();
-                completion.complete(CombatResult.cancelled(attacks, shots));
+                if (CombatControllerImpl.this.task == this) {
+                    snapshot = CombatControllerImpl.this.snapshot(status, CombatPhase.FINISHED, "cancelled");
+                    clearCombatState();
+                } else {
+                    snapshot = new CombatDiagnostics(status, CombatPhase.FINISHED, snapshot.targetId(), snapshot.weapon(),
+                            snapshot.elapsedTicks(), snapshot.unseenTicks(), snapshot.weaponSwitches(), snapshot.attacks(),
+                            snapshot.shots(), snapshot.blockedMovementTicks(), snapshot.targetDistance(),
+                            snapshot.targetVisible(), false, "cancelled");
+                }
+                completion.complete(CombatResult.cancelled(snapshot.attacks(), snapshot.shots()));
             }
         }
         private void complete(CombatResult result) {

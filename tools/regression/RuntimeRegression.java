@@ -62,6 +62,10 @@ public final class RuntimeRegression {
     private boolean approachedFinishBeforeEntrance;
 
     public static void register() {
+        ActivityRegression.register();
+        ActivityPersistenceRegression.register();
+        RegionRegression.register();
+        RealityRegression.register();
         NavigationLoadMeasurement.register();
         dev.navigationai.runtime.NavigationFixRegression.register();
         ReviewRegression.register();

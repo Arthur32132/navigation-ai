@@ -24,6 +24,17 @@ class MovementControllerTest {
         var input=new MovementController().update(jump(),state(.97,.03,true,false),false);
         assertFalse(input.jump()); assertFalse(input.sprint()); assertTrue(input.sneak()); assertTrue(input.forward()<=0);
     }
+    @Test void offCenterStationaryStartBacksUpAndCanAccelerateAgain() {
+        var controller=new MovementController();var edge=jump();
+        var recover=controller.update(edge,state(.98,0,true,true),false);
+        assertFalse(recover.jump());assertTrue(recover.sneak());assertTrue(recover.forward()<0);
+        assertTrue(controller.update(edge,state(.75,-.05,true,true),false).forward()<0);
+        var launch=controller.update(edge,state(.5,-.03,true,true),false);
+        assertFalse(launch.sneak());
+        for(int n=0;n<8;n++)launch=controller.update(edge,state(.5,0,true,true),false);
+        assertTrue(launch.forward()>0);
+        assertTrue(controller.update(edge,state(.8,.20,true,true),false).jump());
+    }
     @Test void settlesLandingWithoutLaunchingTheSameJumpAgain() {
         var controller=new MovementController(); var edge=jump();
         controller.update(edge,state(2.5,.2,false,true),false);

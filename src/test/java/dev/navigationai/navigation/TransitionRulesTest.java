@@ -6,7 +6,30 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class TransitionRulesTest {
+    @Test void diggingUsesAnExposedCardinalFaceBeforeCuttingTheDiagonalCorner() {
+        GridWorld world=new GridWorld(){
+            public boolean passable(GridPos p){return true;}
+            public boolean requiresBreaking(GridPos p){return !p.equals(START);}
+        };
+        assertNull(TransitionRules.describe(world,START,new GridPos(1,0,1),NavigationPolicy.safeDefaults()));
+        assertNotNull(TransitionRules.describe(world,START,new GridPos(1,0,0),NavigationPolicy.safeDefaults()));
+    }
     private static final GridPos START = new GridPos(0, 0, 0);
+    @Test void almostFullPartialBlockNeedsJumpEvenAtTheSameGridY(){
+        GridWorld world=new GridWorld(){
+            public boolean passable(GridPos p){return true;}
+            public double supportHeight(GridPos p){return p.x()==0?0:15.0/16;}
+        };
+        var edge=TransitionRules.describe(world,START,new GridPos(1,0,0),NavigationPolicy.safeDefaults());
+        assertEquals(GridTransition.Type.JUMP,edge.type());assertTrue(edge.takeoff().grounded());
+    }
+    @Test void gridStepCannotHideAnAlmostTwoBlockPhysicalRise(){
+        GridWorld world=new GridWorld(){
+            public boolean passable(GridPos p){return true;}
+            public double supportHeight(GridPos p){return p.equals(START)?0:p.y()+15.0/16;}
+        };
+        assertNull(TransitionRules.describe(world,START,new GridPos(1,1,0),NavigationPolicy.safeDefaults()));
+    }
     @Test void plannerCarriesOpeningAndSupportContract() {
         GridWorld world = new GridWorld() {
             @Override public boolean passable(GridPos pos) { return pos.y() == 0 && pos.z() == 0 && pos.x() >= 0 && pos.x() <= 2; }

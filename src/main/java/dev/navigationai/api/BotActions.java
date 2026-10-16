@@ -5,6 +5,7 @@ import net.minecraft.server.level.ServerPlayer;
 /** Direct, server-thread actions. Implementations must be called on the server thread. */
 public interface BotActions {
     ServerPlayer player();
+    default net.minecraft.world.entity.LivingEntity entity() { return player(); }
     void stop();
     void setMovement(float sideways, float forward, boolean jump, boolean sprint, boolean sneak);
     void look(float yaw, float pitch);

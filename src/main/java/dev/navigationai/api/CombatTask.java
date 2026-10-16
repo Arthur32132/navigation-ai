@@ -6,4 +6,5 @@ public interface CombatTask {
     CombatStatus status();
     CompletableFuture<CombatResult> completion();
     void cancel();
+    default CombatDiagnostics diagnostics() { return CombatDiagnostics.idle(); }
 }

@@ -12,8 +12,11 @@ public final class TransitionRules {
         int dx = Math.abs(to.x() - from.x()), dz = Math.abs(to.z() - from.z());
         int dy = to.y() - from.y();
         boolean longJump = Math.max(dx, dz) > 1;
+        // A diagonal target can be hidden behind the still solid cardinal corner. Dig cardinal faces first.
+        if(world.requiresBreaking(to)&&dx+dz!=1)return null;
         boolean climb = world.isClimbable(from) || world.isClimbable(to);
         boolean swim = world.isWater(from) || world.isWater(to);
+        if(!climb&&!swim&&world.supportHeight(to)-world.supportHeight(from)>1.25+1e-6)return null;
         boolean crouch = world.requiresSneak(from) || world.requiresSneak(to);
         // Buoyancy can climb a water column, but it cannot supply a grounded jump onto a tall dry bank.
         if (!climb && world.isWater(from) && !world.isWater(to)
@@ -34,7 +37,7 @@ public final class TransitionRules {
             // Vertical air columns are not stairs. Only ladders/water support them.
             if (dx + dz == 0 && !climb && !swim) return null;
             type = climb ? GridTransition.Type.CLIMB : swim ? GridTransition.Type.SWIM
-                    : dy > 0 && world.supportHeight(to) - world.supportHeight(from) > 0.6
+                    : world.supportHeight(to) - world.supportHeight(from) > 0.6
                     ? GridTransition.Type.JUMP : dy < 0 ? GridTransition.Type.DROP : GridTransition.Type.STEP;
             if (type == GridTransition.Type.JUMP && crouch) return null;
         }

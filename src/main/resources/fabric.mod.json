@@ -6,7 +6,7 @@
   "description": "Server-side fake players and high quality navigation API for Fabric.",
   "authors": ["Navigation AI contributors"],
   "license": "MIT",
-  "environment": "server",
+  "environment": "*",
   "accessWidener": "navigation_ai.accesswidener",
   "mixins": ["navigation_ai.mixins.json"],
   "entrypoints": {

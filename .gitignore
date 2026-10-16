@@ -7,3 +7,5 @@ out/
 *.iml
 .idea/
 .vscode/
+__pycache__/
+*.pyc

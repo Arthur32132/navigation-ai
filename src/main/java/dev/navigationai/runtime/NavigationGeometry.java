@@ -14,12 +14,17 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 /** Geometry shared by snapshot planning and live transition validation. */
 final class NavigationGeometry {
     private NavigationGeometry() { }
+    /** Keep the player's historic margin, but never round a 1.95 m villager above a 2 m doorway. */
+    static double clearanceMargin(double height,boolean crouching){
+        return Math.min(crouching?.02:.10,Math.max(.005,(Math.ceil(height)-height)/2));
+    }
 
     static double feetOffset(VoxelShape feet, VoxelShape below) {
-        if (!feet.isEmpty() && feet.max(Direction.Axis.Y) <= 0.5D) return feet.max(Direction.Axis.Y);
+        if (partialSupport(feet)) return feet.max(Direction.Axis.Y);
         if (!below.isEmpty()) return below.max(Direction.Axis.Y) - 1.0D;
         return 0.0D;
     }
+    static boolean partialSupport(VoxelShape shape){return !shape.isEmpty()&&shape.max(Direction.Axis.Y)>0&&shape.max(Direction.Axis.Y)<1.0D;}
 
     static double feetOffset(ServerLevel level, BlockPos position) {
         var feet = level.getBlockState(position).getCollisionShape(level, position);

@@ -1,0 +1,6 @@
+package dev.navigationai.api;
+
+public enum CombatPhase {
+    IDLE, ACQUIRING, APPROACHING, STRAFING, RETREATING, SEARCHING,
+    HOLDING, BLOCKING, DRAWING, ATTACKING, FINISHED
+}

@@ -3,9 +3,9 @@ plugins {
     id 'maven-publish'
 }
 
-group = project.group
+group = 'dev.navigationai'
 version = project.version
-base { archivesName = project.archives_base_name }
+base { archivesName = 'navigation-ai' }
 
 repositories { }
 

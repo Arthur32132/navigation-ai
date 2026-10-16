@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-14",
+  "minecraft": "26.2",
+  "libraryJarSha256": "7eb18d6fb03437f33848e5a78674c6236b024268e049eb1bf9efb571edae6d6f",
+  "junit": {
+    "tests": 94,
+    "failures": 0,
+    "errors": 0
+  },
+  "villagerScenarios": 23,
+  "playerApiScenarios": 15,
+  "playerCombatScenarios": 11,
+  "playerTransitionScenarios": 10,
+  "villagerRestart": true,
+  "playerRestart": true,
+  "success": true,
+  "reports": [
+    "report.json",
+    "server.log",
+    "server-restarted.log"
+  ],
+  "autonomousBotsJunit": {
+    "tests": 10,
+    "failures": 0,
+    "errors": 0
+  },
+  "consumerBuilds": {
+    "Practicetestmod": true,
+    "AutonomousBots": true
+  }
+}

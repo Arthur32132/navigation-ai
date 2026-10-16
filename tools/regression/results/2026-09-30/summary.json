@@ -1,0 +1,527 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-30",
+  "timezone": "Asia/Yekaterinburg",
+  "status": "complete",
+  "success": true,
+  "scope": {
+    "minecraft": "26.2",
+    "fabricLoader": "0.19.5",
+    "fabricApi": "0.161.0+26.2",
+    "java": "25",
+    "difficulty": "peaceful",
+    "seed": "8675309",
+    "isolation": "Fresh localhost Fabric validation worlds; production worlds and server settings were not copied.",
+    "notRepeated": [
+      "navreality journey 1000",
+      "navregions"
+    ]
+  },
+  "junit": {
+    "tests": 90,
+    "failures": 0,
+    "errors": 0,
+    "evidence": "main-report.json"
+  },
+  "artifacts": {
+    "library": {
+      "filename": "navigation-ai-0.1.0.jar",
+      "sha256": "b1157883064d7a9535aa37520bfbddd428c747f0f923b8c1e530a88ed5b6f21c",
+      "identicalInBothReports": true
+    },
+    "currentConsumer": {
+      "filename": "navigation-ai-practice-test-0.1.0.jar",
+      "sha256": "0284cae282e81d3f5fe28f9a8d0a23ff07d65029b2f8db9f2ead31744a94a502",
+      "evidence": "combat-confirmation-report.json"
+    },
+    "mainConsumer": {
+      "filename": "navigation-ai-practice-test-0.1.0.jar",
+      "sha256": "374e727ccb2b341dc22913cec8cc36a4e0b2aed6e97a4895ac2fbc6831eabdae",
+      "evidence": "main-report.json"
+    },
+    "baseCommit": "3e642e2438bd647e339e7d15b77bf446650d10cd",
+    "sourceComparison": {
+      "changedFiles": [
+        "MinecraftmodNavigationAi/tools/regression/CombatTacticsRegression.java"
+      ],
+      "productionSourcesIdentical": true,
+      "sourceFileCount": 131,
+      "explanation": "The original shield fixture asserted cooldown after the first attempted axe hit during vanilla ServerPlayer login immunity. The only source change waits at most 200 ticks, while still requiring axe selection, shield use, an attack and actual shield cooldown. Production library sources and the library JAR are identical in the main and confirmation reports."
+    }
+  },
+  "evidence": [
+    {
+      "file": "main-report.json",
+      "sha256": "c1f06530e6b5249d0fce6a1f8ce7d284e575467396419df1ee3fe4b5d3f6aa1a",
+      "originalReport": "C:\\minecraftWorkflow\\MinecraftmodNavigationAi\\build\\validation\\expansion-2026-09-30-final\\report.json",
+      "runEnded": true,
+      "runnerExitCode": 1,
+      "rawSuccess": false,
+      "normalServerShutdown": true,
+      "note": "The original combat 10/11 fixture failure is retained unchanged. All other main stages passed; the aggregate selects the separately confirmed combat stage."
+    },
+    {
+      "file": "combat-confirmation-report.json",
+      "sha256": "696e716ebbeaaa086065da331f66101526b9b46415708cff3984dc1c23d254f8",
+      "originalReport": "C:\\minecraftWorkflow\\MinecraftmodNavigationAi\\build\\validation\\expansion-2026-09-30-combat-confirmation\\report.json",
+      "runEnded": true,
+      "runnerExitCode": 0,
+      "rawSuccess": true,
+      "normalServerShutdown": true
+    }
+  ],
+  "selectedStages": [
+    {
+      "command": "navcombat",
+      "success": true,
+      "seconds": 12.588461400002416,
+      "result": "[14:28:04] [Server thread/INFO]: COMBAT PASS passed=11 failed=0",
+      "events": [
+        "[14:27:53] [Server thread/INFO]: COMBAT START ranged_then_melee",
+        "[14:27:53] [Server thread/INFO]: COMBAT START strict_sword",
+        "[14:27:53] [Server thread/INFO]: COMBAT START ammo_fallback",
+        "[14:27:53] [Server thread/INFO]: COMBAT START health_limit",
+        "[14:27:53] [Server thread/INFO]: COMBAT START visibility_limit",
+        "[14:27:54] [Server thread/INFO]: COMBAT START duration_limit",
+        "[14:27:54] [Server thread/INFO]: COMBAT START entity_occlusion",
+        "[14:27:54] [Server thread/INFO]: COMBAT START ledge_retreat",
+        "[14:27:57] [Server thread/INFO]: COMBAT START shield_and_axe",
+        "[14:28:01] [Server thread/INFO]: COMBAT START completion_snapshot",
+        "[14:28:01] [Server thread/INFO]: COMBAT START charged_sword_damage",
+        "[14:28:04] [Server thread/INFO]: COMBAT PASS passed=11 failed=0"
+      ],
+      "evidence": "combat-confirmation-report.json",
+      "stageIndex": 0
+    },
+    {
+      "command": "navactivities",
+      "success": true,
+      "seconds": 72.64447890000156,
+      "result": "[14:25:38] [Server thread/INFO]: ACTIVITIES PASS passed=17 failed=0",
+      "events": [
+        "[14:24:26] [Server thread/INFO]: ACTIVITIES START nearby_resource_radius32",
+        "[14:24:27] [Server thread/INFO]: ACTIVITIES START symmetric_controller_ownership",
+        "[14:24:28] [Server thread/INFO]: ACTIVITIES START gather_combat_resume_return",
+        "[14:24:37] [Server thread/INFO]: ACTIVITIES START combat_timeout_cleanup",
+        "[14:24:38] [Server thread/INFO]: ACTIVITIES START manual_override_paused_activity",
+        "[14:24:38] [Server thread/INFO]: ACTIVITIES START activity_future_isolation",
+        "[14:24:43] [Server thread/INFO]: ACTIVITIES START cancel_activity_children",
+        "[14:24:43] [Server thread/INFO]: ACTIVITIES START cross_controller_reentrant_callback",
+        "[14:24:43] [Server thread/INFO]: ACTIVITIES START navigate_combat_resume",
+        "[14:24:52] [Server thread/INFO]: ACTIVITIES START two_interruptions_preserve_gather_count",
+        "[14:25:05] [Server thread/INFO]: ACTIVITIES START changed_mining_target_on_resume",
+        "[14:25:10] [Server thread/INFO]: ACTIVITIES START completion_callback_new_navigation",
+        "[14:25:19] [Server thread/INFO]: ACTIVITIES START activity_save_restore_progress",
+        "[14:25:28] [Server thread/INFO]: ACTIVITIES START paused_activity_save_restore",
+        "[14:25:37] [Server thread/INFO]: ACTIVITIES START resource_support_protection",
+        "[14:25:37] [Server thread/INFO]: ACTIVITIES START mining_cancel_callback_new_navigation",
+        "[14:25:37] [Server thread/INFO]: ACTIVITIES START floor_resource_safe_approach",
+        "[14:25:38] [Server thread/INFO]: ACTIVITIES PASS passed=17 failed=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 1
+    },
+    {
+      "command": "navlibrary",
+      "success": true,
+      "seconds": 14.846682800001872,
+      "result": "[14:25:53] [Server thread/INFO]: LIBRARY PASS passed=15 failed=0",
+      "events": [
+        "[14:25:39] [Server thread/INFO]: LIBRARY START inventory_snapshot_defensive_copy",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START equipment_swap_preserves_items",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START invalid_equipment_is_transactional",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START stop_all_cancels_root_and_children",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START stop_all_preserves_callback_intent",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START submit_runs_on_server_thread",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START submit_reports_exception",
+        "[14:25:39] [Server thread/INFO]: LIBRARY OK submit_reports_exception cause=java.lang.IllegalArgumentException: library_expected",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START submit_cancel_before_dispatch",
+        "[14:25:39] [Server thread/INFO]: LIBRARY START wait_then_excavate_then_return",
+        "[14:25:44] [Server thread/INFO]: LIBRARY START wait_save_restore_progress",
+        "[14:25:46] [Server thread/INFO]: LIBRARY START inventory_rejects_wrong_thread",
+        "[14:25:46] [Server thread/INFO]: LIBRARY START removed_bot_rejects_mutation",
+        "[14:25:46] [Server thread/INFO]: LIBRARY START excavation_save_at_exact_budget",
+        "[14:25:51] [Server thread/INFO]: LIBRARY START excavation_restore_preserves_block_budget",
+        "[14:25:53] [Server thread/INFO]: LIBRARY START delayed_restore_preserves_new_intent",
+        "[14:25:53] [Server thread/INFO]: LIBRARY PASS passed=15 failed=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 2
+    },
+    {
+      "command": "navexcavation",
+      "success": true,
+      "seconds": 42.901825400000234,
+      "result": "[14:26:36] [Server thread/INFO]: EXCAVATION PASS passed=12 failed=0",
+      "events": [
+        "[14:25:53] [Server thread/INFO]: EXCAVATION START tunnel_walk_mine_return",
+        "[14:25:59] [Server thread/INFO]: EXCAVATION PASS tunnel_walk_mine_return ticks=129 ExcavationResult[status=SUCCESS, reason=excavated, completedSegments=4, brokenBlocks=8, returnedToEntrance=true, durationNanos=6328940000]",
+        "[14:25:59] [Server thread/INFO]: EXCAVATION START staircase_walk_mine_return",
+        "[14:26:09] [Server thread/INFO]: EXCAVATION PASS staircase_walk_mine_return ticks=191 ExcavationResult[status=SUCCESS, reason=excavated, completedSegments=4, brokenBlocks=12, returnedToEntrance=true, durationNanos=9539410400]",
+        "[14:26:09] [Server thread/INFO]: EXCAVATION START fluid_face_rejected",
+        "[14:26:09] [Server thread/INFO]: EXCAVATION PASS fluid_face_rejected ticks=6 ExcavationResult[status=FAILED, reason=unsafe_fluid, completedSegments=0, brokenBlocks=0, returnedToEntrance=true, durationNanos=291318800]",
+        "[14:26:09] [Server thread/INFO]: EXCAVATION START falling_ceiling_rejected",
+        "[14:26:09] [Server thread/INFO]: EXCAVATION PASS falling_ceiling_rejected ticks=6 ExcavationResult[status=FAILED, reason=unstable_ceiling, completedSegments=0, brokenBlocks=0, returnedToEntrance=true, durationNanos=289571800]",
+        "[14:26:09] [Server thread/INFO]: EXCAVATION START container_face_protected",
+        "[14:26:10] [Server thread/INFO]: EXCAVATION PASS container_face_protected ticks=6 ExcavationResult[status=FAILED, reason=protected_block_entity, completedSegments=0, brokenBlocks=0, returnedToEntrance=true, durationNanos=290708400]",
+        "[14:26:10] [Server thread/INFO]: EXCAVATION START missing_tool_rejected",
+        "[14:26:10] [Server thread/INFO]: EXCAVATION PASS missing_tool_rejected ticks=6 ExcavationResult[status=FAILED, reason=no_suitable_tool, completedSegments=0, brokenBlocks=0, returnedToEntrance=true, durationNanos=291195200]",
+        "[14:26:10] [Server thread/INFO]: EXCAVATION START block_budget_partial_progress",
+        "[14:26:12] [Server thread/INFO]: EXCAVATION PASS block_budget_partial_progress ticks=45 ExcavationResult[status=FAILED, reason=block_budget_exhausted, completedSegments=1, brokenBlocks=3, returnedToEntrance=true, durationNanos=2241256100]",
+        "[14:26:12] [Server thread/INFO]: EXCAVATION START manual_navigation_cancels_excavation",
+        "[14:26:14] [Server thread/INFO]: EXCAVATION PASS manual_navigation_cancels_excavation ticks=25 ownership=true",
+        "[14:26:14] [Server thread/INFO]: EXCAVATION START zero_budget_clear_passage",
+        "[14:26:18] [Server thread/INFO]: EXCAVATION PASS zero_budget_clear_passage ticks=80 ExcavationResult[status=SUCCESS, reason=excavated, completedSegments=4, brokenBlocks=0, returnedToEntrance=true, durationNanos=3991634000]",
+        "[14:26:18] [Server thread/INFO]: EXCAVATION START mining_cannot_reach_through_wall",
+        "[14:26:18] [Server thread/INFO]: EXCAVATION PASS mining_cannot_reach_through_wall ticks=1 MiningResult[status=FAILED, reason=obstructed, blockBroken=false, durationNanos=41528800]",
+        "[14:26:18] [Server thread/INFO]: EXCAVATION START buried_vein_followed",
+        "[14:26:29] [Server thread/INFO]: EXCAVATION PASS buried_vein_followed ticks=235 GatherResult[status=SUCCESS, reason=target_reached, collectedItems=6, brokenBlocks=6, durationNanos=11741638000]",
+        "[14:26:29] [Server thread/INFO]: EXCAVATION START excavation_future_isolation",
+        "[14:26:36] [Server thread/INFO]: EXCAVATION PASS excavation_future_isolation ticks=128 ExcavationResult[status=SUCCESS, reason=excavated, completedSegments=4, brokenBlocks=8, returnedToEntrance=true, durationNanos=6390214600]",
+        "[14:26:36] [Server thread/INFO]: EXCAVATION PASS passed=12 failed=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 3
+    },
+    {
+      "command": "navexcavatepersist prepare",
+      "success": true,
+      "seconds": 2.7912765000000945,
+      "result": "[14:26:39] [Server thread/INFO]: EXCAVATE PERSIST READY successSegments=2 successBlocks=4 cappedSegments=2 cappedBlocks=4",
+      "events": [
+        "[14:26:39] [Server thread/INFO]: EXCAVATE PERSIST READY successSegments=2 successBlocks=4 cappedSegments=2 cappedBlocks=4"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 4
+    },
+    {
+      "command": "navexcavatepersist verify",
+      "success": true,
+      "seconds": 18.300992100001167,
+      "result": "[14:27:06] [Server thread/INFO]: EXCAVATE PERSIST PASS fullBlocks=24 cappedBlocks=11 success=ActivityResult[status=SUCCESS, reason=completed, completedSteps=3, interruptions=0, durationNanos=17248163600] capped=ActivityResult[status=FAILED, reason=excavation_block_budget_exhausted, completedSteps=0, interruptions=0, durationNanos=6148302900]",
+      "events": [
+        "[14:27:06] [Server thread/INFO]: EXCAVATE PERSIST PASS fullBlocks=24 cappedBlocks=11 success=ActivityResult[status=SUCCESS, reason=completed, completedSteps=3, interruptions=0, durationNanos=17248163600] capped=ActivityResult[status=FAILED, reason=excavation_block_budget_exhausted, completedSteps=0, interruptions=0, durationNanos=6148302900]"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 5
+    },
+    {
+      "command": "navtest selftest",
+      "success": true,
+      "seconds": 0.10601820000010775,
+      "result": "[14:27:06] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state",
+      "events": [
+        "[14:27:06] [Server thread/INFO]: SELFTEST PASS (22 checks): runtime.service, service.find(UUID), service.find(name), service.bots, handle.id/name/player/state, vanilla player/entity registration, actions.player, navigator available, miner/collector available, combat available, CombatPolicy validation, actions.look/setMovement/stop, NavigationPolicy defaults/custom, NavigationPolicy validation, GatherPolicy validation, all NavigationGoal records, navigator.goTo/status/goal, NavigationTask.cancel/completion, navigator.follow/cancel, GridPos/GridWorld/GridPathfinder, NavigationResult factories, handle.remove/state"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 6
+    },
+    {
+      "command": "navtest ticket-regression",
+      "success": true,
+      "seconds": 0.04551730000093812,
+      "result": "[14:27:06] [Server thread/INFO]: TICKET REGRESSION PASS: overlapping routes released; player loading/simulation tickets preserved",
+      "events": [
+        "[14:27:06] [Server thread/INFO]: TICKET REGRESSION PASS: overlapping routes released; player loading/simulation tickets preserved"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 7
+    },
+    {
+      "command": "navtest regression",
+      "success": true,
+      "seconds": 140.79966570000033,
+      "result": "[14:29:27] [Server thread/INFO]: REGRESSION PASS passed=51 failed=0",
+      "events": [
+        "[14:27:08] [Server thread/INFO]: REGRESSION START mining_inventory_tool_restore",
+        "[14:27:08] [Server thread/INFO]: REGRESSION START mining_cancel_before_tick",
+        "[14:27:08] [Server thread/INFO]: REGRESSION START mining_no_tool_preserves_slot",
+        "[14:27:08] [Server thread/INFO]: REGRESSION START unbreakable_block",
+        "[14:27:08] [Server thread/INFO]: REGRESSION START gather_and_pickup",
+        "[14:27:09] [Server thread/INFO]: REGRESSION START full_inventory",
+        "[14:27:09] [Server thread/INFO]: REGRESSION START missing_resource",
+        "[14:27:09] [Server thread/INFO]: REGRESSION START gather_timeout_cancels_navigation",
+        "[14:27:09] [Server thread/INFO]: REGRESSION START gather_cancel",
+        "[14:27:09] [Server thread/INFO]: REGRESSION START best_sword_and_broken_weapon_replacement",
+        "[14:27:13] [Server thread/INFO]: REGRESSION START bow_inventory_arrows_damage",
+        "[14:27:16] [Server thread/INFO]: REGRESSION START combat_one_block_step",
+        "[14:27:19] [Server thread/INFO]: REGRESSION START unreachable_resource",
+        "[14:27:20] [Server thread/INFO]: REGRESSION START retry_other_side",
+        "[14:27:22] [Server thread/INFO]: REGRESSION START navigation_breaking",
+        "[14:27:25] [Server thread/INFO]: REGRESSION START navigation_bridge",
+        "[14:27:26] [Server thread/INFO]: REGRESSION START navigation_door",
+        "[14:27:27] [Server thread/INFO]: REGRESSION START navigation_ladder",
+        "[14:27:29] [Server thread/INFO]: REGRESSION START navigation_dynamic_obstacle",
+        "[14:27:31] [Server thread/INFO]: REGRESSION START navigation_stair_geometry",
+        "[14:27:32] [Server thread/INFO]: REGRESSION START navigation_partial_surface",
+        "[14:27:33] [Server thread/INFO]: REGRESSION START navigation_water",
+        "[14:27:41] [Server thread/INFO]: REGRESSION START navigation_copper_door",
+        "[14:27:41] [Server thread/INFO]: REGRESSION START navigation_jump_pits",
+        "[14:27:44] [Server thread/INFO]: REGRESSION START navigation_crouch_tunnel",
+        "[14:27:45] [Server thread/INFO]: REGRESSION START navigation_long_wall_frontier",
+        "[14:27:54] [Server thread/INFO]: REGRESSION START navigation_block_goal_solid",
+        "[14:27:55] [Server thread/INFO]: REGRESSION START navigation_controlled_drop",
+        "[14:27:56] [Server thread/INFO]: REGRESSION START navigation_fence_gate",
+        "[14:27:57] [Server thread/INFO]: REGRESSION START navigation_bridge_cancel_rollback",
+        "[14:27:58] [Server thread/INFO]: REGRESSION START navigation_multi_goal",
+        "[14:28:00] [Server thread/INFO]: REGRESSION START navigation_patrol",
+        "[14:28:03] [Server thread/INFO]: REGRESSION START navigation_look_at",
+        "[14:28:03] [Server thread/INFO]: REGRESSION START navigation_dimension_goal",
+        "[14:28:04] [Server thread/INFO]: REGRESSION START navigation_escort",
+        "[14:28:08] [Server thread/INFO]: REGRESSION START navigation_waterlogged_geometry",
+        "[14:28:10] [Server thread/INFO]: REGRESSION START navigation_jump_with_doors_at_edges",
+        "[14:28:11] [Server thread/INFO]: REGRESSION START navigation_open_door",
+        "[14:28:12] [Server thread/INFO]: REGRESSION START navigation_open_trapdoor",
+        "[14:28:13] [Server thread/INFO]: REGRESSION START navigation_open_overhead_trapdoor",
+        "[14:28:15] [Server thread/INFO]: REGRESSION START navigation_open_trapdoor_corner",
+        "[14:28:16] [Server thread/INFO]: REGRESSION START navigation_long_deep_water",
+        "[14:28:32] [Server thread/INFO]: REGRESSION START navigation_long_flat_route",
+        "[14:28:39] [Server thread/INFO]: REGRESSION START navigation_occupied_destination",
+        "[14:28:40] [Server thread/INFO]: REGRESSION START navigation_grounded_edge_start",
+        "[14:28:42] [Server thread/INFO]: REGRESSION START navigation_elevated_goal_distant_access",
+        "[14:28:56] [Server thread/INFO]: REGRESSION START navigation_consecutive_gap_jumps_door",
+        "[14:28:58] [Server thread/INFO]: REGRESSION START navigation_come_from_below_elevated_finish",
+        "[14:29:25] [Server thread/INFO]: REGRESSION START mining_waterlogged_block",
+        "[14:29:25] [Server thread/INFO]: REGRESSION START navigation_reentrant_cancel_callback",
+        "[14:29:27] [Server thread/INFO]: REGRESSION START navigation_airborne_arrival",
+        "[14:29:27] [Server thread/INFO]: REGRESSION PASS passed=51 failed=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 8
+    },
+    {
+      "command": "navreview",
+      "success": true,
+      "seconds": 22.159680499997194,
+      "result": "[14:29:49] [Server thread/INFO]: REVIEW PASS passed=15 failed=0",
+      "events": [
+        "[14:29:27] [Server thread/INFO]: REVIEW START slab_headroom",
+        "[14:29:27] [Server thread/INFO]: REVIEW START block_goal_all_approaches",
+        "[14:29:29] [Server thread/INFO]: REVIEW START moving_follow",
+        "[14:29:41] [Server thread/INFO]: REVIEW START miner_reentrant_start",
+        "[14:29:41] [Server thread/INFO]: REVIEW START collector_reentrant_start",
+        "[14:29:41] [Server thread/INFO]: REVIEW START combat_reentrant_start",
+        "[14:29:41] [Server thread/INFO]: REVIEW START final_approach_new_hazard",
+        "[14:29:42] [Server thread/INFO]: REVIEW START unsafe_building_material",
+        "[14:29:42] [Server thread/INFO]: REVIEW START insufficient_bridge_material",
+        "[14:29:43] [Server thread/INFO]: REVIEW START request_metrics_across_segments",
+        "[14:29:46] [Server thread/INFO]: REVIEW START incremental_resource_scan",
+        "[14:29:46] [Server thread/INFO]: REVIEW START resource_reservation",
+        "[14:29:46] [Server thread/INFO]: REVIEW START new_obstacle_inside_jump",
+        "[14:29:47] [Server thread/INFO]: REVIEW START new_powder_snow_on_route",
+        "[14:29:48] [Server thread/INFO]: REVIEW START fair_resource_scan_budget",
+        "[14:29:49] [Server thread/INFO]: REVIEW PASS passed=15 failed=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 9
+    },
+    {
+      "command": "navtransitions",
+      "success": true,
+      "seconds": 41.090202899998985,
+      "result": "[14:30:30] [Server thread/INFO]: TRANSITIONS PASS passed=10 failed=0 dangling=0",
+      "events": [
+        "[14:29:50] [Server thread/INFO]: TRANSITIONS START door_then_consecutive_jumps",
+        "[14:29:53] [Server thread/INFO]: TRANSITIONS START slab_under_low_ceiling",
+        "[14:29:54] [Server thread/INFO]: TRANSITIONS START sprint_lost_after_door",
+        "[14:29:56] [Server thread/INFO]: TRANSITIONS START flowing_water",
+        "[14:30:11] [Server thread/INFO]: TRANSITIONS START knockback_during_jump",
+        "[14:30:13] [Server thread/INFO]: TRANSITIONS START landing_changed_in_flight",
+        "[14:30:17] [Server thread/INFO]: TRANSITIONS START future_obstacle_replan_in_motion",
+        "[14:30:23] [Server thread/INFO]: TRANSITIONS START follow_snapshot_reuse",
+        "[14:30:27] [Server thread/INFO]: TRANSITIONS START follow_arrival_during_gap_jump",
+        "[14:30:29] [Server thread/INFO]: TRANSITIONS START short_drop_under_overhang",
+        "[14:30:30] [Server thread/INFO]: TRANSITIONS PASS passed=10 failed=0 dangling=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 10
+    },
+    {
+      "command": "navfixes",
+      "success": true,
+      "seconds": 28.298000399998273,
+      "result": "[14:30:59] [Server thread/INFO]: FIXES PASS passed=15 failed=0",
+      "events": [
+        "[14:30:31] [Server thread/INFO]: FIXES START",
+        "[14:30:59] [Server thread/INFO]: FIXES PASS passed=15 failed=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 11
+    },
+    {
+      "command": "navpersist prepare",
+      "success": true,
+      "seconds": 2.344788599999447,
+      "result": "[14:31:01] [Server thread/INFO]: PERSIST READY count=1 step=0",
+      "events": [
+        "[14:31:01] [Server thread/INFO]: PERSIST READY count=1 step=0"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 12
+    },
+    {
+      "command": "navpersist verify",
+      "success": true,
+      "seconds": 25.3148927000002,
+      "result": "[14:31:34] [Server thread/INFO]: PERSIST PASS count=5 result=ActivityResult[status=SUCCESS, reason=completed, completedSteps=2, interruptions=0, durationNanos=24248519400]",
+      "events": [
+        "[14:31:34] [Server thread/INFO]: PERSIST PASS count=5 result=ActivityResult[status=SUCCESS, reason=completed, completedSteps=2, interruptions=0, durationNanos=24248519400]"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 13
+    },
+    {
+      "command": "navreality mixed",
+      "success": true,
+      "seconds": 170.5186117000012,
+      "result": "[14:34:25] [Server thread/INFO]: REALITY PASS mode=mixed reason=reached_goal completed=60 supports=405 ticks=3407 travelled=3336.858735545411 horizontal=3324.006199346104 seconds=168.6772906 full={ticks=3405,avgMs=2.801850778267254,p95Ms=4.1948,p99Ms=8.184,maxMs=84.3635} runtime={ticks=3407,avgMs=1.172011358966833,p95Ms=1.8918,p99Ms=3.9434,maxMs=17.1952} metrics=NavigationMetrics[serverTicks=3913, lastTickNanos=214400, totalTickNanos=4505976200, maxTickNanos=140962500, snapshots=318, snapshotNanos=2369328300, pathSearchesSubmitted=318, pathSearchesCompleted=318, pathSearchesCancelled=3, pathSearchesRejected=0, backpressureDeferrals=0, nodeBudgetDeferrals=0, pathSearchNanos=104150704800, pathNodesVisited=494269, replans=177, queuedSearches=0, activeSearches=0]",
+      "events": [
+        "[14:31:36] [Server thread/INFO]: REALITY START mode=mixed distance=0 difficulty=peaceful origin=(8000.5, 230.0, 8000.5) destination=(8080.5, 230.0, 8000.5)",
+        "[14:31:44] [Server thread/INFO]: REALITY PROGRESS ticks=200 round=0 position=(8009.345357174775, 230.0, 8000.5) remaining=71.15464282522498 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=199, ticksToFirstMovement=102, replans=1, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=9]",
+        "[14:31:54] [Server thread/INFO]: REALITY PROGRESS ticks=400 round=0 position=(8034.350700619234, 230.0, 8000.5) remaining=46.149299380766024 status=COMPUTING diagnostics=NavigationDiagnostics[ticksElapsed=399, ticksToFirstMovement=102, replans=3, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=14]",
+        "[14:32:04] [Server thread/INFO]: REALITY PROGRESS ticks=600 round=0 position=(8054.214261848201, 230.0, 7998.499999693099) remaining=26.361715259302347 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=599, ticksToFirstMovement=102, replans=4, damageTaken=0.0, reusedSnapshotCells=2013, completed=false, ticksWithoutMovement=0]",
+        "[14:32:10] [Server thread/INFO]: REALITY ROUND completed=1 tasks=12",
+        "[14:32:14] [Server thread/INFO]: REALITY PROGRESS ticks=800 round=1 position=(8079.148083666471, 230.0, 8000.499962783017) remaining=1.3519163340408809 status=COMPUTING diagnostics=NavigationDiagnostics[ticksElapsed=79, ticksToFirstMovement=-1, replans=0, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=79]",
+        "[14:32:24] [Server thread/INFO]: REALITY PROGRESS ticks=1000 round=1 position=(8053.823745491175, 230.0, 8000.500000248726) remaining=26.67625450882497 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=279, ticksToFirstMovement=94, replans=2, damageTaken=0.0, reusedSnapshotCells=17952, completed=false, ticksWithoutMovement=3]",
+        "[14:32:34] [Server thread/INFO]: REALITY PROGRESS ticks=1200 round=1 position=(8037.865306241914, 230.0, 8000.500000248726) remaining=42.63469375808563 status=COMPUTING diagnostics=NavigationDiagnostics[ticksElapsed=479, ticksToFirstMovement=94, replans=5, damageTaken=0.0, reusedSnapshotCells=47751, completed=false, ticksWithoutMovement=112]",
+        "[14:32:44] [Server thread/INFO]: REALITY PROGRESS ticks=1400 round=1 position=(8001.878963278596, 230.0, 8000.500000248726) remaining=78.62103672140438 status=SUCCESS diagnostics=NavigationDiagnostics[ticksElapsed=678, ticksToFirstMovement=94, replans=7, damageTaken=0.0, reusedSnapshotCells=47751, completed=true, ticksWithoutMovement=1]",
+        "[14:32:47] [Server thread/INFO]: REALITY ROUND completed=2 tasks=24",
+        "[14:32:54] [Server thread/INFO]: REALITY PROGRESS ticks=1600 round=2 position=(8010.547614856686, 230.0, 8000.500000248726) remaining=69.95238514331413 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=140, ticksToFirstMovement=99, replans=1, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=5]",
+        "[14:33:04] [Server thread/INFO]: REALITY PROGRESS ticks=1800 round=2 position=(8029.336536916029, 230.0, 8000.500000248726) remaining=51.16346308397078 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=340, ticksToFirstMovement=99, replans=2, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=1]",
+        "[14:33:14] [Server thread/INFO]: REALITY PROGRESS ticks=2000 round=2 position=(8059.335078453891, 230.0, 8000.500000248726) remaining=21.164921546109326 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=540, ticksToFirstMovement=99, replans=4, damageTaken=0.0, reusedSnapshotCells=10098, completed=false, ticksWithoutMovement=8]",
+        "[14:33:21] [Server thread/INFO]: REALITY ROUND completed=3 tasks=36",
+        "[14:33:24] [Server thread/INFO]: REALITY PROGRESS ticks=2200 round=3 position=(8079.034117613782, 230.0, 8000.500000248726) remaining=1.4658823862182755 status=COMPUTING diagnostics=NavigationDiagnostics[ticksElapsed=73, ticksToFirstMovement=-1, replans=0, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=73]",
+        "[14:33:34] [Server thread/INFO]: REALITY PROGRESS ticks=2400 round=3 position=(8050.932090098025, 230.0, 8000.500000248726) remaining=29.56790990197533 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=273, ticksToFirstMovement=92, replans=2, damageTaken=0.0, reusedSnapshotCells=18513, completed=false, ticksWithoutMovement=0]",
+        "[14:33:44] [Server thread/INFO]: REALITY PROGRESS ticks=2600 round=3 position=(8019.7949607715955, 230.0, 8000.500000248726) remaining=60.70503922840453 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=473, ticksToFirstMovement=92, replans=4, damageTaken=0.0, reusedSnapshotCells=52833, completed=false, ticksWithoutMovement=7]",
+        "[14:33:52] [Server thread/INFO]: REALITY ROUND completed=4 tasks=48",
+        "[14:33:54] [Server thread/INFO]: REALITY PROGRESS ticks=2800 round=4 position=(8001.90085420134, 230.0, 8000.500000248726) remaining=78.59914579866017 status=COMPUTING diagnostics=NavigationDiagnostics[ticksElapsed=47, ticksToFirstMovement=-1, replans=0, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=47]",
+        "[14:34:04] [Server thread/INFO]: REALITY PROGRESS ticks=3000 round=4 position=(8017.717639952717, 230.0, 8000.500000248726) remaining=62.782360047282964 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=247, ticksToFirstMovement=89, replans=1, damageTaken=0.0, reusedSnapshotCells=0, completed=false, ticksWithoutMovement=0]",
+        "[14:34:14] [Server thread/INFO]: REALITY PROGRESS ticks=3200 round=4 position=(8046.606091505536, 230.0, 8000.500000248726) remaining=33.893908494464085 status=RUNNING diagnostics=NavigationDiagnostics[ticksElapsed=447, ticksToFirstMovement=89, replans=3, damageTaken=0.0, reusedSnapshotCells=11154, completed=false, ticksWithoutMovement=0]",
+        "[14:34:24] [Server thread/INFO]: REALITY PROGRESS ticks=3400 round=4 position=(8079.024595123594, 230.0, 8000.500000248726) remaining=1.4754048764061944 status=SUCCESS diagnostics=NavigationDiagnostics[ticksElapsed=622, ticksToFirstMovement=89, replans=4, damageTaken=0.0, reusedSnapshotCells=29667, completed=true, ticksWithoutMovement=1]",
+        "[14:34:25] [Server thread/INFO]: REALITY PASS mode=mixed reason=reached_goal completed=60 supports=405 ticks=3407 travelled=3336.858735545411 horizontal=3324.006199346104 seconds=168.6772906 full={ticks=3405,avgMs=2.801850778267254,p95Ms=4.1948,p99Ms=8.184,maxMs=84.3635} runtime={ticks=3407,avgMs=1.172011358966833,p95Ms=1.8918,p99Ms=3.9434,maxMs=17.1952} metrics=NavigationMetrics[serverTicks=3913, lastTickNanos=214400, totalTickNanos=4505976200, maxTickNanos=140962500, snapshots=318, snapshotNanos=2369328300, pathSearchesSubmitted=318, pathSearchesCompleted=318, pathSearchesCancelled=3, pathSearchesRejected=0, backpressureDeferrals=0, nodeBudgetDeferrals=0, pathSearchNanos=104150704800, pathNodesVisited=494269, replans=177, queuedSearches=0, activeSearches=0]"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 14
+    },
+    {
+      "command": "navtest load 50",
+      "success": true,
+      "seconds": 20.381518700000015,
+      "result": "[14:34:45] [Server thread/INFO]: MEASURE DONE full={ticks=356, avgMs=3.89768595505618, p95Ms=5.0405, maxMs=68.1833} runtime={ticks=357, avgMs=1.3676084033613445, p95Ms=2.1215, maxMs=6.4389}",
+      "events": [
+        "[14:34:25] [Server thread/INFO]: MEASURE START: per-run full server ticks and BotRuntime ticks",
+        "[14:34:27] [Server thread/INFO]: LOAD START count=50 generation=false (run counts 1, 10, 25 and 50 separately)",
+        "[14:34:45] [Server thread/INFO]: LOAD PASS count=50 completed=50/50 ticks=357 maxTickMs=140.9625 avgTickMs=1.1696047775175644 searches=50 nodes=650 queued=0",
+        "[14:34:45] [Server thread/INFO]: MEASURE DONE full={ticks=356, avgMs=3.89768595505618, p95Ms=5.0405, maxMs=68.1833} runtime={ticks=357, avgMs=1.3676084033613445, p95Ms=2.1215, maxMs=6.4389}"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 15
+    }
+  ],
+  "supersededStages": [
+    {
+      "command": "navcombat",
+      "success": false,
+      "seconds": 10.594917400001577,
+      "result": "[14:24:25] [Server thread/INFO]: COMBAT FAIL passed=10 failed=1",
+      "events": [
+        "[14:24:16] [Server thread/INFO]: COMBAT START ranged_then_melee",
+        "[14:24:16] [Server thread/INFO]: COMBAT START strict_sword",
+        "[14:24:16] [Server thread/INFO]: COMBAT START ammo_fallback",
+        "[14:24:16] [Server thread/INFO]: COMBAT START health_limit",
+        "[14:24:16] [Server thread/INFO]: COMBAT START visibility_limit",
+        "[14:24:17] [Server thread/INFO]: COMBAT START duration_limit",
+        "[14:24:17] [Server thread/INFO]: COMBAT START entity_occlusion",
+        "[14:24:17] [Server thread/INFO]: COMBAT START ledge_retreat",
+        "[14:24:20] [Server thread/INFO]: COMBAT START shield_and_axe",
+        "[14:24:22] [Server thread/INFO]: COMBAT ERROR shield_and_axe vanilla shield/axe targetShieldDisabled=false CombatDiagnostics[status=RUNNING, phase=ATTACKING, targetId=6ed27fdb-642f-40eb-9338-73c8d1be98ab, weapon=AXE, elapsedTicks=27, unseenTicks=0, weaponSwitches=2, attacks=1, shots=0, blockedMovementTicks=0, targetDistance=2.769010543823242, targetVisible=true, blocking=false, reason=running]",
+        "[14:24:22] [Server thread/INFO]: COMBAT START completion_snapshot",
+        "[14:24:22] [Server thread/INFO]: COMBAT START charged_sword_damage",
+        "[14:24:25] [Server thread/INFO]: COMBAT FAIL passed=10 failed=1"
+      ],
+      "evidence": "main-report.json",
+      "stageIndex": 0,
+      "supersededBy": "combat-confirmation-report.json",
+      "reason": "The original shield fixture asserted cooldown after the first attempted axe hit during vanilla ServerPlayer login immunity. The only source change waits at most 200 ticks, while still requiring axe selection, shield use, an attack and actual shield cooldown. Production library sources and the library JAR are identical in the main and confirmation reports."
+    }
+  ],
+  "pendingStages": [],
+  "counts": {
+    "junitTests": 90,
+    "integrationScenarios": 146,
+    "scenarioCounts": {
+      "navtest regression": 51,
+      "navreview": 15,
+      "navtransitions": 10,
+      "navfixes": 15,
+      "navactivities": 17,
+      "navlibrary": 15,
+      "navexcavation": 12,
+      "navcombat": 11
+    },
+    "apiSmokeChecks": 22,
+    "ticketRegression": 1,
+    "gatherRestartItems": 5,
+    "excavationRestartCompletedBlocks": 24,
+    "excavationRestartCappedBlocks": 11,
+    "mixedAssignments": 60,
+    "loadBots": 50
+  },
+  "mixed": {
+    "bots": 12,
+    "rounds": 5,
+    "completedAssignments": 60,
+    "placedSupports": 405,
+    "ticks": 3407,
+    "travelledBlocks": 3336.858735545411,
+    "horizontalBlocks": 3324.006199346104,
+    "measuredSeconds": 168.6772906,
+    "stageTickMeasurements": {
+      "full": {
+        "ticks": 3405,
+        "avgMs": 2.801850778267254,
+        "p95Ms": 4.1948,
+        "p99Ms": 8.184,
+        "maxMs": 84.3635
+      },
+      "runtime": {
+        "ticks": 3407,
+        "avgMs": 1.172011358966833,
+        "p95Ms": 1.8918,
+        "p99Ms": 3.9434,
+        "maxMs": 17.1952
+      }
+    },
+    "evidence": "main-report.json"
+  },
+  "load": {
+    "bots": 50,
+    "completedAssignments": 50,
+    "ticks": 357,
+    "searches": 50,
+    "nodes": 650,
+    "queuedSearches": 0,
+    "stageTickMeasurements": {
+      "full": {
+        "ticks": 356,
+        "avgMs": 3.89768595505618,
+        "p95Ms": 5.0405,
+        "maxMs": 68.1833
+      },
+      "runtime": {
+        "ticks": 357,
+        "avgMs": 1.3676084033613445,
+        "p95Ms": 2.1215,
+        "maxMs": 6.4389
+      }
+    },
+    "loadPass": "[14:34:45] [Server thread/INFO]: LOAD PASS count=50 completed=50/50 ticks=357 maxTickMs=140.9625 avgTickMs=1.1696047775175644 searches=50 nodes=650 queued=0",
+    "evidence": "main-report.json",
+    "note": "LOAD PASS maxTickMs/avgTickMs are cumulative runtime metrics. MEASURE DONE full/runtime values measure this load stage only."
+  },
+  "limitations": [
+    "This aggregate combines the completed combat confirmation with the main run; it does not overwrite the original main report success=false.",
+    "The 1000-block natural journey and navregions were not repeated in this session; their earlier 2026-09-27 evidence remains separate.",
+    "Tick timings describe these isolated peaceful arena runs and exclude arena preparation from the measured interval."
+  ]
+}

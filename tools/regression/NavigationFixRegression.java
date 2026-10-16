@@ -82,11 +82,14 @@ public final class NavigationFixRegression {
             switch(phase) {
                 case 0 -> {
                     if(ticks<10) return;
-                    finiteInputs(); futureIsolation();
+                    finiteInputs(); futureIsolation(); pendingChunkCapture();
                     bot.player().getInventory().setItem(0,new ItemStack(Items.STONE,16));
                     // The probe arena is away from both players; load its
                     // chunk explicitly as test setup before capturing it.
-                    level.getChunkAt(p(0,0,80));
+                    var probe = new net.minecraft.world.level.ChunkPos(p(0,0,80).getX() >> 4,p(0,0,80).getZ() >> 4);
+                    for(int cx=probe.x()-1;cx<=probe.x()+1;cx++) for(int cz=probe.z()-1;cz<=probe.z()+1;cz++) {
+                        level.getChunk(cx,cz);
+                    }
                     GridWorld world=WorldSnapshot.capture(level,bot.player(),new GridPos(4096,200,4176),16,
                             false,false,false,true,()->true);
                     GridPath path=GridPathfinder.find(world,new GridPos(4096,200,4176),new GridPos(4107,200,4176),build);
@@ -202,6 +205,24 @@ public final class NavigationFixRegression {
         } catch(Throwable error) { check("unexpected_exception",false,error); finish(); }
     }
     private void next(int phase) { this.phase=phase; ticks=0; }
+    private void pendingChunkCapture() {
+        var source = level.getChunkSource();
+        var position = new net.minecraft.world.level.ChunkPos(12500, 12500);
+        var loading = source.addTicketAndLoadWithRadius(NavigationAiMod.NAVIGATION_TICKET, position, 2);
+        try {
+            boolean requested = source.hasChunk(position.x(), position.z());
+            boolean ready = source.getChunkNow(position.x(), position.z()) != null;
+            GridPos start = new GridPos(position.x()*16+8, 200, position.z()*16+8);
+            WorldSnapshot snapshot = WorldSnapshot.capture(level, bot.player(), start, 1,
+                    false, false, false, false, () -> false);
+            check("capture_does_not_wait_for_pending_chunk", requested && !ready
+                            && source.getChunkNow(position.x(), position.z()) == null
+                            && !loading.isDone() && !snapshot.known(start) && snapshot.hasUnloadedChunks(),
+                    "requested="+requested+" ready="+ready+" completed="+loading.isDone());
+        } finally {
+            source.removeTicketWithRadius(NavigationAiMod.NAVIGATION_TICKET, position, 2);
+        }
+    }
     private void finiteInputs() {
         boolean ok=true;
         for(float value : new float[]{Float.NaN,Float.POSITIVE_INFINITY,Float.NEGATIVE_INFINITY}) {

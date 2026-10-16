@@ -74,6 +74,19 @@ public final class GridPathfinder {
     public static GridPath findToAny(GridWorld world, GridPos start, Set<GridPos> goals, GridPos frontierTarget,
                                     NavigationPolicy policy, NodeBudget budget, boolean returnBestPartial,
                                     Set<GridPos> exploredFrontiers) {
+        return search(world, start, goals, frontierTarget, policy, budget, returnBestPartial, exploredFrontiers, null);
+    }
+
+    public static GridExploration explore(GridWorld world, GridPos start, Set<GridPos> goals, GridPos frontierTarget,
+                                           NavigationPolicy policy, NodeBudget budget, Set<GridPos> exploredFrontiers) {
+        List<GridExploration.Portal> exits = new ArrayList<>();
+        GridPath path = search(world, start, goals, frontierTarget, policy, budget, true, exploredFrontiers, exits);
+        return new GridExploration(path, exits);
+    }
+
+    private static GridPath search(GridWorld world, GridPos start, Set<GridPos> goals, GridPos frontierTarget,
+                                    NavigationPolicy policy, NodeBudget budget, boolean returnBestPartial,
+                                    Set<GridPos> exploredFrontiers, List<GridExploration.Portal> exits) {
         if (!world.passable(start)) return new GridPath(List.of(), 0);
         goals = Set.copyOf(goals);
         if (goals.contains(start)) return GridPath.reached(List.of(start), 1);
@@ -105,6 +118,7 @@ public final class GridPathfinder {
         boolean searchLimitReached = false;
         boolean pathLengthReached = false;
         boolean goalVisible = goals.stream().anyMatch(world::passable);
+        Map<GridPos, SearchNode> portals = exits == null ? null : new java.util.LinkedHashMap<>();
         while (!open.isEmpty() && visited < policy.maxSearchNodes()) {
             if (Thread.currentThread().isInterrupted()) return new GridPath(List.of(), visited);
             SearchNode currentNode = open.poll().node();
@@ -116,6 +130,12 @@ public final class GridPathfinder {
             GridPos current = currentNode.pos();
             visited++;
             double currentCost = currentNode.cost;
+            if (portals != null && currentNode != startNode && world.isFrontier(current)) {
+                // Eight-block portal regions keep a large cliff or cave boundary bounded.
+                GridPos region = new GridPos(Math.floorDiv(current.x(), 8), Math.floorDiv(current.y(), 8), Math.floorDiv(current.z(), 8));
+                SearchNode previous = portals.get(region);
+                if (previous != null && currentCost < previous.cost || previous == null && portals.size() < 64) portals.put(region, currentNode);
+            }
             if (currentNode != startNode && world.isFrontier(current) && !exploredFrontiers.contains(current)) {
                 if (bestFrontier == null || preferFrontier(currentNode, bestFrontier, start, frontierTarget)) {
                     bestFrontier = currentNode;
@@ -189,6 +209,17 @@ public final class GridPathfinder {
             }
         }
         if (visited >= policy.maxSearchNodes() && !open.isEmpty()) searchLimitReached = true;
+        if (exits != null) {
+            for (SearchNode exit : portals.values()) {
+                List<GridPos> route = reconstruct(exit);
+                if (route.size() > 256) continue;
+                boolean reverse = true;
+                for (int i = route.size()-1; i > 0; i--) {
+                    if (TransitionRules.describe(world, route.get(i), route.get(i-1), policy) == null) { reverse = false; break; }
+                }
+                exits.add(new GridExploration.Portal(route, reverse));
+            }
+        }
         SearchNode partial = !goalVisible ? bestFrontier : bestNode;
         if (returnBestPartial && partial != null && partial != startNode
                 && (budgetExhausted || searchLimitReached || pathLengthReached || !goalVisible)) {

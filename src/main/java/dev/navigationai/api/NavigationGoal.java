@@ -9,8 +9,8 @@ import java.util.List;
 import java.util.Objects;
 
 public sealed interface NavigationGoal permits NavigationGoal.BlockGoal, NavigationGoal.PositionGoal,
-        NavigationGoal.FollowGoal, NavigationGoal.LookAtGoal, NavigationGoal.ReturnGoal,
-        NavigationGoal.PatrolGoal, NavigationGoal.EscortGoal, NavigationGoal.MultiGoal,
+        NavigationGoal.FollowingGoal, NavigationGoal.LookAtGoal, NavigationGoal.ReturnGoal,
+        NavigationGoal.PatrolGoal, NavigationGoal.MultiGoal,
         NavigationGoal.DimensionGoal {
     record BlockGoal(BlockPos position, double tolerance) implements NavigationGoal {
         public BlockGoal {
@@ -26,7 +26,13 @@ public sealed interface NavigationGoal permits NavigationGoal.BlockGoal, Navigat
         }
         public PositionGoal(Vec3 position) { this(position, 0.75); }
     }
-    record FollowGoal(ServerPlayer target, double distance, double repathDistance) implements NavigationGoal {
+    sealed interface FollowingGoal extends NavigationGoal permits FollowGoal, EscortGoal, EntityFollowGoal, EntityEscortGoal {
+        net.minecraft.world.entity.LivingEntity target();
+        double distance();
+        double repathDistance();
+    }
+
+    record FollowGoal(ServerPlayer target, double distance, double repathDistance) implements FollowingGoal {
         public FollowGoal {
             Objects.requireNonNull(target, "target");
             validateFinite("distance", distance);
@@ -60,7 +66,7 @@ public sealed interface NavigationGoal permits NavigationGoal.BlockGoal, Navigat
         }
         public PatrolGoal(List<Vec3> waypoints, boolean loop) { this(waypoints, loop, 0.75); }
     }
-    record EscortGoal(ServerPlayer target, double distance, double repathDistance) implements NavigationGoal {
+    record EscortGoal(ServerPlayer target, double distance, double repathDistance) implements FollowingGoal {
         public EscortGoal {
             Objects.requireNonNull(target, "target");
             validateFinite("distance", distance);
@@ -69,6 +75,19 @@ public sealed interface NavigationGoal permits NavigationGoal.BlockGoal, Navigat
             if (repathDistance < distance) throw new IllegalArgumentException("repathDistance must be >= distance");
         }
         public EscortGoal(ServerPlayer target, double distance) { this(target, distance, 4.0); }
+    }
+    /** Follow any loaded living entity, including another controlled villager. */
+    record EntityFollowGoal(net.minecraft.world.entity.LivingEntity target, double distance, double repathDistance) implements FollowingGoal {
+        public EntityFollowGoal { validateFollowing(target, distance, repathDistance); }
+        public EntityFollowGoal(net.minecraft.world.entity.LivingEntity target, double distance) { this(target, distance, Math.max(4, distance)); }
+    }
+    record EntityEscortGoal(net.minecraft.world.entity.LivingEntity target, double distance, double repathDistance) implements FollowingGoal {
+        public EntityEscortGoal { validateFollowing(target, distance, repathDistance); }
+        public EntityEscortGoal(net.minecraft.world.entity.LivingEntity target, double distance) { this(target, distance, Math.max(4, distance)); }
+    }
+    private static void validateFollowing(net.minecraft.world.entity.LivingEntity target, double distance, double repath) {
+        Objects.requireNonNull(target, "target"); validateFinite("distance", distance); validateFinite("repathDistance", repath);
+        if (distance < .5 || repath < distance) throw new IllegalArgumentException("distance must be >= .5 and repathDistance >= distance");
     }
     record MultiGoal(List<NavigationGoal> goals) implements NavigationGoal {
         public MultiGoal {

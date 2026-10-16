@@ -11,13 +11,15 @@ final class MovementController {
     private GridTransition active;
     private Phase phase = Phase.APPROACH;
     private float previousForward;
+    private boolean resetTakeoff;
 
-    void reset() { active = null; phase = Phase.APPROACH; previousForward = 0; }
+    void reset() { active = null; phase = Phase.APPROACH; previousForward = 0; resetTakeoff=false; }
 
     Input update(GridTransition transition, State state, boolean continueStraight) {
         if (!transition.equals(active)) {
             active = transition;
             phase = Phase.APPROACH;
+            resetTakeoff=false;
         }
         double dx = transition.to().x() + .5 - state.x(), dz = transition.to().z() + .5 - state.z();
         double distance = Math.hypot(dx, dz);
@@ -50,8 +52,12 @@ final class MovementController {
             boolean ready = progress >= transition.takeoff().edgeProgress()
                     && alongSpeed >= transition.takeoff().minimumSpeed() && Math.abs(sidewaysSpeed) < .12;
             // A lost sprint must not turn an unready takeoff into walking off the platform.
-            if (!ready && progress >= .46 && transition.gapJump()) {
-                desiredSpeed = 0;
+            if (!ready && progress >= .46 && transition.gapJump())resetTakeoff=true;
+            if(resetTakeoff&&progress<=.05)resetTakeoff=false;
+            if (resetTakeoff) {
+                // A replan can begin at the front of a cell with no momentum. Braking there forever
+                // cannot produce a legal takeoff. Back onto the same supported platform first.
+                desiredSpeed = -.10;
                 crouch = true;
                 sprint = false;
             } else if (ready) {

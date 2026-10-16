@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
@@ -48,18 +49,29 @@ final class ResourceCollectorImpl implements ResourceCollector {
 
     @Override
     public GatherTask gather(GatherRequest request, GatherPolicy policy, NavigationPolicy navigationPolicy) {
+        return startGather(request, policy, navigationPolicy, true);
+    }
+
+    GatherTask gatherAsChild(GatherRequest request, GatherPolicy policy, NavigationPolicy navigationPolicy) {
+        return startGather(request, policy, navigationPolicy, false);
+    }
+
+    private GatherTask startGather(GatherRequest request, GatherPolicy policy, NavigationPolicy navigationPolicy,
+                                   boolean root) {
         runtime.ensureServerThread();
         owner.ensureActive();
         java.util.Objects.requireNonNull(request, "request");
         java.util.Objects.requireNonNull(policy, "policy");
         java.util.Objects.requireNonNull(navigationPolicy, "navigationPolicy");
+        if (root && owner.control().claim(BotControl.Kind.GATHER) < 0) return superseded(request, policy, navigationPolicy);
         long generation = ++startGeneration;
+        long controlRequest = owner.control().generation();
         cancel();
-        if (generation != startGeneration) return superseded(request, policy, navigationPolicy);
+        if (generation != startGeneration || !owner.control().current(controlRequest)) return superseded(request, policy, navigationPolicy);
         owner.navigator().cancel();
-        if (generation != startGeneration) return superseded(request, policy, navigationPolicy);
+        if (generation != startGeneration || !owner.control().current(controlRequest)) return superseded(request, policy, navigationPolicy);
         owner.minerImpl().cancel();
-        if (generation != startGeneration) return superseded(request, policy, navigationPolicy);
+        if (generation != startGeneration || !owner.control().current(controlRequest)) return superseded(request, policy, navigationPolicy);
         owner.ensureActive();
         task = new GatherTaskImpl(request, policy, navigationPolicy);
         return task;
@@ -78,6 +90,13 @@ final class ResourceCollectorImpl implements ResourceCollector {
         if (task == null || task.status != GatherStatus.RUNNING) return;
         task.ticks++;
         if (task.ticks > task.policy.timeoutTicks()) { task.fail("timeout"); return; }
+        if (task.phase != GatherPhase.MINING) {
+            collectNearbyDrops(task.request.items());
+            task.collected = countItem(owner.entity(), task.request.items()) - task.baseline;
+            if (!hasInventoryRoom(owner.entity(), task.request.items()) && task.collected < task.request.count()) {
+                task.fail("inventory_full"); return;
+            }
+        }
         if (task.collected >= task.request.count()) { task.complete("target_reached"); return; }
 
         switch (task.phase) {
@@ -95,7 +114,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
     }
 
     private void search(GatherTaskImpl current) {
-        ServerLevel level = (ServerLevel) owner.player().level();
+        ServerLevel level = (ServerLevel) owner.entity().level();
         if (current.target != null) {
             if (!current.request.blocks().contains(level.getBlockState(current.target).getBlock())) {
                 clearTarget(current);
@@ -109,31 +128,36 @@ final class ResourceCollectorImpl implements ResourceCollector {
             }
         }
         if (!current.scanComplete) {
-            int radius = current.policy.radius();
-            if (current.scanOrigin == null) current.scanOrigin = owner.player().blockPosition();
+            if (current.scanOrigin == null) current.scanOrigin = owner.entity().blockPosition();
             BlockPos origin = current.scanOrigin;
-            int side = radius * 2 + 1;
-            int volume = side * side * side;
             int cells = runtime.acquireResourceScanCells(512);
             long deadline = runtime.planningDeadline();
-            for (int scanned = 0; scanned < cells && current.scanIndex < volume; scanned++) {
+            for (int scanned = 0; scanned < cells && current.scanCursor.hasNext(); scanned++) {
                 if (System.nanoTime() >= deadline) break;
-                int index = current.scanIndex++;
-                BlockPos pos = origin.offset(index / (side * side) - radius,
-                        index / side % side - radius, index % side - radius);
-                if (level.hasChunkAt(pos) && current.request.blocks().contains(level.getBlockState(pos).getBlock())) {
+                BlockPos pos = current.scanCursor.next(origin);
+                current.scanIndex++;
+                var chunk = level.getChunkSource().getChunkNow(pos.getX() >> 4, pos.getZ() >> 4);
+                if (chunk != null && current.request.blocks().contains(chunk.getBlockState(pos).getBlock())) {
                     current.candidates.add(pos);
                 }
             }
-            if (current.scanIndex < volume) return;
-            current.scanComplete = true;
+            current.scanComplete = !current.scanCursor.hasNext();
         }
         int examined = 0;
         long deadline = runtime.planningDeadline();
-        while (!current.candidates.isEmpty() && examined++ < 512 && System.nanoTime() < deadline) {
-            BlockPos target = current.candidates.remove();
-            if (!current.request.blocks().contains(level.getBlockState(target).getBlock())) continue;
-            List<BlockPos> standingPositions = findStandingPositions(level, owner.player(), target,
+        while ((!current.veinCandidates.isEmpty() || !current.candidates.isEmpty())
+                && examined++ < 512 && System.nanoTime() < deadline) {
+            // Follow newly exposed neighbours before returning to the original area scan.
+            BlockPos target = current.veinCandidates.isEmpty() ? current.candidates.remove() : current.veinCandidates.removeFirst();
+            current.veinQueued.remove(target);
+            var chunk = level.getChunkSource().getChunkNow(target.getX() >> 4, target.getZ() >> 4);
+            if (chunk == null || !current.request.blocks().contains(chunk.getBlockState(target).getBlock())) continue;
+            String unsafe = MiningSafety.excavationFailure(level, owner.entity(), target);
+            if (unsafe != null) { current.lastFailureReason = unsafe; continue; }
+            if (!owner.minerImpl().hasUsableTool(level.getBlockState(target), 1)) {
+                current.lastFailureReason = "no_suitable_tool"; continue;
+            }
+            List<BlockPos> standingPositions = findStandingPositions(level, owner.entity(), target,
                     current.navigationPolicy);
             if (standingPositions.isEmpty()) continue;
             if (!runtime.reserveResource(level, target, current)) continue;
@@ -145,7 +169,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
             current.attemptsForBlock++;
             return;
         }
-        if (!current.candidates.isEmpty()) return;
+        if (!current.veinCandidates.isEmpty() || !current.candidates.isEmpty() || !current.scanComplete) return;
         current.fail(current.brokenBlocks == 0
                 ? (current.lastFailureReason == null ? "no_resources" : current.lastFailureReason)
                 : "resources_exhausted");
@@ -154,13 +178,16 @@ final class ResourceCollectorImpl implements ResourceCollector {
     private void startNavigation(GatherTaskImpl current, BlockPos stand) {
         current.stand = stand;
         current.phase = GatherPhase.MOVING;
-        current.navigation = owner.navigator().goTo(
-                new NavigationGoal.PositionGoal(Vec3.atCenterOf(stand), 1.0),
+        current.navigation = owner.navigatorImpl().goToAsChild(
+                new NavigationGoal.PositionGoal(new Vec3(stand.getX()+.5,
+                        stand.getY()+NavigationGeometry.feetOffset((ServerLevel)owner.entity().level(),stand),
+                        stand.getZ()+.5), .2),
                 current.navigationPolicy);
     }
 
     private void clearTarget(GatherTaskImpl current) {
         runtime.releaseResources(current);
+        runtime.releaseResourceDrops(owner.id());
         current.target = null;
         current.stand = null;
         current.standingPositions = List.of();
@@ -174,7 +201,9 @@ final class ResourceCollectorImpl implements ResourceCollector {
         if (current.navigation == null) { current.phase = GatherPhase.SEARCHING; return; }
         NavigationStatus status = current.navigation.status();
         if (status == NavigationStatus.SUCCESS) {
-            current.mining = owner.miner().breakBlock(current.target);
+            String unsafe = MiningSafety.excavationFailure((ServerLevel)owner.entity().level(), owner.entity(), current.target);
+            if (unsafe != null) { current.lastFailureReason = unsafe; clearTarget(current); current.phase = GatherPhase.SEARCHING; return; }
+            current.mining = owner.minerImpl().breakBlockForCollector(current.target);
             current.phase = GatherPhase.MINING;
         } else if (status == NavigationStatus.FAILED || status == NavigationStatus.CANCELLED
                 || status == NavigationStatus.STUCK) {
@@ -185,9 +214,16 @@ final class ResourceCollectorImpl implements ResourceCollector {
     private void tickMining(GatherTaskImpl current) {
         if (current.mining == null) { current.phase = GatherPhase.SEARCHING; return; }
         MiningStatus status = current.mining.status();
+        if (status == MiningStatus.RUNNING) {
+            String unsafe = MiningSafety.excavationFailure((ServerLevel)owner.entity().level(), owner.entity(), current.target);
+            if (unsafe != null) { current.mining.cancel(); current.lastFailureReason = unsafe; clearTarget(current); current.phase = GatherPhase.SEARCHING; }
+            return;
+        }
         if (status == MiningStatus.SUCCESS) {
             current.brokenBlocks++;
+            enqueueVeinNeighbours(current);
             current.collectingTicks = 0;
+            current.navigation = null;
             current.phase = GatherPhase.COLLECTING;
         } else if (status == MiningStatus.FAILED || status == MiningStatus.CANCELLED) {
             var result = current.mining.completion().getNow(null);
@@ -198,14 +234,40 @@ final class ResourceCollectorImpl implements ResourceCollector {
         }
     }
 
+    private void enqueueVeinNeighbours(GatherTaskImpl current) {
+        ServerLevel level = (ServerLevel)owner.entity().level();
+        for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
+            BlockPos neighbour = current.target.relative(direction);
+            BlockPos origin = current.scanOrigin;
+            int radius = current.policy.radius();
+            if (origin == null || Math.abs(neighbour.getX() - origin.getX()) > radius
+                    || Math.abs(neighbour.getY() - origin.getY()) > radius
+                    || Math.abs(neighbour.getZ() - origin.getZ()) > radius || !MiningSafety.loaded(level, neighbour)) continue;
+            if (current.request.blocks().contains(level.getBlockState(neighbour).getBlock()) && current.veinQueued.add(neighbour)) {
+                current.veinCandidates.addLast(neighbour);
+            }
+        }
+    }
+
     private void tickCollecting(GatherTaskImpl current) {
         current.collectingTicks++;
         collectNearbyDrops(current.request.items());
-        current.collected = countItem(owner.player(), current.request.items()) - current.baseline;
+        current.collected = countItem(owner.entity(), current.request.items()) - current.baseline;
         if (current.collected >= current.request.count()) { current.complete("target_reached"); return; }
+        ItemEntity drop = runtime.nearestResourceDrop(owner.id(), owner.entity(), current.request.items());
+        if (drop != null && hasInventoryRoom(owner.entity(), current.request.items()) && current.collectingTicks < 200) {
+            // Loot can bounce beyond the original mining approach. Follow the
+            // actual item through the navigator rather than abandoning it after 20 ticks.
+            if (current.navigation == null || current.navigation.completion().isDone()) {
+                current.navigation = owner.navigatorImpl().goToAsChild(
+                        new NavigationGoal.PositionGoal(drop.position(), 1.0), current.navigationPolicy);
+            }
+            return;
+        }
         if (current.collectingTicks >= 20) {
-            if (!hasInventoryRoom(owner.player(), current.request.items())) current.fail("inventory_full");
+            if (!hasInventoryRoom(owner.entity(), current.request.items())) current.fail("inventory_full");
             else {
+                if (current.navigation != null) current.navigation.cancel();
                 clearTarget(current);
                 current.phase = GatherPhase.SEARCHING;
             }
@@ -213,37 +275,41 @@ final class ResourceCollectorImpl implements ResourceCollector {
     }
 
     private void collectNearbyDrops(java.util.Set<net.minecraft.world.item.Item> items) {
-        ServerPlayer player = owner.player();
+        LivingEntity player = owner.entity();
         ServerLevel level = (ServerLevel) player.level();
         AABB area = player.getBoundingBox().inflate(2.5);
         for (net.minecraft.world.entity.Entity entity : level.getEntities(player, area, candidate ->
                 candidate instanceof ItemEntity item && items.contains(item.getItem().getItem()))) {
-            ((ItemEntity) entity).playerTouch(player);
+            ((ItemEntity) entity).playerTouch(ActorSupport.context(player));
         }
     }
 
-    private static int countItem(ServerPlayer player, java.util.Set<net.minecraft.world.item.Item> items) {
+    private static int countItem(LivingEntity player, java.util.Set<net.minecraft.world.item.Item> items) {
         int count = 0;
-        for (ItemStack stack : player.getInventory().getNonEquipmentItems()) {
+        for (ItemStack stack : ActorSupport.context(player).getInventory().getNonEquipmentItems()) {
             if (items.contains(stack.getItem())) count += stack.getCount();
         }
         return count;
     }
 
-    private static boolean hasInventoryRoom(ServerPlayer player, java.util.Set<net.minecraft.world.item.Item> items) {
+    private static boolean hasInventoryRoom(LivingEntity player, java.util.Set<net.minecraft.world.item.Item> items) {
         for (net.minecraft.world.item.Item item : items) {
             ItemStack probe = new ItemStack(item);
-            if (player.getInventory().getSlotWithRemainingSpace(probe) >= 0
-                    || player.getInventory().getFreeSlot() >= 0) return true;
+            if (ActorSupport.context(player).getInventory().getSlotWithRemainingSpace(probe) >= 0
+                    || ActorSupport.context(player).getInventory().getFreeSlot() >= 0) return true;
         }
         return false;
     }
 
-    private static List<BlockPos> findStandingPositions(ServerLevel level, ServerPlayer player, BlockPos target,
+    private static List<BlockPos> findStandingPositions(ServerLevel level, LivingEntity player, BlockPos target,
                                                         NavigationPolicy policy) {
         List<BlockPos> positions = new ArrayList<>();
         for (BlockPos candidate : new BlockPos[] {
-                target.west(), target.east(), target.north(), target.south(), target.above() }) {
+                target.west(), target.east(), target.north(), target.south(),
+                target.west().above(), target.east().above(), target.north().above(), target.south().above() }) {
+            if (!WorldSnapshot.loadedGeometryAt(level, candidate.getX(), candidate.getZ())) continue;
+            // Do not stand on the block that will be removed. The post-break
+            // support, rather than its current collision, determines safety.
             BlockState below = level.getBlockState(candidate.below());
             boolean supported = !below.getCollisionShape(level, candidate.below()).isEmpty()
                     || policy.allowWater() && !level.getFluidState(candidate.below()).isEmpty();
@@ -270,6 +336,9 @@ final class ResourceCollectorImpl implements ResourceCollector {
                 Comparator.<BlockPos>comparingDouble(pos -> pos.distSqr(scanOrigin))
                         .thenComparingInt(BlockPos::getX).thenComparingInt(BlockPos::getY).thenComparingInt(BlockPos::getZ));
         private int scanIndex;
+        private final java.util.ArrayDeque<BlockPos> veinCandidates = new java.util.ArrayDeque<>();
+        private final java.util.Set<BlockPos> veinQueued = new java.util.HashSet<>();
+        private final ResourceScanCursor scanCursor;
         private boolean scanComplete;
         private final long started = System.nanoTime();
         private GatherStatus status = GatherStatus.RUNNING;
@@ -292,7 +361,8 @@ final class ResourceCollectorImpl implements ResourceCollector {
             this.request = request;
             this.policy = policy;
             this.navigationPolicy = navigationPolicy;
-            this.baseline = countItem(owner.player(), request.items());
+            this.scanCursor = new ResourceScanCursor(policy.radius());
+            this.baseline = countItem(owner.entity(), request.items());
         }
         @Override public GatherStatus status() { return status; }
         @Override public GatherPhase phase() { return phase; }
@@ -304,6 +374,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
                 status = GatherStatus.CANCELLED;
                 phase = GatherPhase.DONE;
                 runtime.releaseResources(this);
+                runtime.releaseResourceDrops(owner.id());
                 if (navigation != null) navigation.cancel();
                 if (mining != null) mining.cancel();
                 completion.complete(new GatherResult(status, "cancelled", collected, brokenBlocks, System.nanoTime() - started));
@@ -314,6 +385,9 @@ final class ResourceCollectorImpl implements ResourceCollector {
             status = GatherStatus.SUCCESS;
             phase = GatherPhase.DONE;
             runtime.releaseResources(this);
+            runtime.releaseResourceDrops(owner.id());
+            if (navigation != null) navigation.cancel();
+            if (mining != null) mining.cancel();
             completion.complete(new GatherResult(status, reason, collected, brokenBlocks, System.nanoTime() - started));
         }
         private void fail(String reason) {
@@ -321,6 +395,7 @@ final class ResourceCollectorImpl implements ResourceCollector {
             status = GatherStatus.FAILED;
             phase = GatherPhase.DONE;
             runtime.releaseResources(this);
+            runtime.releaseResourceDrops(owner.id());
             if (navigation != null) navigation.cancel();
             if (mining != null) mining.cancel();
             completion.complete(new GatherResult(status, reason, collected, brokenBlocks, System.nanoTime() - started));

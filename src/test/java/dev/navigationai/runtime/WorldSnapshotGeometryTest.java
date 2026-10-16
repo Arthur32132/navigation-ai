@@ -13,13 +13,30 @@ import static org.junit.jupiter.api.Assertions.*;
 class WorldSnapshotGeometryTest {
     private WorldSnapshot world(Set<GridPos> passable, Set<GridPos> crouch, Set<GridPos> free,
                                 Map<GridPos, List<AABB>> collisions) {
+        return world(passable, crouch, free, collisions, Set.of());
+    }
+
+    private WorldSnapshot world(Set<GridPos> passable, Set<GridPos> crouch, Set<GridPos> free,
+                                Map<GridPos, List<AABB>> collisions, Set<GridPos> hazards) {
         Set<GridPos> known = new HashSet<>();
         for (int x=-2; x<=6; x++) for (int y=-2; y<=5; y++) for(int z=-2; z<=6; z++) {
             known.add(new GridPos(x,y,z));
         }
-        return new WorldSnapshot(passable, Set.of(), crouch, Set.of(), Set.of(),
+        return new WorldSnapshot(passable, hazards, crouch, Set.of(), Set.of(),
                 free, Map.of(), Map.of(), collisions, known, 0.6, 1.8, Set.of(), 0,
                 -8,8,-8,8,-8,8,false);
+    }
+
+    @Test void rejectsDiagonalBodyContactWithHazardBetweenSafeEndpoints() {
+        GridPos start = new GridPos(0,0,0), end = new GridPos(1,0,1);
+        GridPos corner = new GridPos(1,0,0), detour = new GridPos(0,0,1);
+        Set<GridPos> cells = Set.of(start, end, corner, detour);
+        assertTrue(world(cells,Set.of(),Set.of(),Map.of()).canTraverse(start,end));
+        WorldSnapshot hazardous = world(cells,Set.of(),Set.of(),Map.of(),Set.of(corner));
+        assertFalse(hazardous.canTraverse(start,end));
+        assertTrue(hazardous.canTraverse(start,detour));
+        assertTrue(hazardous.canTraverse(detour,end));
+        assertTrue(hazardous.canTraverse(corner,end), "A bot already inside a hazard can leave it");
     }
 
     @Test void permitsClearOneTwoAndThreeBlockGapJumps() {
@@ -28,6 +45,20 @@ class WorldSnapshotGeometryTest {
             GridPos end = new GridPos(length,0,0);
             assertTrue(world(Set.of(start,end),Set.of(),Set.of(),Map.of()).canJump(start,end));
         }
+    }
+
+    @Test void rejectsJumpArcAndWalkingSweepThroughAnotherEntity() throws Exception {
+        GridPos start = new GridPos(0,0,0), end = new GridPos(4,0,0);
+        WorldSnapshot snapshot = world(Set.of(start,end,new GridPos(1,0,0)),Set.of(),Set.of(),Map.of());
+        assertTrue(snapshot.canJump(start,end));
+        var field = WorldSnapshot.class.getDeclaredField("entityCollisions");
+        field.setAccessible(true);
+        field.set(snapshot,List.of(new AABB(1.7,0,.2,2.3,1.8,.8)));
+        assertFalse(snapshot.canJump(start,end));
+        field.set(snapshot,List.of(new AABB(.8,0,.2,1.4,1.8,.8)));
+        assertFalse(snapshot.canTraverse(start,new GridPos(1,0,0)));
+        field.set(snapshot,List.of(new AABB(1.7,0,2.2,2.3,1.8,2.8)));
+        assertTrue(snapshot.canJump(start,end));
     }
 
     @Test void rejectsCrouchingTakeoffAndLanding() {
@@ -67,6 +98,15 @@ class WorldSnapshotGeometryTest {
         assertTrue(world(Set.of(start,end),Set.of(),clearEntry,Map.of()).canDrop(start,end));
     }
 
+    @Test void checksHeadClearanceBeforeASingleBlockDescent() {
+        GridPos start=new GridPos(0,1,0), end=new GridPos(1,0,0);
+        assertTrue(world(Set.of(start,end),Set.of(),Set.of(),Map.of()).canTraverse(start,end));
+        Map<GridPos,List<AABB>> roof=Map.of(new GridPos(1,2,0),List.of(new AABB(1,2,0,2,3,1)));
+        WorldSnapshot snapshot=world(Set.of(start,end),Set.of(),Set.of(),roof);
+        assertTrue(snapshot.passable(end),"Landing fits below the roof");
+        assertFalse(snapshot.canTraverse(start,end),"The body must enter before it can fall");
+    }
+
     @Test void startsBodyAboveThePartialSupport() {
         double offset=NavigationGeometry.feetOffset(Shapes.box(0,0,0,1,0.5,1),Shapes.block());
         assertEquals(0.5,offset);
@@ -75,6 +115,15 @@ class WorldSnapshotGeometryTest {
     }
     @Test void supportHeightIncludesAPartialBlockBelowTheCell() {
         assertEquals(-.5, NavigationGeometry.feetOffset(Shapes.empty(),Shapes.box(0,0,0,1,.5,1)));
+    }
+    @Test void farmlandAndPathsSupportTheBodyAboveTheirActualSurface(){
+        var farmland=Shapes.box(0,0,0,1,15.0/16,1);
+        assertTrue(NavigationGeometry.partialSupport(farmland));
+        double offset=NavigationGeometry.feetOffset(farmland,Shapes.block());assertEquals(15.0/16,offset);
+        var body=NavigationGeometry.body(.5,offset,.5,.6,1.95);
+        assertFalse(body.intersects(new AABB(0,0,0,1,15.0/16,1)));
+        assertFalse(NavigationGeometry.partialSupport(Shapes.block()));
+        assertFalse(NavigationGeometry.partialSupport(Shapes.box(0,0,0,1,1.5,1)));
     }
 
     @Test void includesRaisedShapesFromTheBlockBelow() {

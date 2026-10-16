@@ -9,4 +9,7 @@ public interface CombatController {
     CombatStatus status();
     CombatTask task();
     LivingEntity target();
+    default CombatDiagnostics diagnostics() {
+        return task() == null ? CombatDiagnostics.idle() : task().diagnostics();
+    }
 }

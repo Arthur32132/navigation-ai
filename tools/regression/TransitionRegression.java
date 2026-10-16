@@ -21,7 +21,7 @@ public final class TransitionRegression {
     private static TransitionRegression active;
     private static final String[] NAMES = {"door_then_consecutive_jumps", "slab_under_low_ceiling",
             "sprint_lost_after_door", "flowing_water", "knockback_during_jump", "landing_changed_in_flight",
-            "future_obstacle_replan_in_motion", "follow_snapshot_reuse", "follow_arrival_during_gap_jump"};
+            "future_obstacle_replan_in_motion", "follow_snapshot_reuse", "follow_arrival_during_gap_jump", "short_drop_under_overhang"};
     private final CommandSourceStack source;
     private final ServerLevel level;
     private BotHandle bot, target;
@@ -118,6 +118,14 @@ public final class TransitionRegression {
                 task=bot.navigator().follow(new NavigationGoal.FollowGoal(target.player(),3,4),
                         new NavigationPolicy(false,false,false,false,40000,512,16,100,3));
             }
+            case 9 -> {
+                for(int x=1;x<=5;x++) for(int z=-2;z<=2;z++) {
+                    block(x,-1,z,Blocks.AIR);block(x,-2,z,Blocks.STONE);
+                }
+                block(1,1,0,Blocks.STONE);
+                task=bot.navigator().goTo(new NavigationGoal.PositionGoal(new Vec3(3076.5,199,3072.5),.45),
+                        new NavigationPolicy(false,false,false,false,40000,512,16,100,3));
+            }
         }
     }
     private void tick() {
@@ -133,6 +141,7 @@ public final class TransitionRegression {
             player.getFoodData().setFoodLevel(4); changed=true;
         }
         if(scenario==3 && player.isInWater()) observed=true;
+        if(scenario==9 && Math.abs(player.getZ()-3072.5)>.8) observed=true;
         if((scenario==4 || scenario==5) && !changed && !player.onGround() && x>1.5 && x<4) {
             if(scenario==4) player.setDeltaMovement(player.getDeltaMovement().add(0,0,.08));
             else block(4,0,0,Blocks.STONE);
@@ -161,6 +170,7 @@ public final class TransitionRegression {
                 case 6 -> changed && task.status()==NavigationStatus.SUCCESS && maxPaused<25;
                 case 7 -> stage==3 && task.diagnostics().reusedSnapshotCells()>0 && task.diagnostics().replans()>=2;
                 case 8 -> observed && stage==1 && task.diagnostics().damageTaken()==0;
+                case 9 -> observed && task.status()==NavigationStatus.SUCCESS && task.diagnostics().damageTaken()==0;
                 default -> task.status()==NavigationStatus.SUCCESS && task.diagnostics().damageTaken()==0;
             };
             finish(ok,"result="+task.completion().join()+" diagnostics="+task.diagnostics()+" maxPaused="+maxPaused

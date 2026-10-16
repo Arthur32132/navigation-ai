@@ -4,6 +4,7 @@ import dev.navigationai.runtime.BotRuntime;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
@@ -21,11 +22,20 @@ public final class NavigationAiMod implements ModInitializer {
     public static final TicketType NAVIGATION_TICKET = Registry.register(
             BuiltInRegistries.TICKET_TYPE, Identifier.fromNamespaceAndPath(MOD_ID, "navigation"),
             new TicketType(TicketType.NO_TIMEOUT, TicketType.FLAG_LOADING));
-    private static BotRuntime runtime;
+    public static final TicketType VILLAGER_TICKET = Registry.register(
+            BuiltInRegistries.TICKET_TYPE, Identifier.fromNamespaceAndPath(MOD_ID, "villager_control"),
+            new TicketType(TicketType.NO_TIMEOUT, TicketType.FLAG_LOADING | TicketType.FLAG_SIMULATION
+                    | TicketType.FLAG_KEEP_DIMENSION_ACTIVE));
+    private static volatile BotRuntime runtime;
 
     @Override
     public void onInitialize() {
-        ServerLifecycleEvents.SERVER_STARTED.register(server -> { if (runtime == null) runtime = new BotRuntime(server); });
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+            if (runtime == null) runtime = new BotRuntime(server);
+            for (var level : server.getAllLevels()) for (var entity : level.getAllEntities()) runtime.entityLoaded(entity);
+        });
+        ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> { if (runtime != null) runtime.entityLoaded(entity); });
+        ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> { if (runtime != null) runtime.entityUnloaded(entity); });
         ServerTickEvents.START_SERVER_TICK.register(server -> { if (runtime != null) runtime.tick(); });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> { if (runtime != null) { runtime.close(); runtime = null; } });
     }
