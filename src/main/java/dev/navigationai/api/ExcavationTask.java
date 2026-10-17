@@ -10,4 +10,6 @@ public interface ExcavationTask {
     int brokenBlocks();
     CompletableFuture<ExcavationResult> completion();
     void cancel();
+    default boolean waitingForInfrastructure() { return false; }
+    default long infrastructureWaitTicks() { return 0; }
 }

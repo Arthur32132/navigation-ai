@@ -1,5 +1,16 @@
 # Сборка и проверка
 
+Текущий кандидат: **0.2.2**, Minecraft 26.2. Упаковка этой версии по запросу
+пользователя выполняется без тестов и запуска Minecraft:
+
+```text
+gradlew.bat build -x test --offline --no-daemon
+gradlew.bat --stop
+```
+
+Исторические игровые команды ниже приведены как документация и не входят
+в эту сборку. [Статус и изменения 0.2.2](RELEASE_0.2.2.md).
+
 ## Требования
 
 | Инструмент | Требование |
@@ -36,14 +47,14 @@ python tools/regression/run-validation.py --server-template ../navigation-fixes-
 `test` запускает JUnit 5. `build` дополнительно собирает remapped JAR и sources JAR. Артефакты:
 
 ```text
-build/libs/navigation-ai-0.1.0.jar
-build/libs/navigation-ai-0.1.0-sources.jar
+build/libs/navigation-ai-0.2.2.jar
+build/libs/navigation-ai-0.2.2-sources.jar
 ```
 
 Публикация в локальный Maven-репозиторий использует координаты:
 
 ```text
-dev.navigationai:navigation-ai:0.1.0
+dev.navigationai:navigation-ai:0.2.2
 ```
 
 ## Ручная smoke-проверка

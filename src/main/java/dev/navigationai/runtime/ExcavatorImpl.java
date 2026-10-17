@@ -54,7 +54,9 @@ final class ExcavatorImpl {
             current.finish(ExcavationStatus.FAILED, "different_dimension"); return;
         }
         current.syncProgress();
-        if (++current.ticks > current.policy.timeoutTicks()) { current.finish(ExcavationStatus.FAILED, "timeout"); return; }
+        if(current.waitingForInfrastructure())current.waitTicks++;
+        else current.ticks++;
+        if (current.ticks > current.policy.timeoutTicks()) { current.finish(ExcavationStatus.FAILED, "timeout"); return; }
         if (current.policy.collectDrops()) collectDrops();
         switch (current.phase) {
             case APPROACHING -> approach(current);
@@ -217,6 +219,9 @@ final class ExcavatorImpl {
         ExcavationStatus outcome;
         String reason;
         int completed, broken, ticks;
+        long waitTicks;
+        @Override public boolean waitingForInfrastructure(){return navigation!=null&&navigation.waitingForInfrastructure();}
+        @Override public long infrastructureWaitTicks(){return waitTicks;}
         boolean returned;
         BlockPos target;
         MiningTask mining;

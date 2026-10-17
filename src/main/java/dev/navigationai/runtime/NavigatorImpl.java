@@ -80,7 +80,7 @@ final class NavigatorImpl implements Navigator {
     private Vec3 stallAnchor;
     private int ticksNearStallAnchor;
     private MiningTask navigationMining;
-    private long nextHazardRepathNanos;
+    private long nextHazardRepathTick;
     private WorldSnapshot plannedSnapshot;
     private WorldSnapshot.Capture pendingCapture;
     private GridPos captureStart, captureGoal;
@@ -203,7 +203,7 @@ final class NavigatorImpl implements Navigator {
         nextFrontierRetryTick = 0;
         budgetDeferrals = 0;
         cancelSearchFuture();
-        nextHazardRepathNanos = 0L;
+        nextHazardRepathTick = 0L;
         waitingForLanding = false;
         backgroundPlanning = false;
         recoverAfterLanding = false;
@@ -491,6 +491,11 @@ final class NavigatorImpl implements Navigator {
 
     void tick() {
         if (task == null || goal == null || isTerminal(task.status())) return;
+        task.sampleInfrastructureWait();
+        if(task.wait.expired()){
+            task.fail(waitingForFrontierChunks?"chunk_loading_timeout":"planning_timeout",resultNodesVisited());
+            return;
+        }
         validationDeferred = false;
         task.observe();
         if (recoverAfterLanding && stableForArrival(owner.entity())) {
@@ -519,6 +524,7 @@ final class NavigatorImpl implements Navigator {
         }
         if (waitingForFrontierChunks) {
             if (runtime.server().getTickCount() < nextFrontierRetryTick) return;
+            if(runtime.navigationChunksPending(owner.id()))return;
             waitingForFrontierChunks = false;
             requestPath();
             return;
@@ -1405,9 +1411,9 @@ final class NavigatorImpl implements Navigator {
         }
         owner.actions().stop();
         brakeHorizontal();
-        long now = System.nanoTime();
-        if (now < nextHazardRepathNanos) return false;
-        nextHazardRepathNanos = now + 250_000_000L;
+        long now = runtime.server().getTickCount();
+        if (now < nextHazardRepathTick) return false;
+        nextHazardRepathTick = now + dev.navigationai.api.TickWorkBudget.HAZARD_REPATH_TICKS;
         if (++repathAttempts >= 3) {
             owner.actions().stop();
             finishStuck("changed_obstacle", pathIndex < path.size() ? path.get(pathIndex) : null);
@@ -1695,6 +1701,7 @@ final class NavigatorImpl implements Navigator {
         rememberFrontier(result);
         lastTargetDistance = Double.POSITIVE_INFINITY; ticksWithoutProgress = 0;
         task.status = NavigationStatus.RUNNING;
+        task.sampleInfrastructureWait();
     }
 
     private void rememberFrontier(GridPath result) {
@@ -1724,8 +1731,8 @@ final class NavigatorImpl implements Navigator {
 
     /** Waits for ordinary chunk loading; this never requests world generation. */
     private void deferForFrontierChunks(int nodesVisited) {
-        if (++frontierChunkWaitAttempts > MAX_FRONTIER_CHUNK_RETRIES) {
-            task.fail("unreachable", nodesVisited);
+        if (!runtime.navigationChunksPending(owner.id())&&++frontierChunkWaitAttempts > MAX_FRONTIER_CHUNK_RETRIES) {
+            task.fail("unloaded_frontier", nodesVisited);
             return;
         }
         waitingForFrontierChunks = true;
@@ -1865,6 +1872,15 @@ final class NavigatorImpl implements Navigator {
                                 int slot, ItemStack returnedStack) { }
 
     private final class NavigationTaskImpl implements NavigationTask {
+        private final InfrastructureWaitTracker wait = new InfrastructureWaitTracker();
+        void sampleInfrastructureWait(){
+            wait.sample(terminalTick>=0?terminalTick:runtime.server().getTickCount(),System.nanoTime(),waitingForInfrastructure());
+        }
+        @Override public boolean waitingForInfrastructure(){
+            return NavigatorImpl.this.task==this&&status==NavigationStatus.COMPUTING
+                &&(pendingCapture!=null||searchFuture!=null||planningDeferred||waitingForFrontierChunks);
+        }
+        @Override public long infrastructureWaitTicks(){sampleInfrastructureWait();return wait.ticks();}
         private volatile NavigationStatus status = NavigationStatus.IDLE;
         private final CompletableFuture<NavigationResult> completion = new CompletableFuture<>();
         private final AtomicBoolean cancelled = new AtomicBoolean();

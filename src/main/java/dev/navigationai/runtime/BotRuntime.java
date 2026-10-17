@@ -275,6 +275,12 @@ public final class BotRuntime implements BotService, AutoCloseable {
         }
     }
 
+    boolean navigationChunksPending(UUID id) {
+        if(navigationTicketDemands.containsKey(id))return true;
+        var retained=navigationTickets.get(id);
+        return retained!=null&&retained.stream().anyMatch(pendingTicketLoads::contains);
+    }
+
     private void retainNavigationTicket(ChunkTicket ticket) {
         int references = navigationTicketRefs.merge(ticket, 1, Integer::sum);
         if (references == 1) {
@@ -597,9 +603,9 @@ public final class BotRuntime implements BotService, AutoCloseable {
         // A slow recent tick takes precedence over the static bot-count tier.
         long lastTick = Math.max(server.getAverageTickTimeNanos(),
                 metrics.snapshot(pathScheduler.queuedTasks(), pathScheduler.activeTasks()).lastTickNanos());
-        planningTimeBudgetNanos = lastTick > 75_000_000L ? 2_000_000L
-                : lastTick > 50_000_000L ? 3_000_000L : 5_000_000L;
-        if (lastTick > 75_000_000L) {
+        long target=server.tickRateManager().nanosecondsPerTick();
+        planningTimeBudgetNanos = dev.navigationai.api.TickWorkBudget.planningNanos(target,lastTick);
+        if (dev.navigationai.api.TickWorkBudget.overloaded(target,lastTick)) {
             snapshotLimit = Math.max(1, snapshotLimit - 1);
             nodeLimit = Math.max(8_000, nodeLimit * 3 / 4);
         }
