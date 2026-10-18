@@ -234,22 +234,15 @@ final class WorldSnapshot implements GridWorld {
         private final GridPos destination;
         private final boolean allowWater, allowBreaking, allowPlacing;
         private int minX, maxX, minY, maxY, minZ, maxZ;
-        private final Set<GridPos> passable = new HashSet<>();
-        private final Set<GridPos> dangerous = new HashSet<>();
-        private final Set<GridPos> crouchOnly = new HashSet<>();
-        private final Set<GridPos> climbableCells = new HashSet<>();
-        private final Set<GridPos> waterCells = new HashSet<>();
-        private final Set<GridPos> freeBody = new HashSet<>();
-        private final Map<GridPos, Double> actionCosts = new HashMap<>();
-        private final Map<GridPos, Double> surfaceOffsets = new HashMap<>();
-        private final Map<GridPos, List<AABB>> collisions = new HashMap<>();
-        private final Set<GridPos> knownCells = new HashSet<>();
-        private final Set<GridPos> placementCells = new HashSet<>();
-        private final Set<GridPos> openableCells = new HashSet<>(), breakingCells = new HashSet<>();
+        // Dense per-cell storage over the capture box: searches query these sets for every node.
+        private final Set<GridPos> passable, dangerous, crouchOnly, climbableCells, waterCells, freeBody;
+        private final Map<GridPos, Double> actionCosts, surfaceOffsets;
+        private final Map<GridPos, List<AABB>> collisions;
+        private final Set<GridPos> knownCells, placementCells, openableCells, breakingCells;
         private final Map<Long, ChunkGeometryStamp> chunkStamps = new HashMap<>();
         private WorldSnapshot previous;
         private long reusedCells;
-        private final Set<GridPos> groundedOnlyCells = new HashSet<>();
+        private final Set<GridPos> groundedOnlyCells;
         private final int availablePlacements;
         private final double standingHeight, crouchingHeight, bodyWidth;
         private int x, y, z;
@@ -292,6 +285,13 @@ final class WorldSnapshot implements GridWorld {
             crouchingHeight = observer.getDimensions(Pose.CROUCHING).height();
             bodyWidth = observer.getDimensions(Pose.STANDING).width();
             x = minX; y = minY; z = minZ;
+            // One spare layer above and below: collision sweeps also ask about the cells next to the box.
+            var box = CellSet.CellBox.of(minX - 1, maxX + 1, minY - 1, maxY + 2, minZ - 1, maxZ + 1);
+            passable = new CellSet(box); dangerous = new CellSet(box); crouchOnly = new CellSet(box);
+            climbableCells = new CellSet(box); waterCells = new CellSet(box); freeBody = new CellSet(box);
+            knownCells = new CellSet(box); placementCells = new CellSet(box); openableCells = new CellSet(box);
+            breakingCells = new CellSet(box); groundedOnlyCells = new CellSet(box);
+            actionCosts = new CellMap<>(box); surfaceOffsets = new CellMap<>(box); collisions = new CellMap<>(box);
         }
 
         boolean step(int maxCells) { return step(maxCells, Long.MAX_VALUE); }
@@ -649,9 +649,29 @@ final class WorldSnapshot implements GridWorld {
         // Enter them with short walking transitions before climbing.
         if (climbableCells.contains(from) || climbableCells.contains(to)
                 || requiresSneak(from) || requiresSneak(to) || isWater(from) || isWater(to)) return false;
+        // Over plain walkable ground a long jump is never needed: steps reach the same cell more
+        // safely. Checking the arc for every direction of every node dominated path search time.
+        if (!jumpNeeded(from, to)) return false;
         return NavigationGeometry.clearJump(feetPoint(from), feetPoint(to), bodyWidth, standingHeight,
                 this::collisionFree, pos -> dangerous.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ()))
                         || waterCells.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())));
+    }
+
+    /** A gap, an obstacle or a dangerous cell lies between two cells of the same height. */
+    private boolean jumpNeeded(GridPos from, GridPos to) {
+        int samples = (int) Math.ceil(Math.hypot(to.x() - from.x(), to.z() - from.z()) * 8);
+        int lastX = from.x(), lastZ = from.z();
+        for (int i = 1; i < samples; i++) {
+            double t = i / (double) samples;
+            int cx = (int) Math.floor(from.x() + .5 + (to.x() - from.x()) * t), cz = (int) Math.floor(from.z() + .5 + (to.z() - from.z()) * t);
+            // Eight samples per block visit most cells several times in a row.
+            if (cx == lastX && cz == lastZ || cx == to.x() && cz == to.z()) continue;
+            lastX = cx; lastZ = cz;
+            GridPos cell = new GridPos(cx, from.y(), cz);
+            if (!passable(cell) || requiresPlacement(cell) || dangerous(cell) || requiresSneak(cell)
+                    || Math.abs(supportHeight(cell) - supportHeight(from)) > .5) return true;
+        }
+        return false;
     }
 
     private net.minecraft.world.phys.Vec3 feetPoint(GridPos pos) {
