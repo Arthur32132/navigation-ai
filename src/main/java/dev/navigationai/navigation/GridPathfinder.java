@@ -176,7 +176,7 @@ public final class GridPathfinder {
                         + (jump ? 0.35D : 0.0D);
                 if (world.dangerous(next)) nextScore += policy.dangerCost();
                 SearchNode nextNode = new SearchNode(new State(next, nextWaterSteps, nextPlacements), nextSteps, nextScore, currentNode, transition);
-                if (retainLabel(labels, nextNode)) {
+                if (retainLabel(labels, nextNode, policy.maxPathLength())) {
                     open.add(new Entry(nextNode, nextScore + goalHeuristic(next, goals, frontierTarget)));
                 }
             }
@@ -202,7 +202,7 @@ public final class GridPathfinder {
                             + dropDistance * 0.35D;
                     if (world.dangerous(next)) nextScore += policy.dangerCost();
                     SearchNode nextNode = new SearchNode(new State(next, nextWaterSteps, nextPlacements), nextSteps, nextScore, currentNode, transition);
-                    if (retainLabel(labels, nextNode)) {
+                    if (retainLabel(labels, nextNode, policy.maxPathLength())) {
                         open.add(new Entry(nextNode, nextScore + goalHeuristic(next, goals, frontierTarget)));
                     }
                 }
@@ -228,13 +228,18 @@ public final class GridPathfinder {
         return new GridPath(List.of(), visited, budgetExhausted);
     }
 
-    private static boolean retainLabel(Map<State, List<SearchNode>> labels, SearchNode candidate) {
+    /**
+     * Keeps a label unless a cheaper one exists. The step count matters only once a route could come
+     * near the length limit; tracking it everywhere kept many labels per cell (a jump costs more but
+     * takes fewer steps) and multiplied the nodes of every search.
+     */
+    private static boolean retainLabel(Map<State, List<SearchNode>> labels, SearchNode candidate, int maxPathLength) {
         List<SearchNode> alternatives = labels.computeIfAbsent(candidate.state, ignored -> new ArrayList<>());
         for (SearchNode previous : alternatives) {
-            if (previous.cost <= candidate.cost && previous.steps <= candidate.steps) return false;
+            if (previous.cost <= candidate.cost && (previous.steps <= candidate.steps || previous.steps * 2 < maxPathLength)) return false;
         }
         alternatives.removeIf(previous -> {
-            boolean dominated = candidate.cost <= previous.cost && candidate.steps <= previous.steps;
+            boolean dominated = candidate.cost <= previous.cost && (candidate.steps <= previous.steps || candidate.steps * 2 < maxPathLength);
             if (dominated) previous.superseded = true;
             return dominated;
         });

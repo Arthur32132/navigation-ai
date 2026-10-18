@@ -649,9 +649,26 @@ final class WorldSnapshot implements GridWorld {
         // Enter them with short walking transitions before climbing.
         if (climbableCells.contains(from) || climbableCells.contains(to)
                 || requiresSneak(from) || requiresSneak(to) || isWater(from) || isWater(to)) return false;
+        // Over plain walkable ground a long jump is never needed: steps reach the same cell more
+        // safely. Checking the arc for every direction of every node dominated path search time.
+        if (!jumpNeeded(from, to)) return false;
         return NavigationGeometry.clearJump(feetPoint(from), feetPoint(to), bodyWidth, standingHeight,
                 this::collisionFree, pos -> dangerous.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ()))
                         || waterCells.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())));
+    }
+
+    /** A gap, an obstacle or a dangerous cell lies between two cells of the same height. */
+    private boolean jumpNeeded(GridPos from, GridPos to) {
+        int samples = (int) Math.ceil(Math.hypot(to.x() - from.x(), to.z() - from.z()) * 8);
+        for (int i = 1; i < samples; i++) {
+            double t = i / (double) samples;
+            GridPos cell = new GridPos((int) Math.floor(from.x() + .5 + (to.x() - from.x()) * t), from.y(),
+                    (int) Math.floor(from.z() + .5 + (to.z() - from.z()) * t));
+            if (cell.equals(from) || cell.equals(to)) continue;
+            if (!passable(cell) || requiresPlacement(cell) || dangerous(cell) || requiresSneak(cell)
+                    || Math.abs(supportHeight(cell) - supportHeight(from)) > .5) return true;
+        }
+        return false;
     }
 
     private net.minecraft.world.phys.Vec3 feetPoint(GridPos pos) {
