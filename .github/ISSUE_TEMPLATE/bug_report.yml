@@ -1,0 +1,33 @@
+name: Bug report / Ошибка
+description: Report a reproducible problem with the mod.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "English or Russian is welcome. Do not upload credentials, private player data, complete worlds or game binaries."
+  - type: input
+    id: revision
+    attributes:
+      label: Mod version or commit
+      description: Include affected consumer mods and their revisions, if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Minecraft, Fabric Loader/API, Java, OS, other mods, client or dedicated server, and tick rate.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Give minimal steps using a disposable world. Include expected and actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Small redacted log excerpts, screenshots, and relevant save metadata; identify the build that produced them.

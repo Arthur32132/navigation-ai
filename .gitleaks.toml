@@ -1,0 +1,13 @@
+title = "Navigation AI secret scanning"
+
+[extend]
+useDefault = true
+
+# Regression reports record SHA-256 for Java source paths. Ignore only the
+# exact checksum line, while retaining default scanning everywhere else.
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+description = "SHA-256 entries for Java source files"
+regexTarget = "line"
+regexes = ['''^\s*"[^"\r\n]+\.java":\s*"[a-f0-9]{64}",?\s*$''']

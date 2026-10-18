@@ -1,5 +1,14 @@
 # Navigation AI
 
+[MIT license](LICENSE) · [Contributing / Участие](CONTRIBUTING.md) ·
+[Report a bug or suggest an improvement](https://github.com/Arthur32132/navigation-ai/issues/new/choose) ·
+[Security](SECURITY.md)
+
+**English:** Experimental server-side navigation and physical-control API for
+Minecraft Fabric, used by [Autonomous Villages](https://github.com/Arthur32132/autonomous-villages).
+Forks and pull requests are welcome; see the contributor guide for JDK 25 setup
+and validation requirements.
+
 Серверная библиотека для Fabric/Minecraft 26.2. Она управляет fake-player и настоящими жителями, сохраняет их состояние и предоставляет API для физического управления и навигации. Поддерживаются выделенный и встроенный сервер одиночной игры; при подключении к выделенному серверу установка библиотеки на клиент не требуется.
 
 Текущий артефакт — `navigation-ai:0.2.2`. Библиотека загружается и на клиенте для встроенного сервера; игровые действия выполняются в серверном потоке. Добавлены учёт ожидания инфраструктуры и CPU-бюджеты для ускоренной симуляции. Кандидат 0.2.2 собирается без запуска тестов по указанию пользователя; исторические PASS не являются его приёмкой. [Изменения и ограничения 0.2.2](docs/RELEASE_0.2.2.md).
