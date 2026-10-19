@@ -66,9 +66,34 @@ final class NavigationGeometry {
         return true;
     }
 
-    /** Every sample checks the whole body, including entry faces and both endpoints. */
+    /**
+     * Every sample checks the whole body, including entry faces and both endpoints. The box around
+     * the whole arc is tried first: when nothing touches it, nothing touches any sample inside it,
+     * which settles a clear jump over a gap with one query instead of dozens.
+     */
     static boolean clearJump(Vec3 from, Vec3 to, double width, double height,
                              Predicate<AABB> clear, Predicate<BlockPos> dangerous) {
+        double distance = Math.hypot(to.x - from.x, to.z - from.z);
+        if (distance < 2.0D || distance > 4.0D || Math.abs(from.y - to.y) > 0.5D) return false;
+        double half = width / 2.0D;
+        // The arc rises at most 1.25 above the higher end (5t(1-t) plus the linear climb, |dy| <= 0.5).
+        AABB envelope = new AABB(Math.min(from.x, to.x) - half, Math.min(from.y, to.y) + 1.0E-6D, Math.min(from.z, to.z) - half,
+                Math.max(from.x, to.x) + half, Math.max(from.y, to.y) + 1.25D + height, Math.max(from.z, to.z) + half);
+        if (clear.test(envelope) && !dangerousUnder(envelope, (int) Math.floor(Math.min(from.y, to.y)), dangerous)) return true;
+        return clearJumpSampled(from, to, width, height, clear, dangerous);
+    }
+
+    private static boolean dangerousUnder(AABB body, int baseY, Predicate<BlockPos> dangerous) {
+        for (int bx = (int) Math.floor(body.minX); bx <= (int) Math.floor(body.maxX - 1.0E-6D); bx++) {
+            for (int bz = (int) Math.floor(body.minZ); bz <= (int) Math.floor(body.maxZ - 1.0E-6D); bz++) {
+                if (dangerous.test(new BlockPos(bx, baseY, bz))) return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean clearJumpSampled(Vec3 from, Vec3 to, double width, double height,
+                                    Predicate<AABB> clear, Predicate<BlockPos> dangerous) {
         double distance = Math.hypot(to.x - from.x, to.z - from.z);
         if (distance < 2.0D || distance > 4.0D || Math.abs(from.y - to.y) > 0.5D) return false;
         int samples = (int) Math.ceil(distance * 16.0D);
@@ -84,12 +109,7 @@ final class NavigationGeometry {
             AABB body = previous == null ? sampleBody : sampleBody.minmax(previous);
             previous = sampleBody;
             if (!clear.test(body)) return false;
-            int baseY = (int) Math.floor(Math.min(from.y, to.y));
-            for (int bx = (int) Math.floor(body.minX); bx <= (int) Math.floor(body.maxX - 1.0E-6D); bx++) {
-                for (int bz = (int) Math.floor(body.minZ); bz <= (int) Math.floor(body.maxZ - 1.0E-6D); bz++) {
-                    if (dangerous.test(new BlockPos(bx, baseY, bz))) return false;
-                }
-            }
+            if (dangerousUnder(body, (int) Math.floor(Math.min(from.y, to.y)), dangerous)) return false;
         }
         return true;
     }
