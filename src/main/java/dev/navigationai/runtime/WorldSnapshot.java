@@ -209,7 +209,9 @@ final class WorldSnapshot implements GridWorld {
     }
 
     private void captureEntities(ServerLevel level, LivingEntity observer, GridPos start, GridPos destination) {
-        Set<GridPos> blocked = new HashSet<>(), hazards = new HashSet<>(), occupiedCells = new HashSet<>();
+        // Bit sets over the snapshot box: passable() asks about entities for every cell a search visits.
+        var box = CellSet.CellBox.of(minX - 1, maxX + 1, minY - 1, maxY + 2, minZ - 1, maxZ + 1);
+        Set<GridPos> blocked = new CellSet(box), hazards = new CellSet(box), occupiedCells = new CellSet(box);
         List<AABB> entityBodies = new ArrayList<>();
         AABB scan = new AABB(minX, minY, minZ, maxX + 1.0, maxY + 1.0, maxZ + 1.0);
         for (LivingEntity entity : level.getEntitiesOfClass(LivingEntity.class, scan)) {
@@ -221,8 +223,7 @@ final class WorldSnapshot implements GridWorld {
             if (!occupied.equals(start) && !occupied.equals(destination)) blocked.add(occupied);
             for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) hazards.add(occupied.add(dx, 0, dz));
         }
-        entityBlocked = Set.copyOf(blocked); entityDanger = Set.copyOf(hazards);
-        entityOccupied = Set.copyOf(occupiedCells);
+        entityBlocked = blocked; entityDanger = hazards; entityOccupied = occupiedCells;
         entityCollisions = List.copyOf(entityBodies);
     }
 
@@ -632,7 +633,7 @@ final class WorldSnapshot implements GridWorld {
     @Override public boolean requiresOpening(GridPos pos) { return openableCells.contains(pos); }
     @Override public boolean requiresBreaking(GridPos pos) { return breakingCells.contains(pos); }
     @Override public boolean crossesGap(GridPos from, GridPos to) {
-        int samples = (int) Math.ceil(Math.hypot(to.x() - from.x(), to.z() - from.z()) * 8);
+        int samples = (int) Math.ceil(horizontal(from, to) * 8);
         for (int i = 1; i < samples; i++) {
             double t = i / (double) samples;
             GridPos cell = new GridPos((int) Math.floor(from.x() + .5 + (to.x() - from.x()) * t), from.y(),
@@ -644,34 +645,68 @@ final class WorldSnapshot implements GridWorld {
     @Override public boolean canJump(GridPos from, GridPos to) {
         if (!passable(from) || !passable(to) || from.y() != to.y()) return false;
         if (requiresPlacement(to)) return false;
-        if (!sprintAvailable && Math.hypot(to.x() - from.x(), to.z() - from.z()) > 3.0) return false;
+        if (!sprintAvailable && horizontal(from, to) > 3.0) return false;
         // Climbable blocks are not landing platforms for long sprint jumps.
         // Enter them with short walking transitions before climbing.
         if (climbableCells.contains(from) || climbableCells.contains(to)
                 || requiresSneak(from) || requiresSneak(to) || isWater(from) || isWater(to)) return false;
         // Over plain walkable ground a long jump is never needed: steps reach the same cell more
-        // safely. Checking the arc for every direction of every node dominated path search time.
-        if (!jumpNeeded(from, to)) return false;
+        // safely. Checking the arc for every direction of every node dominated path search time,
+        // and so did sweeping the arc into a tree trunk or a wall that no jump clears.
+        if (jumpObstacle(from, to) != JUMP_MAY_CLEAR) return false;
+        return clearArc(from, to);
+    }
+
+    /** The full sweep of the jump arc against blocks, entities and dangerous cells. */
+    boolean clearArc(GridPos from, GridPos to) {
         return NavigationGeometry.clearJump(feetPoint(from), feetPoint(to), bodyWidth, standingHeight,
                 this::collisionFree, pos -> dangerous.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ()))
                         || waterCells.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())));
     }
 
-    /** A gap, an obstacle or a dangerous cell lies between two cells of the same height. */
-    private boolean jumpNeeded(GridPos from, GridPos to) {
-        int samples = (int) Math.ceil(Math.hypot(to.x() - from.x(), to.z() - from.z()) * 8);
+    static final int JUMP_NOT_NEEDED = 0, JUMP_MAY_CLEAR = 1, JUMP_BLOCKED = 2;
+    /**
+     * What lies between two cells of the same height: plain ground (no jump needed), a gap, an
+     * obstacle or a dangerous cell (a jump may clear it), or a block at head height that no jump
+     * clears. Throughout a jump arc (at most 1.25 high) the body covers 1.25 to 1.95 above the
+     * take-off feet, and the body's centre crosses every cell on the line, so a collision box that
+     * spans such a cell's whole footprint and that height range rules the jump out exactly.
+     */
+    int jumpObstacle(GridPos from, GridPos to) {
+        int samples = (int) Math.ceil(horizontal(from, to) * 8);
         int lastX = from.x(), lastZ = from.z();
+        boolean needed = false;
+        double feet = supportHeight(from);
         for (int i = 1; i < samples; i++) {
             double t = i / (double) samples;
             int cx = (int) Math.floor(from.x() + .5 + (to.x() - from.x()) * t), cz = (int) Math.floor(from.z() + .5 + (to.z() - from.z()) * t);
             // Eight samples per block visit most cells several times in a row.
             if (cx == lastX && cz == lastZ || cx == to.x() && cz == to.z()) continue;
             lastX = cx; lastZ = cz;
+            if (spansFootprint(new GridPos(cx, from.y() + 1, cz), feet + 1.25, feet + 1.95)) return JUMP_BLOCKED;
+            if (needed) continue;
             GridPos cell = new GridPos(cx, from.y(), cz);
             if (!passable(cell) || requiresPlacement(cell) || dangerous(cell) || requiresSneak(cell)
-                    || Math.abs(supportHeight(cell) - supportHeight(from)) > .5) return true;
+                    || Math.abs(supportHeight(cell) - feet) > .5) needed = true;
+        }
+        return needed ? JUMP_MAY_CLEAR : JUMP_NOT_NEEDED;
+    }
+
+    /** A collision box of the cell covers its whole footprint somewhere between the two heights. */
+    private boolean spansFootprint(GridPos cell, double low, double high) {
+        List<AABB> parts = collisions.get(cell);
+        if (parts == null) return false;
+        for (AABB part : parts) {
+            if (part.minX <= cell.x() + 1.0E-6 && part.maxX >= cell.x() + 1 - 1.0E-6
+                    && part.minZ <= cell.z() + 1.0E-6 && part.maxZ >= cell.z() + 1 - 1.0E-6
+                    && part.minY < high && part.maxY > low) return true;
         }
         return false;
+    }
+
+    private static double horizontal(GridPos from, GridPos to) {
+        int dx = to.x() - from.x(), dz = to.z() - from.z();
+        return Math.sqrt(dx * dx + dz * dz);
     }
 
     private net.minecraft.world.phys.Vec3 feetPoint(GridPos pos) {
