@@ -55,7 +55,7 @@ import org.slf4j.LoggerFactory;
 public final class BotRuntime implements BotService, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger("navigation_ai/runtime");
     private static final int SNAPSHOT_BUDGET_PER_TICK = 4;
-    private static final int SNAPSHOT_CELLS_BUDGET_PER_TICK = 4_096;
+    private static final int SNAPSHOT_CELLS_BUDGET_PER_TICK = 16_384;
     private static final int PATH_NODES_BUDGET_PER_TICK = 40_000;
     private final MinecraftServer server;
     private final Map<UUID, BotHandleImpl> bots = new ConcurrentHashMap<>();

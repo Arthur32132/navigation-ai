@@ -106,7 +106,9 @@ final class NavigatorImpl implements Navigator {
     private static final int MAX_BUDGET_DEFERRALS = 3;
     private static final int MAX_FRONTIER_CHUNK_RETRIES = 20;
     private static final int FRONTIER_CHUNK_RETRY_DELAY_TICKS = 5;
-    private static final int SNAPSHOT_CELLS_PER_BOT_TICK = 2_048;
+    // Capture is bounded by the runtime's per-tick planning time; the cell caps only keep one bot
+    // from taking a whole tick. At 2 048 a 200 000-cell route snapshot took 100 ticks to capture.
+    private static final int SNAPSHOT_CELLS_PER_BOT_TICK = 8_192;
     private static final int MAX_TICKS_IN_ONE_AREA = 300;
 
     NavigatorImpl(BotRuntime runtime, BotHandleImpl owner) { this.runtime = runtime; this.owner = owner; }
