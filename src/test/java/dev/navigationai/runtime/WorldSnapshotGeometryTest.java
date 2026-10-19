@@ -61,6 +61,43 @@ class WorldSnapshotGeometryTest {
         assertTrue(snapshot.canJump(start,end));
     }
 
+    @Test void trunkAtHeadHeightRulesOutTheJumpWithoutSweepingTheArc() {
+        GridPos start = new GridPos(0,0,0), end = new GridPos(4,0,0);
+        Map<GridPos,List<AABB>> trunk = Map.of(new GridPos(2,0,0), List.of(new AABB(2,0,0,3,1,1)),
+                new GridPos(2,1,0), List.of(new AABB(2,1,0,3,2,1)));
+        WorldSnapshot snapshot = world(Set.of(start,end),Set.of(),Set.of(),trunk);
+        assertEquals(WorldSnapshot.JUMP_BLOCKED, snapshot.jumpObstacle(start,end));
+        assertFalse(snapshot.clearArc(start,end));
+        assertFalse(snapshot.canJump(start,end));
+        // A post that does not fill the cell's footprint is left to the full sweep.
+        Map<GridPos,List<AABB>> post = Map.of(new GridPos(2,1,0), List.of(new AABB(2.4,1,.4,2.6,2,.6)));
+        assertEquals(WorldSnapshot.JUMP_NOT_NEEDED, world(Set.of(start,end,new GridPos(1,0,0),new GridPos(2,0,0),new GridPos(3,0,0)),
+                Set.of(),Set.of(),post).jumpObstacle(start,end));
+    }
+
+    @Test void headHeightShortcutNeverRejectsAJumpTheArcWouldClear() {
+        var random = new java.util.Random(7);
+        GridPos start = new GridPos(0,0,0);
+        int blocked = 0;
+        for (int round = 0; round < 3000; round++) {
+            GridPos end = new GridPos(2 + random.nextInt(3), 0, random.nextInt(3) - 1);
+            Map<GridPos,List<AABB>> shapes = new java.util.HashMap<>();
+            for (int n = 0; n < 3; n++) {
+                int x = random.nextInt(5), y = random.nextInt(3), z = random.nextInt(3) - 1;
+                double low = random.nextInt(4) / 4.0, high = low + .25 + random.nextInt(4) / 4.0;
+                double inset = random.nextBoolean() ? 0 : .3;
+                shapes.put(new GridPos(x,y,z), List.of(new AABB(x + inset, y + low, z + inset, x + 1 - inset, y + Math.min(1, high), z + 1 - inset)));
+            }
+            shapes.remove(start); shapes.remove(end);
+            WorldSnapshot snapshot = world(Set.of(start,end),Set.of(),Set.of(),shapes);
+            if (snapshot.jumpObstacle(start,end) == WorldSnapshot.JUMP_BLOCKED) {
+                blocked++;
+                assertFalse(snapshot.clearArc(start,end), "shortcut rejected a clear jump to " + end + " over " + shapes);
+            }
+        }
+        assertTrue(blocked > 100);
+    }
+
     @Test void rejectsCrouchingTakeoffAndLanding() {
         GridPos start=new GridPos(0,0,0), end=new GridPos(2,0,0);
         assertFalse(world(Set.of(start,end),Set.of(start),Set.of(),Map.of()).canJump(start,end));
