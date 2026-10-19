@@ -249,6 +249,16 @@ final class WorldSnapshot implements GridWorld {
         private int x, y, z;
         private boolean hasUnloadedChunks;
         private WorldSnapshot result;
+        // The column being scanned: whether its chunks are loaded and its geometry stamp. Reset at
+        // every step, since a chunk can unload between ticks.
+        private int columnX, columnZ;
+        private boolean columnLoaded, columnReusable;
+        private long columnKey;
+        // The scan walks each column upwards, so the cell below is the previous cell and this cell
+        // was the previous cell's "above": one block lookup per cell instead of three.
+        private int windowY;
+        private BlockState windowState, windowAbove;
+        private VoxelShape windowStateShape, windowAboveShape;
 
         private Capture(ServerLevel level, LivingEntity observer, GridPos start, int radius, boolean allowWater,
                         boolean allowChunkGeneration, boolean allowBreaking, boolean allowPlacing,
@@ -300,6 +310,7 @@ final class WorldSnapshot implements GridWorld {
         boolean step(int maxCells, long deadlineNanos) {
             if (result != null) return true;
             int processed = 0;
+            columnX = Integer.MIN_VALUE; windowY = Integer.MIN_VALUE;
             while (x <= maxX && processed++ < maxCells) {
                 if (System.nanoTime() >= deadlineNanos) return false;
                 int x = this.x, y = this.y, z = this.z;
@@ -307,42 +318,61 @@ final class WorldSnapshot implements GridWorld {
                     this.y = minY;
                     if (++this.z > maxZ) { this.z = minZ; this.x++; }
                 }
-                BlockPos pos = new BlockPos(x, y, z);
-                if (!loadedGeometryAt(level, x, z)) {
+                if (x != columnX || z != columnZ) {
+                    columnX = x; columnZ = z; windowY = Integer.MIN_VALUE;
                     // Navigation tickets request generation asynchronously. Never
                     // wait for chunk generation inside the server tick capture.
+                    columnLoaded = loadedGeometryAt(level, x, z);
+                    if (columnLoaded) {
+                        columnKey = chunkKey(x >> 4, z >> 4);
+                        ChunkGeometryStamp stamp = chunkStamps.computeIfAbsent(columnKey,
+                                ignored -> ChunkGeometryStamp.read(level, x >> 4, z >> 4));
+                        columnReusable = previous != null && stamp.equals(previous.chunkStamps.get(columnKey));
+                    }
+                }
+                if (!columnLoaded) {
                     hasUnloadedChunks = true;
                     continue;
                 }
+                BlockPos pos = new BlockPos(x, y, z);
                 GridPos gridPos = new GridPos(x, y, z);
-                long revisionKey = chunkKey(x >> 4, z >> 4);
-                ChunkGeometryStamp stamp = chunkStamps.computeIfAbsent(revisionKey,
-                        ignored -> ChunkGeometryStamp.read(level, x >> 4, z >> 4));
-                if (previous != null && previous.knownCells.contains(gridPos)
-                        && stamp.equals(previous.chunkStamps.get(revisionKey))) {
+                if (columnReusable && previous.knownCells.contains(gridPos)) {
                     copyCell(previous, gridPos);
                     reusedCells++;
+                    windowY = Integer.MIN_VALUE;
                     continue;
                 }
-                var state = level.getBlockState(pos);
+                BlockState state, below;
+                VoxelShape stateShape, belowShape;
+                if (windowY == y - 1) {
+                    below = windowState; belowShape = windowStateShape;
+                    state = windowAbove; stateShape = windowAboveShape;
+                } else {
+                    below = level.getBlockState(pos.below()); belowShape = below.getCollisionShape(level, pos.below());
+                    state = level.getBlockState(pos); stateShape = state.getCollisionShape(level, pos);
+                }
                 var above = level.getBlockState(pos.above());
-                var below = level.getBlockState(pos.below());
-                FluidState fluidState = level.getFluidState(pos);
-                FluidState belowFluid = level.getFluidState(pos.below());
+                var aboveShape = above.getCollisionShape(level, pos.above());
+                windowY = y; windowState = state; windowStateShape = stateShape;
+                windowAbove = above; windowAboveShape = aboveShape;
+                // A block's fluid is part of its state; level.getFluidState would look the block up again.
+                FluidState fluidState = state.getFluidState();
+                FluidState belowFluid = below.getFluidState();
                 boolean belowWater = belowFluid.getType() == Fluids.WATER
                         || belowFluid.getType() == Fluids.FLOWING_WATER;
                 boolean waterCell = fluidState.getType() == Fluids.WATER
                         || fluidState.getType() == Fluids.FLOWING_WATER;
-                var stateShape = state.getCollisionShape(level, pos);
-                var aboveShape = above.getCollisionShape(level, pos.above());
-                var belowShape = below.getCollisionShape(level, pos.below());
                 double offset = NavigationGeometry.feetOffset(stateShape, belowShape);
                 boolean waterSurface = fluidState.isEmpty() && belowWater && stateShape.isEmpty() && belowShape.isEmpty();
                 if (waterSurface) offset = belowFluid.getHeight(level, pos.below()) - 1.0;
                 knownCells.add(gridPos);
                 if (offset != 0.0D) surfaceOffsets.put(gridPos, offset);
-                var planningState = NavigationGeometry.planningState(state, ActorSupport.mayInteract(observer, level, pos));
-                var planningShape = planningState.getCollisionShape(level, pos);
+                // Only doors, trapdoors and gates depend on the actor's permission to use them.
+                boolean passage = state.getBlock() instanceof DoorBlock || state.getBlock() instanceof TrapDoorBlock
+                        || state.getBlock() instanceof FenceGateBlock;
+                boolean mayOpen = passage && ActorSupport.mayInteract(observer, level, pos);
+                var planningState = NavigationGeometry.planningState(state, mayOpen);
+                var planningShape = planningState == state ? stateShape : planningState.getCollisionShape(level, pos);
                 if (!planningShape.isEmpty()) {
                     collisions.put(gridPos, planningShape.toAabbs().stream().map(box -> box.move(pos)).toList());
                 }
@@ -365,15 +395,14 @@ final class WorldSnapshot implements GridWorld {
                         && (aboveShape.isEmpty() || above.is(BlockTags.CLIMBABLE));
                 if (climbable) climbableCells.add(new GridPos(x, y, z));
                 boolean openable = (isClosedHandOpenableDoor(state) || isClosedHandOpenableTrapdoor(state)
-                        || isClosedFenceGate(state))
-                        && ActorSupport.mayInteract(observer, level, pos);
+                        || isClosedFenceGate(state)) && mayOpen;
                 if (openable) openableCells.add(gridPos);
                 boolean openGate = state.getBlock() instanceof FenceGateBlock
                         && state.hasProperty(FenceGateBlock.OPEN) && state.getValue(FenceGateBlock.OPEN);
                 boolean lavaCell = fluidState.getType() == Fluids.LAVA
                         || fluidState.getType() == Fluids.FLOWING_LAVA;
                 boolean fluidAllowed = (!waterCell && !lavaCell) || (allowWater && waterCell);
-                boolean floor = below.getCollisionShape(level, pos.below()).isEmpty()
+                boolean floor = belowShape.isEmpty()
                         ? (allowWater && belowWater)
                         : true;
                 boolean jumpClearBody=clearBody,jumpClearance=standingClearance||crouchingClearance;
@@ -389,20 +418,20 @@ final class WorldSnapshot implements GridWorld {
                 if (jumpClearBody && jumpClearance) freeBody.add(gridPos);
                 boolean breakableBody = allowBreaking && !clearBody && hasUsableTool(observer, state)
                         && isBreakable(level, pos, state)&&ActorSupport.mayBreak(observer,level,pos)
-                        && (above.getCollisionShape(level, pos.above()).isEmpty()
+                        && (aboveShape.isEmpty()
                             || (hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)&&ActorSupport.mayBreak(observer,level,pos.above())))
-                        && !below.getCollisionShape(level, pos.below()).isEmpty();
+                        && !belowShape.isEmpty();
                 boolean breakableAbove = allowBreaking && clearBody && !standingClearance && !crouchingClearance
                         && hasUsableTool(observer, above) && isBreakable(level, pos.above(), above)
                         &&ActorSupport.mayBreak(observer,level,pos.above())
-                        && !below.getCollisionShape(level, pos.below()).isEmpty();
+                        && !belowShape.isEmpty();
                 if (breakableBody || breakableAbove) breakingCells.add(gridPos);
                 // A previous route step may place the neighbour that supports this block.
                 // Keep these virtual cells local to the current bridge level; execution
                 // still verifies the real neighbour immediately before each placement.
                 boolean supportedPlacement = allowPlacing && availablePlacements > 0 && (standingBody || crouchingBody)
                         && Math.abs(y - start.y()) <= 1 && below.canBeReplaced()
-                        && below.getCollisionShape(level, pos.below()).isEmpty() && belowFluid.isEmpty();
+                        && belowShape.isEmpty() && belowFluid.isEmpty();
                 boolean passableCell = fluidAllowed && (((standingBody || crouchingBody) && floor)
                         || lowSurface || climbable || openable || openGate
                         || breakableBody || breakableAbove || supportedPlacement);
@@ -419,7 +448,7 @@ final class WorldSnapshot implements GridWorld {
                 }
                 if (breakableBody) {
                     actionCosts.merge(gridPos, breakCost(observer, level, pos, state), Math::max);
-                    if (!above.getCollisionShape(level, pos.above()).isEmpty()) {
+                    if (!aboveShape.isEmpty()) {
                         actionCosts.merge(gridPos, breakCost(observer, level, pos.above(), above), Math::max);
                     }
                 } else if (breakableAbove) {
